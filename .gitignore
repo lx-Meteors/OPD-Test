@@ -1,0 +1,7 @@
+outputs
+.cache
+checkpoint
+logs
+validation_log
+**.pdf
+idea.md

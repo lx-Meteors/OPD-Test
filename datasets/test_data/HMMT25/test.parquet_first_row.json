@@ -1,0 +1,20 @@
+{
+  "prompt": [
+    {
+      "role": "user",
+      "content": "Compute the sum of the positive divisors (including $1$) of $9!$ that have units digit $1$. Please reason step by step, and put your final answer within \\boxed{}."
+    }
+  ],
+  "source": "hmmt",
+  "id": "1",
+  "data_source": "HMMT25",
+  "ability": "math",
+  "reward_model": {
+    "style": "rule",
+    "ground_truth": "103"
+  },
+  "extra_info": {
+    "index": "HMMT25-1",
+    "split": "test"
+  }
+}
