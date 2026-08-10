@@ -19,27 +19,67 @@ student：`y_t` 相对每个重要候选 `z` 应该排得更高还是更低、�
 
 ## 1. 目标函数
 
-单个位置的损失为 teacher 加权的成对 Bernoulli KL：
+每个 response 位置 `t`，锚点是 student 自己采样出的 token `y_t`，对手集合是
 
 ```text
-L_t = Σ_{z ∈ 对手集合}  w_t(z) · KL_B( σ(T(y_t) − T(z))  ‖  σ(S(y_t) − S(z)) )
-
-对手集合 = { top-k 里除 y_t 外的 token }  ∪  { 一个聚合对手 }
-w_t(z) ∝ 该对手的 teacher 质量，归一化到和为 1
+O_t = V_t ∪ {⊥}      V_t = { z ∈ student top-K : z ≠ y_t }    （K = 16，通常 |V_t| = 15）
+                     ⊥  = 一个聚合对手，默认是 y_t 的补集（见 §1.2）
 ```
 
-- `S`、`T` 分别是 student / teacher 的 logit，`σ` 为 sigmoid；
-- teacher 候选权重 `w` 与 teacher 胜率均为 stop-gradient，只有 student 接收梯度；
-- 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）；
-- 聚合对手默认取 **`y_t` 的补集**（`complement_candidate`），它的权重就是 `q(y_t)`、
-  teacher 胜率恰好是 `q(y_t)`，所以那一项等于 `KL_B(q(y_t)‖p(y_t))` —— 即"目标 token 的
-  loss"。它不是外挂项，而是同一个成对构造在最粗对手上的特例，因此**没有自由系数**。
-  为什么必须有一个聚合对手，见 §1.2。
+每个对手按自己的 teacher 质量 `m_t(·)` 加权，归一化到和为 1：
 
-**实现上的关键点**：softmax 归一化项在 logit 差里会抵消，即
-`T(y) − T(z) = log q(y) − log q(z)`。因此所有成对 margin 都能直接从框架已有的 top-k
-log-prob 读出，**不需要传输或重算原始 logits，也不需要额外的 teacher forward**。每次更新
-仍然只有一次 student forward，显存与吞吐和 OPD baseline 完全一致。
+```text
+m_t(z) = q_t(z)   (z ∈ V_t)      m_t(⊥) = q_t(y_t)      Z_t = Σ_{o ∈ O_t} m_t(o)
+
+L_t = Σ_{o ∈ O_t}  [ m_t(o) / Z_t ] · KL_B( r_T(y_t, o)  ‖  r_S(y_t, o) )
+```
+
+胜率是 Bradley-Terry 式的归一化对，都有闭式：
+
+```text
+r_S(y, z) = σ( log p(y) − log p(z) )       = p(y) / ( p(y) + p(z) )
+r_T(y, z) = σ( log q(y) − log q(z) )       = q(y) / ( q(y) + q(z) )
+
+r_S(y, ⊥) = σ( log p(y) − log(1 − p(y)) ) = p(y)
+r_T(y, ⊥) = σ( log q(y) − log(1 − q(y)) ) = q(y)
+```
+
+最后两行是关键：代入 `o = ⊥` 那一项**恰好等于** `KL_B(q(y_t)‖p(y_t))`。所以**目标 token 的
+loss 不是外加项**，而是这个统一公式在最粗对手上的特例，权重也照常由 `q(y_t)` 给出，
+因此没有自由系数。
+
+把 `a_t = m_t(⊥)/Z_t` 记作聚合对手的权重（默认配置下实测均值约 0.65），上式精确等于一个
+凸组合：
+
+```text
+L_t = (1 − a_t) · Σ_{z ∈ V_t} [ q_t(z) / Σ_{z' ∈ V_t} q_t(z') ] · KL_B( r_T(y_t,z) ‖ r_S(y_t,z) )
+      + a_t · KL_B( q_t(y_t) ‖ p_t(y_t) )
+```
+
+即「在 top-K 内部归一化的成对排序项」与「目标 token 项」的加权平均。
+
+梯度对每个成对 margin 的形式统一：
+
+```text
+∂L_t / ∂( S(y_t) − S(o) ) = [ m_t(o) / Z_t ] · ( r_S(y_t, o) − r_T(y_t, o) )
+```
+
+代入 `o = ⊥` 就是 `a_t · ( p(y_t) − q(y_t) )` —— 偏差本身就是梯度，`p(y_t) > q(y_t)` 时压低
+student 的置信度，反之抬高。它是**双向**的，不是 SFT 式的 `−log p(y_t)`。
+
+- `S`、`T` 分别是 student / teacher 的 logit，`σ` 为 sigmoid；
+- 权重 `m_t/Z_t` 与 teacher 胜率 `r_T` 均为 stop-gradient，只有 student 接收梯度；
+- 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）。
+
+**实现上的两个要点**：
+
+1. `KL_B` 在代码里是用 Bernoulli 交叉熵算的（`binary_cross_entropy_with_logits`），与 KL 只
+   差一个 teacher 侧的 Bernoulli 熵，是 student 无关的常数，梯度完全相同；诊断
+   `actor/l_apd_bernoulli_kl` 已把它减掉，所以日志里报的是纯 KL。
+2. softmax 归一化项在 logit 差里会抵消，即 `T(y) − T(z) = log q(y) − log q(z)`。因此所有成对
+   margin 都能直接从框架已有的 top-k log-prob 读出，**不需要传输或重算原始 logits，也不需要
+   额外的 teacher forward**。每次更新仍然只有一次 student forward，显存与吞吐和 OPD
+   baseline 完全一致。
 
 ### 1.1 候选集与归一化范围
 
@@ -71,8 +111,8 @@ top-k 内每个 token 都被统一压低 18%，而 loss 已经收敛。
 
 | | 聚合对手 | 该项的含义 | 权重（自动定标） |
 | --- | --- | --- | --- |
-| `complement_candidate=True`（默认） | `y_t` 的补集，即"除 `y_t` 外的全体" | `KL_B(q(y_t)‖p(y_t))`，即目标 token 的 loss | `a_t = q(y_t)/P_S`，实测约 0.65 |
-| `tail_candidate=True` | top-k 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | `q_tail/(1−q(y_t))`，实测约 0.10 |
+| `complement_candidate=True`（默认） | `y_t` 的补集，即"除 `y_t` 外的全体" | `KL_B(q(y_t)‖p(y_t))`，即目标 token 的 loss | `a_t = q(y_t)/Z_t`，实测约 0.65 |
+| `tail_candidate=True` | top-k 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | `q_tail/Z_t`，此时 `Z_t = 1 − q(y_t)`，实测约 0.10 |
 
 两者都是**同一个成对构造**在一个聚合对手上的特例，权重都由 teacher 质量自动决定，
 所以都没有自由系数。`tail_candidate` 优先级更高；它开启时对手集合 `{z_1..z_k, tail}` 构成
@@ -80,13 +120,10 @@ top-k 内每个 token 都被统一压低 18%，而 loss 已经收敛。
 
 默认选补集，理由有三条：
 
-1. **归一化范围与 baseline 对齐**。`P_S = Σ_{v ∈ top-16} q(v)` 含锚点，所以权重是在
-   baseline 用的那 16 个 id 上归一化的；`tail_candidate` 会引入 baseline 没有的第 17 个
-   虚拟对手。展开就是一个凸组合，每个 token 的总权重恒为 1：
-
-   ```text
-   L_t = (1 − a_t) · [15 个成对项]  +  a_t · KL_B(q(y_t)‖p(y_t))
-   ```
+1. **归一化范围与 baseline 对齐**。此时 `Z_t = q(y_t) + Σ_{z ∈ V_t} q(z)` 是 teacher 在
+   `{y_t} ∪ top-16` 上的总质量，**含锚点**，所以权重是在 baseline 用的那 16 个 id 上归一化
+   的；`tail_candidate` 会引入 baseline 没有的第 17 个虚拟对手。展开就是 §1 那个凸组合，
+   每个 token 的总权重恒为 1。
 
 2. **顺带修掉了权重归一化的 eps 下限问题**。归一化分母现在至少是 `q(y_t)`，不会塌陷。
    此前 teacher 在采样 token 上几乎确定（`q(y_t) > 1 − 1e-6`）的位置会撞上 `1e-6` 下限、
@@ -331,7 +368,7 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/l_apd_pairwise_gap` | 加权的 `abs(r_S − r_T)`，student 与 teacher 胜率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 `q(y_t)` / `p(y_t)`，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
 | `actor/l_apd_anchor_kl` | 锚点项 `KL_B(q(y_t)‖p(y_t))`，`p(y_t) = q(y_t)` 时恰好为 0；仅 `complement_candidate` 生效时记录 |
-| `actor/l_apd_anchor_weight` | 补集对手拿到的权重 `a_t = q(y_t)/P_S`；仅 `complement_candidate` 生效时记录 |
+| `actor/l_apd_anchor_weight` | 补集对手拿到的权重 `a_t = q(y_t)/Z_t`（见 §1）；仅 `complement_candidate` 生效时记录 |
 | `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_anchor_in_candidates` | 锚点落在候选 top-k 内的比例 |
@@ -354,7 +391,7 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
 `p = q` 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
 （只有真实 token 对手时 loss 对"质量在 top-k 与尾部之间如何分配"完全不变，而两种聚合对手
 都能破掉这个不变性）；补集对手那一项逐元素等于 `KL_B(q(y_t)‖p(y_t))`、权重逐元素等于
-`q(y_t)/P_S`、且含它的权重和恒为 1。
+`q(y_t)/Z_t`、且含它的权重和恒为 1。
 
 ## 9. 注意事项
 
