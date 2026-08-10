@@ -4,8 +4,8 @@
 > 安装步骤、其他实验脚本）见 [`README_Prune-OPD.md`](README_Prune-OPD.md)。
 
 L-APD 是在 Prune-OPD 框架内实现的一个**不依赖 reward、advantage、PPO ratio 和 GRPO 分组**的
-on-policy 蒸馏目标。student 先在自己的轨迹上采样出真实 token `y_t` 作为锚点，teacher 再告诉
-student：`y_t` 相对每个重要候选 `z` 应该排得更高还是更低、以及应当相差多少。
+on-policy 蒸馏目标。student 先在自己的轨迹上采样出真实 token $y_t$ 作为锚点，teacher 再告诉
+student：$y_t$ 相对每个重要候选 $z$ 应该排得更高还是更低、以及应当相差多少。
 
 ```text
                            候选 z1
@@ -19,125 +19,156 @@ student：`y_t` 相对每个重要候选 `z` 应该排得更高还是更低、�
 
 ## 1. 目标函数
 
-每个 response 位置 `t`，锚点是 student 自己采样出的 token `y_t`，对手集合是
+记 $p_t$、$q_t$ 为 student / teacher 在位置 $t$ 的分布，$S$、$T$ 为对应的 logit，$\sigma$ 为
+sigmoid，二值 KL 为
 
-```text
-O_t = V_t ∪ {⊥}      V_t = { z ∈ student top-K : z ≠ y_t }    （K = 16，通常 |V_t| = 15）
-                     ⊥  = 一个聚合对手，默认是 y_t 的补集（见 §1.2）
-```
+$$
+\mathrm{KL_B}(a  \Vert  b) \;=\; a\log\frac{a}{b} \;+\; (1-a)\log\frac{1-a}{1-b}.
+$$
 
-每个对手按自己的 teacher 质量 `m_t(·)` 加权，归一化到和为 1：
+每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$，对手集合为
 
-```text
-m_t(z) = q_t(z)   (z ∈ V_t)      m_t(⊥) = q_t(y_t)      Z_t = Σ_{o ∈ O_t} m_t(o)
+$$
+\mathcal{O}_t \;=\; \mathcal{V}_t \cup \lbrace \perp \rbrace,
+\qquad
+\mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{student top-}K \;:\; z \neq y_t \,\bigr\rbrace,
+$$
 
-L_t = Σ_{o ∈ O_t}  [ m_t(o) / Z_t ] · KL_B( r_T(y_t, o)  ‖  r_S(y_t, o) )
-```
+其中 $K=16$、通常 $\lvert \mathcal{V}_t \rvert = 15$，而 $\perp$ 是一个**聚合对手**，默认取 $y_t$ 的补集
+（见 §1.2）。每个对手按自己的 teacher 质量 $m_t(\cdot)$ 加权并归一化到和为 1：
 
-胜率是 Bradley-Terry 式的归一化对，都有闭式：
+$$
+m_t(z) = q_t(z) \;\; (z \in \mathcal{V}_t),
+\qquad
+m_t(\perp) = q_t(y_t),
+\qquad
+Z_t = \sum_{o \in \mathcal{O}_t} m_t(o),
+$$
 
-```text
-r_S(y, z) = σ( log p(y) − log p(z) )       = p(y) / ( p(y) + p(z) )
-r_T(y, z) = σ( log q(y) − log q(z) )       = q(y) / ( q(y) + q(z) )
+$$
+\boxed{\;
+L_t \;=\; \sum_{o \in \mathcal{O}_t} \frac{m_t(o)}{Z_t}\;
+\mathrm{KL_B}\bigl(\, r_T(y_t, o)  \Vert  r_S(y_t, o) \,\bigr)
+\;}
+$$
 
-r_S(y, ⊥) = σ( log p(y) − log(1 − p(y)) ) = p(y)
-r_T(y, ⊥) = σ( log q(y) − log(1 − q(y)) ) = q(y)
-```
+胜率是 Bradley–Terry 式的归一化对，都有闭式。对真实 token 对手 $z \in \mathcal{V}_t$：
 
-最后两行是关键：代入 `o = ⊥` 那一项**恰好等于** `KL_B(q(y_t)‖p(y_t))`。所以**目标 token 的
-loss 不是外加项**，而是这个统一公式在最粗对手上的特例，权重也照常由 `q(y_t)` 给出，
-因此没有自由系数。
+$$
+r_S(y, z) = \sigma\bigl(\log p(y) - \log p(z)\bigr) = \frac{p(y)}{p(y) + p(z)},
+\qquad
+r_T(y, z) = \sigma\bigl(\log q(y) - \log q(z)\bigr) = \frac{q(y)}{q(y) + q(z)}.
+$$
 
-把 `a_t = m_t(⊥)/Z_t` 记作聚合对手的权重（默认配置下实测均值约 0.65），上式精确等于一个
+对聚合对手 $\perp$（取补集时）：
+
+$$
+r_S(y, \perp) = \sigma\Bigl(\log \tfrac{p(y)}{1 - p(y)}\Bigr) = p(y),
+\qquad
+r_T(y, \perp) = \sigma\Bigl(\log \tfrac{q(y)}{1 - q(y)}\Bigr) = q(y).
+$$
+
+第二组是关键：代入 $o = \perp$，那一项**恰好等于** $\mathrm{KL_B}\bigl(q_t(y_t)  \Vert  p_t(y_t)\bigr)$。
+所以**目标 token 的 loss 不是外加项**，而是这个统一公式在最粗对手上的特例，权重也照常由
+$q_t(y_t)$ 给出，因此没有自由系数。
+
+把 $a_t = m_t(\perp)/Z_t$ 记作聚合对手的权重（默认配置下实测均值约 0.65），上式精确等于一个
 凸组合：
 
-```text
-L_t = (1 − a_t) · Σ_{z ∈ V_t} [ q_t(z) / Σ_{z' ∈ V_t} q_t(z') ] · KL_B( r_T(y_t,z) ‖ r_S(y_t,z) )
-      + a_t · KL_B( q_t(y_t) ‖ p_t(y_t) )
-```
-
-即「在 top-K 内部归一化的成对排序项」与「目标 token 项」的加权平均。
+$$
+L_t \;=\; (1 - a_t) \underbrace{\sum_{z \in \mathcal{V}_t}
+\frac{q_t(z)}{\sum_{z' \in \mathcal{V}_t} q_t(z')}\,
+\mathrm{KL_B}\bigl(r_T(y_t, z)  \Vert  r_S(y_t, z)\bigr)}_{\text{在 top-}K\text{ 内部归一化的成对排序项}}
+\;+\; a_t \underbrace{\mathrm{KL_B}\bigl(q_t(y_t)  \Vert  p_t(y_t)\bigr)}_{\text{目标 token 项}}
+$$
 
 梯度对每个成对 margin 的形式统一：
 
-```text
-∂L_t / ∂( S(y_t) − S(o) ) = [ m_t(o) / Z_t ] · ( r_S(y_t, o) − r_T(y_t, o) )
-```
+$$
+\frac{\partial L_t}{\partial\bigl(S(y_t) - S(o)\bigr)}
+\;=\; \frac{m_t(o)}{Z_t}\,\bigl(r_S(y_t, o) - r_T(y_t, o)\bigr).
+$$
 
-代入 `o = ⊥` 就是 `a_t · ( p(y_t) − q(y_t) )` —— 偏差本身就是梯度，`p(y_t) > q(y_t)` 时压低
-student 的置信度，反之抬高。它是**双向**的，不是 SFT 式的 `−log p(y_t)`。
+代入 $o = \perp$ 就是 $a_t\bigl(p_t(y_t) - q_t(y_t)\bigr)$ —— 偏差本身就是梯度，
+$p_t(y_t) > q_t(y_t)$ 时压低 student 的置信度，反之抬高。它是**双向**的，不是 SFT 式的
+$-\log p_t(y_t)$。
 
-- `S`、`T` 分别是 student / teacher 的 logit，`σ` 为 sigmoid；
-- 权重 `m_t/Z_t` 与 teacher 胜率 `r_T` 均为 stop-gradient，只有 student 接收梯度；
+- 权重 $m_t/Z_t$ 与 teacher 胜率 $r_T$ 均为 stop-gradient，只有 student 接收梯度；
 - 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）。
 
 **实现上的两个要点**：
 
-1. `KL_B` 在代码里是用 Bernoulli 交叉熵算的（`binary_cross_entropy_with_logits`），与 KL 只
-   差一个 teacher 侧的 Bernoulli 熵，是 student 无关的常数，梯度完全相同；诊断
+1. $\mathrm{KL_B}$ 在代码里是用 Bernoulli 交叉熵算的（`binary_cross_entropy_with_logits`），与
+   KL 只差一个 teacher 侧的 Bernoulli 熵，是 student 无关的常数，梯度完全相同；诊断
    `actor/l_apd_bernoulli_kl` 已把它减掉，所以日志里报的是纯 KL。
-2. softmax 归一化项在 logit 差里会抵消，即 `T(y) − T(z) = log q(y) − log q(z)`。因此所有成对
-   margin 都能直接从框架已有的 top-k log-prob 读出，**不需要传输或重算原始 logits，也不需要
-   额外的 teacher forward**。每次更新仍然只有一次 student forward，显存与吞吐和 OPD
+2. softmax 归一化项在 logit 差里会抵消，即 $T(y) - T(z) = \log q(y) - \log q(z)$。因此所有
+   成对 margin 都能直接从框架已有的 top-$k$ log-prob 读出，**不需要传输或重算原始 logits，
+   也不需要额外的 teacher forward**。每次更新仍然只有一次 student forward，显存与吞吐和 OPD
    baseline 完全一致。
 
 ### 1.1 候选集与归一化范围
 
-为了和 OPD baseline 可比，默认候选取 **student top-k**（baseline 的
+为了和 OPD baseline 可比，默认候选取 **student top-$k$**（baseline 的
 `top_k_strategy=only_stu` 打分的就是这一组），权重来源是 teacher 在这些 id 上的概率
-`q(z)` 而非 baseline 的 student 概率 —— 这是 `q̃(z) ∝ q(z)` 的定义决定的，改掉就不是
-L-APD 了。归一化范围是**含锚点的这 16 个 id**（见下），和 baseline 在 K 维上做一次
+$q(z)$ 而非 baseline 的 student 概率 —— 这是 $\tilde q(z) \propto q(z)$ 的定义决定的，改掉
+就不是 L-APD 了。归一化范围是**含锚点的这 16 个 id**（见下），和 baseline 在 $K$ 维上做一次
 softmax 的范围逐一对应。
 
 ### 1.2 为什么必须有一个聚合对手
 
-成对项只通过 logit 差 `S(y_t) − S(z)` 依赖 student，所以如果对手只有 top-k 里那些**真实
-token**，就存在一个**精确的不变性**：把 `{y_t} ∪ top-k` 这些 token 的 logit 同时加上同一个
-常数（等价于把这一组的总质量整体缩放，多出/少掉的部分由截断掉的尾部吸收），所有成对
-margin 不变，**loss 一个字都不变**。于是在成对最优点上只能推出比例关系
+成对项只通过 logit 差 $S(y_t) - S(z)$ 依赖 student，所以如果对手只有 top-$k$ 里那些**真实
+token**，就存在一个**精确的不变性**：把 $\mathcal{S}_t = \lbrace y_t \rbrace \cup \text{top-}k$
+这些 token 的 logit 同时加上同一个常数（等价于把这一组的总质量整体缩放，多出/少掉的部分由
+截断掉的尾部吸收），所有成对 margin 不变，**loss 一个字都不变**。于是在成对最优点上只能
+推出比例关系
 
-```text
-p(y_t) = q(y_t) · M_S / N_S      M_S、N_S 分别是 student / teacher 在 {y_t} ∪ top-k 上的总质量
-```
+$$
+p(y_t) \;=\; q(y_t)\cdot\frac{M_S}{N_S},
+\qquad
+M_S = \sum_{v \in \mathcal{S}_t} p(v),
+\qquad
+N_S = \sum_{v \in \mathcal{S}_t} q(v).
+$$
 
-其中 `M_S` 完全自由 —— student 可以把 15 个成对关系全部拟合到完美，同时把大量质量漏进
+其中 $M_S$ 完全自由 —— student 可以把 15 个成对关系全部拟合到完美，同时把大量质量漏进
 尾部。`tests/trainer/ppo/test_l_apd_on_cpu.py::test_token_candidates_alone_leave_the_tail_mass_unidentified`
-锁住了这个性质；一个数值实验里 student 最终停在 `p_tail = 18.9%`（teacher 只有 1.15%），
-top-k 内每个 token 都被统一压低 18%，而 loss 已经收敛。
+锁住了这个性质；一个数值实验里 student 最终停在 $p_{\text{tail}} = 18.9\%$（teacher 只有
+$1.15\%$），top-$k$ 内每个 token 都被统一压低 18%，而 loss 已经收敛。
 
 补一个**聚合对手**就能消掉这个自由方向：只要对手集合覆盖全词表，由
-`p(y)/p(c) = q(y)/q(c)` 对每一块成立、两边求和且都归一到 1，立刻得到 `p(y_t) = q(y_t)`。
-有两种选法：
+$p(y)/p(c) = q(y)/q(c)$ 对每一块 $c$ 成立、两边求和且都归一到 1，立刻得到
+$p(y_t) = q(y_t)$。有两种选法：
 
-| | 聚合对手 | 该项的含义 | 权重（自动定标） |
+| | 聚合对手 $\perp$ | 该项的含义 | 权重（自动定标） |
 | --- | --- | --- | --- |
-| `complement_candidate=True`（默认） | `y_t` 的补集，即"除 `y_t` 外的全体" | `KL_B(q(y_t)‖p(y_t))`，即目标 token 的 loss | `a_t = q(y_t)/Z_t`，实测约 0.65 |
-| `tail_candidate=True` | top-k 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | `q_tail/Z_t`，此时 `Z_t = 1 − q(y_t)`，实测约 0.10 |
+| `complement_candidate=True`（默认） | $y_t$ 的补集，即"除 $y_t$ 外的全体" | $\mathrm{KL_B}(q(y_t) \Vert p(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65$ |
+| `tail_candidate=True` | top-$k$ 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | $q_{\text{tail}}/Z_t$，此时 $Z_t = 1 - q(y_t)$，实测约 $0.10$ |
 
 两者都是**同一个成对构造**在一个聚合对手上的特例，权重都由 teacher 质量自动决定，
-所以都没有自由系数。`tail_candidate` 优先级更高；它开启时对手集合 `{z_1..z_k, tail}` 构成
-"非 `y_t`"的真正**划分**，补集对手则与 `z_j` 有重叠，是一个让总权重恰好为 1 的启发式。
+所以都没有自由系数。`tail_candidate` 优先级更高；它开启时对手集合
+$\lbrace z_1, \dots, z_k, \text{tail} \rbrace$ 构成"非 $y_t$"的真正**划分**，补集对手则与 $z_j$ 有重叠，
+是一个让总权重恰好为 1 的启发式。
 
 默认选补集，理由有三条：
 
-1. **归一化范围与 baseline 对齐**。此时 `Z_t = q(y_t) + Σ_{z ∈ V_t} q(z)` 是 teacher 在
-   `{y_t} ∪ top-16` 上的总质量，**含锚点**，所以权重是在 baseline 用的那 16 个 id 上归一化
-   的；`tail_candidate` 会引入 baseline 没有的第 17 个虚拟对手。展开就是 §1 那个凸组合，
-   每个 token 的总权重恒为 1。
+1. **归一化范围与 baseline 对齐**。此时
+   $Z_t = q(y_t) + \sum_{z \in \mathcal{V}_t} q(z)$ 是 teacher 在
+   $\lbrace y_t \rbrace \cup \text{top-}16$ 上的总质量，**含锚点**，所以权重是在 baseline 用的那 16 个 id
+   上归一化的；`tail_candidate` 会引入 baseline 没有的第 17 个虚拟对手。展开就是 §1 那个凸
+   组合，每个 token 的总权重恒为 1。
+2. **顺带修掉了权重归一化的 eps 下限问题**。归一化分母现在至少是 $q(y_t)$，不会塌陷。
+   此前 teacher 在采样 token 上几乎确定（$q(y_t) > 1 - 10^{-6}$）的位置会撞上 $10^{-6}$ 下限、
+   权重被压到 0、梯度丢失，实测 `candidate_weight_sum` $\approx 0.94$，约 6% 的 token 受影响。
+   现在这些位置 $a_t \to 1$，锚点项接管全部权重。
+3. **目标在两种模式间自动切换**。$q(y_t) \to 0$（teacher 认为采样 token 很差）时
+   $a_t \to 0$，几乎全是排序信号；$q(y_t) \to 1$ 时 $a_t \to 1$，竞争者概率都趋于 0、本来
+   无序可排，信号转为锚点水平。
 
-2. **顺带修掉了权重归一化的 eps 下限问题**。归一化分母现在至少是 `q(y_t)`，不会塌陷。
-   此前 teacher 在采样 token 上几乎确定（`q(y_t) > 1 − 1e-6`）的位置会撞上 `1e-6` 下限、
-   权重被压到 0、梯度丢失，实测 `candidate_weight_sum ≈ 0.94`，约 6% 的 token 受影响。
-   现在这些位置 `a_t → 1`，锚点项接管全部权重。
-3. **目标在两种模式间自动切换**。`q(y_t) → 0`（teacher 认为采样 token 很差）时 `a_t → 0`，
-   几乎全是排序信号；`q(y_t) → 1` 时 `a_t → 1`，竞争者概率都趋于 0、本来无序可排，
-   信号转为锚点水平。
-
-已知代价：`a_t` 均值约 0.65，意味着**多数 token 上锚点项占主导**，排序监督相应被稀释。
-一个两位置的数值实验里，`q(y)=0.95` 那个位置的 `p_tail` 收到 8.67e-03（真值 2.37e-03，
-偏高 3.7 倍），因为成对项只剩 0.05 的权重、竞争者之间的相对水平收敛很慢。`p(y_t)` 本身
-是准的。这是收敛速度而非渐近性质的问题，但 203 步训练里速度就是结果，所以
-`tail_candidate=True` 值得作为对照跑一次。
+已知代价：$a_t$ 均值约 $0.65$，意味着**多数 token 上锚点项占主导**，排序监督相应被稀释。
+一个两位置的数值实验里，$q(y)=0.95$ 那个位置的 $p_{\text{tail}}$ 收到
+$8.67\times10^{-3}$（真值 $2.37\times10^{-3}$，偏高 3.7 倍），因为成对项只剩 $0.05$ 的权重、
+竞争者之间的相对水平收敛很慢；$p(y_t)$ 本身是准的。这是收敛速度而非渐近性质的问题，
+但 203 步训练里速度就是结果，所以 `tail_candidate=True` 值得作为对照跑一次。
 
 顺带一提，框架里没有其它项在约束这个方向：`USE_KL` 默认 `False`，而且 ref-KL 那段代码在
 `update_policy` 的非 L-APD 分支里；`entropy_coeff` 也是 0。
@@ -365,10 +396,10 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/pg_loss` | L-APD 目标值（复用了原字段名） |
 | `actor/l_apd_bernoulli_kl` | teacher 加权的成对 Bernoulli KL（扣掉 teacher 熵的纯 KL），含聚合对手那一项 |
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
-| `actor/l_apd_pairwise_gap` | 加权的 `abs(r_S − r_T)`，student 与 teacher 胜率的差距 |
-| `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 `q(y_t)` / `p(y_t)`，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
-| `actor/l_apd_anchor_kl` | 锚点项 `KL_B(q(y_t)‖p(y_t))`，`p(y_t) = q(y_t)` 时恰好为 0；仅 `complement_candidate` 生效时记录 |
-| `actor/l_apd_anchor_weight` | 补集对手拿到的权重 `a_t = q(y_t)/Z_t`（见 §1）；仅 `complement_candidate` 生效时记录 |
+| `actor/l_apd_pairwise_gap` | 加权的 $\lvert r_S - r_T \rvert$，student 与 teacher 胜率的差距 |
+| `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 $q(y_t)$ / $p(y_t)$，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
+| `actor/l_apd_anchor_kl` | 锚点项 $\mathrm{KL_B}(q(y_t) \Vert p(y_t))$，$p(y_t) = q(y_t)$ 时恰好为 0；仅 `complement_candidate` 生效时记录 |
+| `actor/l_apd_anchor_weight` | 补集对手拿到的权重 $a_t = q(y_t)/Z_t$（见 §1）；仅 `complement_candidate` 生效时记录 |
 | `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_anchor_in_candidates` | 锚点落在候选 top-k 内的比例 |
@@ -387,11 +418,11 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
 ```
 
 覆盖：全词表候选时与定义式逐元素相等；autograd 梯度等于解析式
-`∂L/∂(S(y)−S(z)) = q̃(z)·(r_S − r_T)`；tail 候选只含一个 token 时与全词表 loss 精确相等；
-`p = q` 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
-（只有真实 token 对手时 loss 对"质量在 top-k 与尾部之间如何分配"完全不变，而两种聚合对手
-都能破掉这个不变性）；补集对手那一项逐元素等于 `KL_B(q(y_t)‖p(y_t))`、权重逐元素等于
-`q(y_t)/Z_t`、且含它的权重和恒为 1。
+$\partial L / \partial\bigl(S(y) - S(z)\bigr) = \tilde q(z)\,(r_S - r_T)$；tail 候选只含一个
+token 时与全词表 loss 精确相等；$p = q$ 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的
+归一化性质；§1.2 的可辨识性（只有真实 token 对手时 loss 对"质量在 top-$k$ 与尾部之间如何
+分配"完全不变，而两种聚合对手都能破掉这个不变性）；补集对手那一项逐元素等于
+$\mathrm{KL_B}(q(y_t) \Vert p(y_t))$、权重逐元素等于 $q(y_t)/Z_t$、且含它的权重和恒为 1。
 
 ## 9. 注意事项
 
@@ -406,9 +437,9 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
   与锚点上的 `teacher_log_probs`；该变量只影响 OPD 侧的 reward 构造。候选数由
   `LOG_PROB_TOP_K` 决定。
 - **两个聚合对手全关掉时权重归一化会撞 eps 下限**。权重按 `raw / max(Σ raw, 1e-6)` 归一化，
-  只有真实 token 对手时，teacher 在采样 token 上几乎确定（`q(y_t) > 1 − 1e-6`）的位置竞争者
+  只有真实 token 对手时，teacher 在采样 token 上几乎确定（$q(y_t) > 1 - 10^{-6}$）的位置竞争者
   总质量小于 `1e-6`，下限生效、权重被压到 0、梯度丢失（实测 `candidate_weight_sum ≈ 0.94`，
-  约 6% 的 token）。默认配置不受影响：补集对手让分母至少为 `q(y_t)`，tail 对手则由
+  约 6% 的 token）。默认配置不受影响：补集对手让分母至少为 $q(y_t)$，tail 对手则由
   `_log1mexp` 的 clamp 兜了一个 `~1e-6` 的地板。
 - **不要打开 `TORCH_NCCL_BLOCKING_WAIT`**。它和 vLLM 的 CUDA graph capture 会死锁：8 个 rank
   全堵在 torch 的 `ProcessGroupNCCL::waitForPendingWorks()` 里，而那个等待循环没有超时，
