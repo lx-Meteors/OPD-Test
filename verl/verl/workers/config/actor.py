@@ -44,20 +44,21 @@ class LAPDConfig(BaseConfig):
         candidate_source (str): Where competitor tokens come from. 'teacher' uses the teacher top-k
             (the main method), 'student' uses the student top-k.
         tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
-            candidate set, so top-k truncation does not need a separate target loss.
+            candidate set, so the opponents form a genuine partition of the non-anchor vocabulary.
+        complement_candidate (bool): Add one aggregated candidate standing for everything except the
+            anchor, which is the anchor term ``KL_B(q(y_t) || p(y_t))`` in pairwise form, weighted by
+            ``q(y_t)`` like any other candidate. Ignored when ``tail_candidate`` is set. One of the two
+            is required: token candidates alone only constrain logit differences and leave the mass
+            split between the top-k set and the truncated tail unidentified.
         normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
             by ``1 - q(y_t)``.
-        target_loss_coef (float): Weight of the anchor-only Bernoulli KL term ``KL_B(q(y_t) || p(y_t))``.
-            Redundant when ``tail_candidate=True``, but required when it is off: the pairwise terms then
-            only constrain logit differences and leave the mass split between the top-k set and the
-            truncated tail unidentified.
     """
 
     enable: bool = False
     candidate_source: str = "teacher"
     tail_candidate: bool = True
+    complement_candidate: bool = True
     normalize_weights: bool = True
-    target_loss_coef: float = 0.0
 
 
 @dataclass

@@ -83,7 +83,13 @@ def test_matches_full_vocab_definition():
     candidate_ids = torch.arange(vocab).expand(*anchors.shape, vocab)
 
     token_loss, _ = _call_loss(
-        student_logits, teacher_logits, anchors, response_mask, candidate_ids, tail_candidate=False
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=False,
     )
     expected = _reference_full_vocab_loss(student_logits, teacher_logits, anchors, response_mask)
 
@@ -116,7 +122,13 @@ def test_gradient_matches_analytical_margin_gradient():
     candidate_ids = _candidates_from_teacher(teacher_logits, k=4)
 
     token_loss, _ = _call_loss(
-        student_logits, teacher_logits.float(), anchors, response_mask, candidate_ids, tail_candidate=False
+        student_logits,
+        teacher_logits.float(),
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=False,
     )
     token_loss.sum().backward()
 
@@ -195,10 +207,17 @@ def test_weights_are_a_distribution_over_candidates():
         response_mask,
         candidate_ids,
         tail_candidate=False,
+        complement_candidate=False,
         normalize_weights=False,
     )
     _, renormalized = _call_loss(
-        student_logits, teacher_logits, anchors, response_mask, candidate_ids, tail_candidate=False
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=False,
     )
 
     torch.testing.assert_close(
@@ -217,13 +236,13 @@ def test_weights_are_a_distribution_over_candidates():
     )
 
 
-def test_truncated_pairs_alone_leave_the_tail_mass_unidentified():
-    """Without a tail candidate the pairwise terms only constrain logit differences.
+def test_token_candidates_alone_leave_the_tail_mass_unidentified():
+    """Token candidates alone only constrain logit differences.
 
     Scaling the mass of ``{anchor} + candidates`` up or down, with the slack absorbed
     by the truncated tail, leaves every ``S(y) - S(z)`` untouched and so cannot change
-    the loss. The anchor term is what removes that freedom, which is why
-    ``target_loss_coef`` must be non-zero whenever ``tail_candidate`` is off.
+    the loss. Either aggregated candidate removes that freedom, which is why one of
+    them is required.
     """
     vocab, k = 32, 8
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=3)
@@ -236,36 +255,78 @@ def test_truncated_pairs_alone_leave_the_tail_mass_unidentified():
     in_set.scatter_(-1, anchors.unsqueeze(-1), True)
     shifted[in_set] -= 2.0
 
-    for tail_candidate, target_loss_coef, should_differ in [
-        (False, 0.0, False),  # the unidentified direction
-        (False, 1.0, True),  # anchor term removes it
-        (True, 0.0, True),  # tail candidate removes it
+    for tail_candidate, complement_candidate, should_differ in [
+        (False, False, False),  # the unidentified direction
+        (False, True, True),  # complement candidate removes it
+        (True, False, True),  # tail candidate removes it
     ]:
-        kwargs = dict(tail_candidate=tail_candidate, target_loss_coef=target_loss_coef)
+        kwargs = dict(tail_candidate=tail_candidate, complement_candidate=complement_candidate)
         base, _ = _call_loss(student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs)
         moved, _ = _call_loss(shifted, teacher_logits, anchors, response_mask, candidate_ids, **kwargs)
         if should_differ:
-            assert (moved - base).abs().max() > 1e-3, (tail_candidate, target_loss_coef)
+            assert (moved - base).abs().max() > 1e-3, kwargs
         else:
             torch.testing.assert_close(moved, base, atol=1e-5, rtol=1e-4)
 
 
-def test_anchor_term_is_minimized_when_anchor_probs_match():
-    """The reported anchor KL vanishes exactly when ``p(y_t) == q(y_t)``."""
+def test_complement_candidate_is_the_anchor_bernoulli_kl():
+    """The complement pair reproduces ``KL_B(q(y_t) || p(y_t))`` and its ``q(y_t)`` weight."""
     vocab, k = 32, 8
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=4)
     candidate_ids = _candidates_from_teacher(teacher_logits, k)
+    kwargs = dict(tail_candidate=False, complement_candidate=True)
 
     _, mismatched = _call_loss(
-        student_logits, teacher_logits, anchors, response_mask, candidate_ids, target_loss_coef=1.0
+        student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs
     )
-    _, matched = _call_loss(
-        teacher_logits, teacher_logits, anchors, response_mask, candidate_ids, target_loss_coef=1.0
+    _, matched = _call_loss(teacher_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs)
+
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    p_anchor = student_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1).exp()
+    q_anchor = teacher_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1).exp()
+    expected_kl = q_anchor * (q_anchor / p_anchor).log() + (1 - q_anchor) * ((1 - q_anchor) / (1 - p_anchor)).log()
+
+    torch.testing.assert_close(
+        mismatched["anchor_kl"].double() * response_mask, expected_kl * response_mask, atol=1e-5, rtol=1e-4
+    )
+    assert (matched["anchor_kl"] * response_mask).abs().max() < 1e-5
+
+    # Weight of the complement candidate is q(y_t) renormalized over anchor + candidates.
+    q_candidates = teacher_log_probs.gather(-1, candidate_ids).exp()
+    kept = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+    expected_weight = q_anchor / (q_anchor + (q_candidates * kept).sum(-1))
+    torch.testing.assert_close(
+        mismatched["anchor_weight"].double() * response_mask,
+        expected_weight * response_mask,
+        atol=1e-5,
+        rtol=1e-4,
     )
 
-    assert (matched["anchor_kl"] * response_mask).abs().max() < 1e-5
-    assert (mismatched["anchor_kl"] * response_mask).max() > 1e-3
-    assert (mismatched["anchor_kl"] * response_mask).min() >= -1e-5
+
+def test_weights_including_the_complement_sum_to_one():
+    """With the complement candidate the whole loss is a convex combination."""
+    vocab, k = 32, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=5)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    _, diagnostics = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=True,
+    )
+
+    valid_positions = response_mask.bool()
+    torch.testing.assert_close(
+        diagnostics["candidate_weight_sum"][valid_positions],
+        torch.ones(int(response_mask.sum())),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 if __name__ == "__main__":

@@ -27,17 +27,16 @@ export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-student}"
 # Off to match the baseline, which renormalizes strictly inside the top-k and
 # carries no aggregate tail term.
 export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-False}"
+# Aggregated "everything except the anchor" candidate, i.e. the anchor term
+# KL_B(q(y_t) || p(y_t)) weighted by q(y_t). Required with the tail candidate off,
+# and it makes the weights normalize over the same 16 ids the baseline uses.
+export L_APD_COMPLEMENT_CANDIDATE="${L_APD_COMPLEMENT_CANDIDATE:-True}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
-# Anchor-only Bernoulli KL term. Required here because the tail candidate is off:
-# the pairwise terms then only constrain logit differences, leaving the student
-# free to bleed mass into the truncated tail. 0.1 matches the weight the tail
-# candidate carried when it was enabled.
-export L_APD_TARGET_LOSS_COEF="${L_APD_TARGET_LOSS_COEF:-0.1}"
 
-run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-tgt_${L_APD_TARGET_LOSS_COEF}" \
+run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}" \
     "actor_rollout_ref.actor.l_apd.enable=True" \
     "actor_rollout_ref.actor.l_apd.candidate_source=${L_APD_CANDIDATE_SOURCE}" \
     "actor_rollout_ref.actor.l_apd.tail_candidate=${L_APD_TAIL_CANDIDATE}" \
+    "actor_rollout_ref.actor.l_apd.complement_candidate=${L_APD_COMPLEMENT_CANDIDATE}" \
     "actor_rollout_ref.actor.l_apd.normalize_weights=${L_APD_NORMALIZE_WEIGHTS}" \
-    "actor_rollout_ref.actor.l_apd.target_loss_coef=${L_APD_TARGET_LOSS_COEF}" \
     "$@"

@@ -81,13 +81,14 @@ l_apd:
   # Add one aggregated candidate carrying the probability mass outside the candidate set
   tail_candidate: true
 
+  # Add one aggregated candidate standing for everything except the anchor, i.e. the anchor term
+  # KL_B(q(y_t) || p(y_t)) in pairwise form, weighted by q(y_t). Ignored when tail_candidate=true.
+  # One of the two is required: token candidates alone leave the mass split between the top-k set
+  # and the truncated tail unidentified
+  complement_candidate: true
+
   # Normalize teacher candidate weights by their own sum instead of by 1 - q(y_t)
   normalize_weights: true
-
-  # Weight of the anchor-only Bernoulli KL term KL_B(q(y_t) || p(y_t)).
-  # Redundant when tail_candidate=true, but required when it is off: the pairwise terms alone
-  # leave the mass split between the top-k set and the truncated tail unidentified
-  target_loss_coef: 0.0
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

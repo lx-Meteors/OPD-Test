@@ -167,8 +167,8 @@ Loss options (`actor_rollout_ref.actor.l_apd.*`, or the env vars the script expo
 | `enable` | `false` | Train with L-APD instead of the policy-gradient surrogate |
 | `candidate_source` | `teacher` | Competitor tokens: teacher top-k (main method) or student top-k |
 | `tail_candidate` | `true` | Aggregate the mass outside the candidate set into one candidate |
+| `complement_candidate` | `true` | Aggregate everything except the anchor into one candidate, i.e. the anchor term `KL_B(q(y_t) \|\| p(y_t))`. Ignored when `tail_candidate` is set; one of the two is required |
 | `normalize_weights` | `true` | Normalize candidate weights by their sum instead of `1 - q(y_t)` |
-| `target_loss_coef` | `0.0` | Optional anchor-only Bernoulli KL term, ablation only |
 
 Training logs `actor/l_apd_*`: the Bernoulli KL against the teacher, the
 teacher-weighted pairwise agreement and gap, anchor probabilities, the tail

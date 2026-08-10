@@ -65,8 +65,8 @@ actor_rollout_ref:
       enable: false
       candidate_source: teacher
       tail_candidate: true
+      complement_candidate: true
       normalize_weights: true
-      target_loss_coef: 0.0
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     entropy_coeff: 0

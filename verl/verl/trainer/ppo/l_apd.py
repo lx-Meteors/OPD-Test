@@ -26,6 +26,14 @@ teacher states how ``y`` should be ranked against each important competitor
 with Bradley-Terry style soft win rates ``r(y, z) = sigmoid(logit(y) - logit(z))``
 and teacher candidate weights ``\\tilde q_t(z) = q_t(z) / (1 - q_t(y_t))``.
 
+Because the candidate set is a truncated top-k, the token candidates alone do not
+cover the vocabulary, and an objective built only from them cannot identify
+``p_t(y_t)``: it is invariant to moving mass between ``{y_t} + candidates`` and the
+truncated tail. One aggregated candidate restores coverage, and there are two
+choices for it (see ``tail_candidate`` / ``complement_candidate``). Both enter as
+ordinary candidates, weighted by their own teacher mass, so neither introduces a
+free coefficient.
+
 Because a softmax normalizer cancels inside a logit difference, all pairwise
 margins can be computed from log-probabilities alone, so no raw logits have to
 be materialized or communicated:
@@ -92,8 +100,8 @@ def compute_l_apd_token_loss(
     candidate_mask: torch.Tensor,
     response_mask: torch.Tensor,
     tail_candidate: bool = True,
+    complement_candidate: bool = True,
     normalize_weights: bool = True,
-    target_loss_coef: float = 0.0,
     eps: float = 1.0e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the per-token L-APD loss.
@@ -109,22 +117,25 @@ def compute_l_apd_token_loss(
         candidate_mask: ``(bs, response_length, k)`` mask selecting candidates
             that take part in the loss, i.e. ``z != y_t`` at valid positions.
         response_mask: ``(bs, response_length)`` mask of valid response tokens.
-        tail_candidate: whether to append one aggregated candidate that carries
-            the probability mass outside the candidate set. This keeps the
-            truncated tail supervised without introducing a target-loss weight.
+        tail_candidate: append one aggregated candidate carrying the probability mass
+            outside the candidate set. Its opponents then form a genuine partition of
+            the non-anchor vocabulary, so the tail is supervised too.
+        complement_candidate: append one aggregated candidate standing for everything
+            except the anchor, i.e. the anchor term ``KL_B(q(y) || p(y))`` written in
+            pairwise form. Ignored when ``tail_candidate`` is set, which already covers
+            the vocabulary.
+
+            One of the two is required. Token candidates alone constrain the student
+            only through the logit differences ``S(y) - S(z)``, which leaves one
+            direction free: scaling the mass of ``{y} + candidates`` up or down, with
+            the slack absorbed by the truncated tail, does not change the loss at all.
+            Either aggregated candidate closes that gap, because matching the teacher
+            ratio on a set of cells that covers the whole vocabulary forces
+            ``p(y) = q(y)`` once both sides are normalized.
         normalize_weights: divide the candidate weights by their own sum instead
-            of by ``1 - q(y_t)``. With ``tail_candidate=True`` both are
-            equivalent up to floating point error; without it, normalizing keeps
-            the loss scale independent of how much mass top-k retains.
-        target_loss_coef: weight of the ``KL_B(q(y) || p(y))`` anchor term.
-            The pairwise terms only constrain the logit differences ``S(y) - S(z)``,
-            so with ``tail_candidate=False`` they leave one direction free: scaling
-            the mass of ``{y} + candidates`` up or down, with the slack absorbed by
-            the truncated tail, does not change the loss at all. The anchor term
-            removes that freedom by pinning ``p(y)`` to ``q(y)``, which the pairwise
-            ratios then propagate to the candidates. Only redundant when
-            ``tail_candidate=True``, where the pairs already cover a full partition
-            of the vocabulary and therefore identify ``p(y)`` on their own.
+            of by ``1 - q(y_t)``. Only meaningful together with an aggregated
+            candidate; with ``tail_candidate=True`` the two are equivalent up to
+            floating point error.
         eps: floor for the weight normalizer.
 
     Returns:
@@ -159,6 +170,21 @@ def compute_l_apd_token_loss(
         raw_weights = torch.cat(
             [raw_weights, torch.exp(teacher_tail).unsqueeze(-1) * response_mask.unsqueeze(-1)], dim=-1
         )
+    elif complement_candidate:
+        # The coarsest opponent: everything except the anchor, aggregated. Its margin
+        # log(p(y) / (1 - p(y))) makes the teacher win rate exactly q(y), so this pair
+        # is KL_B(q(y) || p(y)) -- the anchor term -- expressed in the same pairwise
+        # form as every other candidate, and weighted by q(y) like every other candidate.
+        student_complement = _log1mexp(student_anchor)
+        teacher_complement = _log1mexp(teacher_anchor)
+
+        pair_logits = torch.cat([pair_logits, (student_anchor - student_complement).unsqueeze(-1)], dim=-1)
+        teacher_margins = torch.cat(
+            [teacher_margins, (teacher_anchor - teacher_complement).unsqueeze(-1)], dim=-1
+        )
+        raw_weights = torch.cat(
+            [raw_weights, torch.exp(teacher_anchor).unsqueeze(-1) * response_mask.unsqueeze(-1)], dim=-1
+        )
 
     teacher_pair_prob = torch.sigmoid(teacher_margins)
 
@@ -169,18 +195,7 @@ def compute_l_apd_token_loss(
     weights = (raw_weights / normalizer.clamp(min=eps)).detach()
 
     pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
-    token_loss = (weights * pair_loss).sum(dim=-1)
-
-    anchor_loss = None
-    if target_loss_coef != 0.0:
-        # KL_B(q(y) || p(y)) up to a student-independent constant.
-        anchor_logit = student_anchor - _log1mexp(student_anchor)
-        anchor_loss = F.binary_cross_entropy_with_logits(
-            anchor_logit, torch.exp(teacher_anchor), reduction="none"
-        )
-        token_loss = token_loss + target_loss_coef * anchor_loss
-
-    token_loss = token_loss * response_mask
+    token_loss = (weights * pair_loss).sum(dim=-1) * response_mask
 
     with torch.no_grad():
         student_pair_prob = torch.sigmoid(pair_logits)
@@ -201,8 +216,9 @@ def compute_l_apd_token_loss(
             diagnostics["tail_weight"] = weights[..., -1]
             diagnostics["teacher_tail_prob"] = torch.exp(teacher_tail)
             diagnostics["student_tail_prob"] = torch.exp(student_tail)
-        if anchor_loss is not None:
-            # Reported as a KL so it reaches 0 exactly when p(y) == q(y).
-            diagnostics["anchor_kl"] = anchor_loss - _bernoulli_entropy(torch.exp(teacher_anchor))
+        elif complement_candidate:
+            diagnostics["anchor_weight"] = weights[..., -1]
+            # KL_B(q(y) || p(y)), so it reaches 0 exactly when p(y) == q(y).
+            diagnostics["anchor_kl"] = pair_loss[..., -1] - _bernoulli_entropy(teacher_pair_prob[..., -1])
 
     return token_loss, diagnostics
