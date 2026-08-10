@@ -35,6 +35,12 @@ Teacher weights ``w_t(v) = q_t(v) / Z_t`` are renormalized over the whole
 candidate axis, the anchor included: ``Z_t = q_t(y_t) + sum_z q_t(z)``.
 
 ``pair_divergence`` picks the direction and defaults to the reverse one above.
+``log_ratio`` additionally offers the ablation that keeps only the ``v = y_t``
+outcome of that sum, i.e. the bare ``log[p~(y_t) / q~(y_t)]``. That one is not a
+divergence: it is monotone in the student margin, so the teacher cancels out of
+the gradient and the objective is unbounded below. It is the quantity the OPD
+baseline uses as a *reward* under ``no_grad``, where monotonicity is harmless
+because the gradient comes from the policy-gradient term instead.
 
 Because the candidate set is a truncated top-k, the token candidates alone do not
 cover the vocabulary, and an objective built only from them cannot identify
@@ -61,7 +67,7 @@ import torch.nn.functional as F
 
 __all__ = ["compute_l_apd_token_loss", "l_apd_batch_keys"]
 
-_PAIR_DIVERGENCES = ("reverse_kl", "forward_kl")
+_PAIR_DIVERGENCES = ("reverse_kl", "forward_kl", "log_ratio")
 
 # Candidate ids together with the teacher log-probs evaluated on them.
 _CANDIDATE_SOURCES = {
@@ -96,6 +102,19 @@ def _log1mexp(x: torch.Tensor) -> torch.Tensor:
     # Both branches stay finite everywhere on x <= _LOG1MEXP_MAX, which keeps
     # ``torch.where`` from propagating NaNs into the backward pass.
     return torch.where(x > -0.6931471805599453, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
+
+
+def _reverse_pair_kl(student_margins: torch.Tensor, teacher_margins: torch.Tensor) -> torch.Tensor:
+    """``sum_v p~(v) log[p~(v) / q~(v)]`` over the two outcomes of each pair.
+
+    Written from log-sigmoids so it stays finite for every real margin: the
+    ``p~ log p~`` terms vanish at the saturated ends because ``p~`` decays
+    exponentially while its log only grows linearly.
+    """
+    student_prob = torch.sigmoid(student_margins)
+    return student_prob * (F.logsigmoid(student_margins) - F.logsigmoid(teacher_margins)) + (
+        1.0 - student_prob
+    ) * (F.logsigmoid(-student_margins) - F.logsigmoid(-teacher_margins))
 
 
 def _pair_entropy(prob: torch.Tensor) -> torch.Tensor:
@@ -163,6 +182,12 @@ def compute_l_apd_token_loss(
             ``forward_kl`` uses ``KL(q~ || p~)``, whose margin gradient is
             ``p~(y) - q~(y)``: unbounded loss, and the gradient saturates at magnitude
             1 instead of vanishing, so confident misrankings keep full pull.
+
+            ``log_ratio`` keeps only the ``v = y_t`` outcome of the reverse sum, i.e.
+            ``log[p~(y) / q~(y)]``, which on the complement column is
+            ``log[p(y) / q(y)]``. Ablation only: its margin gradient is ``1 - p~(y)``,
+            positive whatever the teacher says, so it has no stationary point, is
+            unbounded below, and drives ``p(y_t)`` to zero.
         eps: floor for the weight normalizer.
 
     Returns:
@@ -228,20 +253,22 @@ def compute_l_apd_token_loss(
     weights = (raw_weights / normalizer.clamp(min=eps)).detach()
 
     if pair_divergence == "reverse_kl":
-        # sum_v p~(v) log[p~(v) / q~(v)] over the two outcomes of the pair, written
-        # from log-sigmoids so it stays finite for every real margin. The
-        # p~ * log p~ terms vanish at the saturated ends because p~ decays
-        # exponentially while its log only grows linearly.
-        student_pair_prob_grad = torch.sigmoid(pair_logits)
-        pair_loss = student_pair_prob_grad * (F.logsigmoid(pair_logits) - F.logsigmoid(teacher_margins)) + (
-            1.0 - student_pair_prob_grad
-        ) * (F.logsigmoid(-pair_logits) - F.logsigmoid(-teacher_margins))
+        pair_loss = _reverse_pair_kl(pair_logits, teacher_margins)
         # The student owns the entropy term here, so the loss already is the KL.
         pair_kl = pair_loss
-    else:
+    elif pair_divergence == "forward_kl":
         pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
         # Cross-entropy; the teacher-side entropy is a stop-gradient constant.
         pair_kl = pair_loss - _pair_entropy(teacher_pair_prob)
+    else:
+        # Only the v = y_t outcome of the reverse KL. On the aggregated complement
+        # column its margin makes the restricted probabilities exactly p(y_t) and
+        # q(y_t), so that column is log[p(y_t) / q(y_t)]. Monotone in the margin, hence
+        # unbounded below and with no stationary point: the teacher term is an additive
+        # stop-gradient constant, so teacher information survives only in the weights
+        # and the candidate set. pair_kl keeps reporting the honest KL.
+        pair_loss = F.logsigmoid(pair_logits) - F.logsigmoid(teacher_margins)
+        pair_kl = _reverse_pair_kl(pair_logits.detach(), teacher_margins)
 
     token_loss = (weights * pair_loss).sum(dim=-1) * response_mask
 

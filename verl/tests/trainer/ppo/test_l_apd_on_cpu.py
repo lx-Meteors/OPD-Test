@@ -544,6 +544,92 @@ def test_reverse_kl_is_bounded_where_forward_diverges():
     assert grads["forward_kl"][1] > 0.9
 
 
+def test_log_ratio_matches_the_two_part_bare_form():
+    """``log_ratio`` is the weighted bare log-ratio plus the target-token log-ratio.
+
+    ``L_t = sum_z [q(z)/Z] log[r_S(y,z) / r_T(y,z)] + [q(y)/Z] log[p(y) / q(y)]``, i.e.
+    the reverse KL with the ``v = z`` outcome of every pair dropped. The complement
+    column collapses to the plain anchor log-ratio because its margin makes the
+    restricted probabilities exactly ``p(y)`` and ``q(y)``.
+    """
+    vocab, k = 64, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=53)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=True,
+        pair_divergence="log_ratio",
+    )
+
+    p = torch.log_softmax(student_logits, dim=-1)
+    q = torch.log_softmax(teacher_logits, dim=-1)
+    p_anchor = p.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    q_anchor = q.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    p_cand, q_cand = p.gather(-1, candidate_ids), q.gather(-1, candidate_ids)
+    kept = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+    normalizer = q_anchor.exp() + (q_cand.exp() * kept).sum(-1)
+
+    r_s = torch.sigmoid(p_anchor.unsqueeze(-1) - p_cand)
+    r_t = torch.sigmoid(q_anchor.unsqueeze(-1) - q_cand)
+    pairwise = ((q_cand.exp() / normalizer.unsqueeze(-1)) * (r_s / r_t).log() * kept).sum(-1)
+    anchor = (q_anchor.exp() / normalizer) * (p_anchor - q_anchor)
+
+    torch.testing.assert_close(
+        token_loss.double(), (pairwise + anchor) * response_mask, atol=1e-5, rtol=1e-4
+    )
+
+
+def test_log_ratio_has_no_stationary_point():
+    """Dropping the ``v = z`` outcome leaves a monotone objective, not a divergence.
+
+    The teacher term becomes an additive stop-gradient constant, so at ``p == q`` the
+    honest KL is zero while the loss still pulls at full strength, and plain gradient
+    descent walks the loss down without bound, taking ``p(y_t)`` to zero with it.
+    """
+    vocab = 16
+    _, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=59)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k=5)
+
+    student_logits = teacher_logits.clone().float().requires_grad_(True)
+    token_loss, diagnostics = _call_loss(
+        student_logits,
+        teacher_logits.float(),
+        anchors,
+        response_mask,
+        candidate_ids,
+        pair_divergence="log_ratio",
+    )
+    token_loss.sum().backward()
+
+    assert diagnostics["pair_kl"].max() < 1e-5
+    assert student_logits.grad.abs().max() > 1e-2
+
+    optimizer = torch.optim.SGD([student_logits], lr=1.0)
+    for _ in range(50):
+        optimizer.zero_grad()
+        loss, _ = _call_loss(
+            student_logits,
+            teacher_logits.float(),
+            anchors,
+            response_mask,
+            candidate_ids,
+            pair_divergence="log_ratio",
+        )
+        loss.sum().backward()
+        optimizer.step()
+
+    student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
+    anchor_log_probs = student_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    assert loss.sum().item() < -10.0
+    assert anchor_log_probs[response_mask.bool()].max().item() < -10.0
+
+
 def test_unknown_pair_divergence_is_rejected():
     vocab, k = 16, 4
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=41)

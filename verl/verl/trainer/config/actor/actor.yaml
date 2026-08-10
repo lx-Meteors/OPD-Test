@@ -93,7 +93,9 @@ l_apd:
   # Direction of the per-pair KL, taken between the two sides restricted to {y_t, z} and renormalized
   # there: reverse_kl uses KL(p~ || q~), forward_kl uses KL(q~ || p~). Same optimum and same
   # first-order behaviour around it; they differ only in how hard confidently misranked pairs are
-  # corrected (reverse decays there, forward does not)
+  # corrected (reverse decays there, forward does not). log_ratio drops the v = z outcome and keeps
+  # the bare log[p~(y_t) / q~(y_t)]; it is not a divergence (monotone in the margin, unbounded below,
+  # teacher absent from the gradient) and exists as an ablation
   pair_divergence: reverse_kl
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C

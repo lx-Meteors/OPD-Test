@@ -58,7 +58,10 @@ class LAPDConfig(BaseConfig):
             whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins directly but decays on
             confidently misranked pairs; 'forward_kl' uses ``KL(q~ || p~)``, whose margin gradient
             ``p~(y_t) - q~(y_t)`` keeps full pull there. Both share the same optimum and agree to
-            first order around it.
+            first order around it. 'log_ratio' keeps only the ``v = y_t`` outcome of the reverse
+            sum, ``log[p~(y_t) / q~(y_t)]``, which is not a divergence: its margin gradient
+            ``1 - p~(y_t)`` never vanishes and never sees the teacher, so the objective is
+            unbounded below. Ablation only.
     """
 
     enable: bool = False
