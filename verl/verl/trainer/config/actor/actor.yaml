@@ -90,6 +90,11 @@ l_apd:
   # Normalize teacher candidate weights by their own sum instead of by 1 - q(y_t)
   normalize_weights: true
 
+  # Direction of the per-pair Bernoulli KL: reverse_kl uses KL_B(r_S || r_T), forward_kl uses
+  # KL_B(r_T || r_S). Same optimum and same first-order behaviour around it; they differ only in how
+  # hard confidently misranked pairs are corrected (reverse decays there, forward does not)
+  pair_divergence: reverse_kl
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

@@ -46,12 +46,17 @@ class LAPDConfig(BaseConfig):
         tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
             candidate set, so the opponents form a genuine partition of the non-anchor vocabulary.
         complement_candidate (bool): Add one aggregated candidate standing for everything except the
-            anchor, which is the anchor term ``KL_B(q(y_t) || p(y_t))`` in pairwise form, weighted by
-            ``q(y_t)`` like any other candidate. Ignored when ``tail_candidate`` is set. One of the two
+            anchor, which is the anchor term -- the Bernoulli KL between ``q(y_t)`` and ``p(y_t)`` --
+            in pairwise form, weighted by ``q(y_t)`` like any other candidate. Ignored when ``tail_candidate`` is set. One of the two
             is required: token candidates alone only constrain logit differences and leave the mass
             split between the top-k set and the truncated tail unidentified.
         normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
             by ``1 - q(y_t)``.
+        pair_divergence (str): Direction of the per-pair Bernoulli KL. 'reverse_kl' scores each pair
+            with ``KL_B(r_S || r_T)``, whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins
+            directly but decays on confidently misranked pairs; 'forward_kl' uses
+            ``KL_B(r_T || r_S)``, whose margin gradient ``r_S - r_T`` keeps full pull there. Both share
+            the same optimum and agree to first order around it.
     """
 
     enable: bool = False
@@ -59,6 +64,7 @@ class LAPDConfig(BaseConfig):
     tail_candidate: bool = True
     complement_candidate: bool = True
     normalize_weights: bool = True
+    pair_divergence: str = "reverse_kl"
 
 
 @dataclass

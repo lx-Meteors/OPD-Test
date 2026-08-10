@@ -20,11 +20,15 @@ teacher states how ``y`` should be ranked against each important competitor
 
 .. math::
 
-    L_t = \\sum_{z \\ne y_t} \\tilde q_t(z)
-          \\mathrm{KL}_{\\mathrm B}(r_T(y_t, z) \\| r_S(y_t, z))
+    L_t = \\sum_{z \\ne y_t} w_t(z)
+          \\mathrm{KL}_{\\mathrm B}(r_S(y_t, z) \\| r_T(y_t, z))
 
 with Bradley-Terry style soft win rates ``r(y, z) = sigmoid(logit(y) - logit(z))``
-and teacher candidate weights ``\\tilde q_t(z) = q_t(z) / (1 - q_t(y_t))``.
+and teacher weights ``w_t(v) = q_t(v) / Z_t`` renormalized over the whole
+candidate axis, the anchor included: ``Z_t = q_t(y_t) + sum_z q_t(z)``.
+
+The direction of the per-pair Bernoulli KL is set by ``pair_divergence`` and
+defaults to the reverse one shown above.
 
 Because the candidate set is a truncated top-k, the token candidates alone do not
 cover the vocabulary, and an objective built only from them cannot identify
@@ -50,6 +54,8 @@ import torch
 import torch.nn.functional as F
 
 __all__ = ["compute_l_apd_token_loss", "l_apd_batch_keys"]
+
+_PAIR_DIVERGENCES = ("reverse_kl", "forward_kl")
 
 # Candidate ids together with the teacher log-probs evaluated on them.
 _CANDIDATE_SOURCES = {
@@ -102,6 +108,7 @@ def compute_l_apd_token_loss(
     tail_candidate: bool = True,
     complement_candidate: bool = True,
     normalize_weights: bool = True,
+    pair_divergence: str = "reverse_kl",
     eps: float = 1.0e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the per-token L-APD loss.
@@ -121,9 +128,9 @@ def compute_l_apd_token_loss(
             outside the candidate set. Its opponents then form a genuine partition of
             the non-anchor vocabulary, so the tail is supervised too.
         complement_candidate: append one aggregated candidate standing for everything
-            except the anchor, i.e. the anchor term ``KL_B(q(y) || p(y))`` written in
-            pairwise form. Ignored when ``tail_candidate`` is set, which already covers
-            the vocabulary.
+            except the anchor, i.e. the anchor term -- the Bernoulli KL between
+            ``q(y)`` and ``p(y)`` -- written in pairwise form. Ignored when
+            ``tail_candidate`` is set, which already covers the vocabulary.
 
             One of the two is required. Token candidates alone constrain the student
             only through the logit differences ``S(y) - S(z)``, which leaves one
@@ -136,12 +143,29 @@ def compute_l_apd_token_loss(
             of by ``1 - q(y_t)``. Only meaningful together with an aggregated
             candidate; with ``tail_candidate=True`` the two are equivalent up to
             floating point error.
+        pair_divergence: which direction of the Bernoulli KL each pair is scored
+            with. Both vanish exactly at ``r_S == r_T`` and agree to first order
+            around it, so this only changes how large disagreements are treated.
+
+            ``reverse_kl`` uses ``KL_B(r_S || r_T)``, whose margin gradient is
+            ``sigmoid'(m) * (m - m_T)``: direct margin matching, but bounded in the
+            student margin, so a confidently misranked pair contributes at most
+            ``-log r_T`` and its gradient decays like ``sigmoid'(m)``.
+
+            ``forward_kl`` uses ``KL_B(r_T || r_S)``, whose margin gradient is
+            ``r_S - r_T``: unbounded loss, and the gradient saturates at magnitude 1
+            instead of vanishing, so confident misrankings keep full pull.
         eps: floor for the weight normalizer.
 
     Returns:
         token_loss: ``(bs, response_length)`` loss, zero outside ``response_mask``.
         diagnostics: dict of detached ``(bs, response_length)`` tensors.
     """
+    if pair_divergence not in _PAIR_DIVERGENCES:
+        raise ValueError(
+            f"Unknown l_apd.pair_divergence: {pair_divergence}. Expected one of {list(_PAIR_DIVERGENCES)}."
+        )
+
     student_anchor = student_anchor_log_probs.float()
     student_candidates = student_candidate_log_probs.float()
     teacher_anchor = teacher_anchor_log_probs.float().detach()
@@ -172,8 +196,8 @@ def compute_l_apd_token_loss(
         )
     elif complement_candidate:
         # The coarsest opponent: everything except the anchor, aggregated. Its margin
-        # log(p(y) / (1 - p(y))) makes the teacher win rate exactly q(y), so this pair
-        # is KL_B(q(y) || p(y)) -- the anchor term -- expressed in the same pairwise
+        # log(p(y) / (1 - p(y))) makes the win rates exactly p(y) and q(y), so this pair
+        # is the Bernoulli KL between them -- the anchor term -- expressed in the same pairwise
         # form as every other candidate, and weighted by q(y) like every other candidate.
         student_complement = _log1mexp(student_anchor)
         teacher_complement = _log1mexp(teacher_anchor)
@@ -194,12 +218,26 @@ def compute_l_apd_token_loss(
         normalizer = (1.0 - torch.exp(teacher_anchor)).unsqueeze(-1)
     weights = (raw_weights / normalizer.clamp(min=eps)).detach()
 
-    pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
+    if pair_divergence == "reverse_kl":
+        # KL_B(r_S || r_T) written from log-sigmoids, which stay finite for every
+        # real margin. The r_S * log r_S terms vanish at the saturated ends because
+        # r_S decays exponentially while its log only grows linearly.
+        student_pair_prob_grad = torch.sigmoid(pair_logits)
+        pair_loss = student_pair_prob_grad * (F.logsigmoid(pair_logits) - F.logsigmoid(teacher_margins)) + (
+            1.0 - student_pair_prob_grad
+        ) * (F.logsigmoid(-pair_logits) - F.logsigmoid(-teacher_margins))
+        # The student owns the entropy term here, so the loss already is the KL.
+        pair_kl = pair_loss
+    else:
+        pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
+        # Cross-entropy; the teacher-side entropy is a stop-gradient constant.
+        pair_kl = pair_loss - _bernoulli_entropy(teacher_pair_prob)
+
     token_loss = (weights * pair_loss).sum(dim=-1) * response_mask
 
     with torch.no_grad():
         student_pair_prob = torch.sigmoid(pair_logits)
-        pairwise_kl = (weights * (pair_loss - _bernoulli_entropy(teacher_pair_prob))).sum(dim=-1)
+        pairwise_kl = (weights * pair_kl).sum(dim=-1)
         agreement = ((student_pair_prob - 0.5) * (teacher_pair_prob - 0.5) > 0).float()
         diagnostics = {
             "bernoulli_kl": pairwise_kl,
@@ -218,7 +256,8 @@ def compute_l_apd_token_loss(
             diagnostics["student_tail_prob"] = torch.exp(student_tail)
         elif complement_candidate:
             diagnostics["anchor_weight"] = weights[..., -1]
-            # KL_B(q(y) || p(y)), so it reaches 0 exactly when p(y) == q(y).
-            diagnostics["anchor_kl"] = pair_loss[..., -1] - _bernoulli_entropy(teacher_pair_prob[..., -1])
+            # Bernoulli KL between q(y) and p(y), so it reaches 0 exactly when
+            # p(y) == q(y) whichever direction the pairs are scored with.
+            diagnostics["anchor_kl"] = pair_kl[..., -1]
 
     return token_loss, diagnostics

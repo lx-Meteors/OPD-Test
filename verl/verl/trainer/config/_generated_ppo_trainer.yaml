@@ -67,6 +67,7 @@ actor_rollout_ref:
       tail_candidate: true
       complement_candidate: true
       normalize_weights: true
+      pair_divergence: reverse_kl
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     entropy_coeff: 0

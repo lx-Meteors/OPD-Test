@@ -63,6 +63,9 @@ def _candidates_from_teacher(teacher_logits, k):
 
 
 def _call_loss(student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs):
+    # The closed forms most tests below compare against are written for the forward
+    # direction, so ask for it explicitly rather than riding on the library default.
+    kwargs.setdefault("pair_divergence", "forward_kl")
     student_log_probs = torch.log_softmax(student_logits, dim=-1)
     teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
     return compute_l_apd_token_loss(
@@ -371,6 +374,189 @@ def test_weights_including_the_complement_sum_to_one():
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_reverse_kl_is_the_default_direction():
+    vocab, k = 32, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=23)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    explicit, _ = _call_loss(
+        student_logits, teacher_logits, anchors, response_mask, candidate_ids, pair_divergence="reverse_kl"
+    )
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    default, _ = compute_l_apd_token_loss(
+        student_anchor_log_probs=student_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1),
+        student_candidate_log_probs=student_log_probs.gather(-1, candidate_ids),
+        teacher_anchor_log_probs=teacher_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1),
+        teacher_candidate_log_probs=teacher_log_probs.gather(-1, candidate_ids),
+        candidate_mask=candidate_ids != anchors.unsqueeze(-1),
+        response_mask=response_mask,
+    )
+
+    torch.testing.assert_close(default, explicit)
+
+
+def test_reverse_kl_matches_the_bernoulli_kl_definition():
+    """The reverse loss is ``sum_o w(o) KL_B(r_S(o) || r_T(o))``, an honest KL."""
+    vocab, k = 64, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=29)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, diagnostics = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=True,
+        pair_divergence="reverse_kl",
+    )
+
+    p = torch.log_softmax(student_logits, dim=-1)
+    q = torch.log_softmax(teacher_logits, dim=-1)
+    p_anchor = p.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    q_anchor = q.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    p_cand, q_cand = p.gather(-1, candidate_ids), q.gather(-1, candidate_ids)
+    kept = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+    normalizer = q_anchor.exp() + (q_cand.exp() * kept).sum(-1)
+
+    def reverse_kl(a, b):
+        return a * (a.log() - b.log()) + (1 - a) * ((1 - a).log() - (1 - b).log())
+
+    pairwise = (
+        (q_cand.exp() / normalizer.unsqueeze(-1))
+        * reverse_kl(torch.sigmoid(p_anchor.unsqueeze(-1) - p_cand), torch.sigmoid(q_anchor.unsqueeze(-1) - q_cand))
+        * kept
+    ).sum(-1)
+    anchor = (q_anchor.exp() / normalizer) * reverse_kl(p_anchor.exp(), q_anchor.exp())
+
+    torch.testing.assert_close(
+        token_loss.double(), (pairwise + anchor) * response_mask, atol=1e-5, rtol=1e-4
+    )
+    # Reverse scores the pairs with the KL itself, so the reported loss is the KL.
+    torch.testing.assert_close(
+        diagnostics["bernoulli_kl"].double() * response_mask,
+        (pairwise + anchor) * response_mask,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_reverse_kl_margin_gradient_closed_form():
+    """dL/d(S(y) - S(z)) = w(z) * sigmoid'(m) * (m - m_T) for the reverse direction."""
+    vocab = 12
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=31)
+    student_logits = student_logits.float().requires_grad_(True)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k=4)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits.float(),
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=False,
+        pair_divergence="reverse_kl",
+    )
+    token_loss.sum().backward()
+
+    p = torch.log_softmax(student_logits.detach(), dim=-1)
+    q = torch.log_softmax(teacher_logits.float(), dim=-1)
+    q_anchor, q_cand = q.gather(-1, anchors.unsqueeze(-1)), q.gather(-1, candidate_ids)
+    valid = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+    weights = q_cand.exp() * valid
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    margin = p.gather(-1, anchors.unsqueeze(-1)) - p.gather(-1, candidate_ids)
+    teacher_margin = q_anchor - q_cand
+    student_win = torch.sigmoid(margin)
+    margin_grad = weights * student_win * (1 - student_win) * (margin - teacher_margin)
+
+    expected = torch.zeros_like(student_logits)
+    expected.scatter_add_(-1, candidate_ids, -margin_grad)
+    expected.scatter_add_(-1, anchors.unsqueeze(-1), margin_grad.sum(dim=-1, keepdim=True))
+
+    torch.testing.assert_close(student_logits.grad, expected, atol=1e-5, rtol=1e-3)
+
+
+def test_both_directions_vanish_on_a_perfect_student():
+    """Both directions share the same optimum, so both are zero at p == q."""
+    vocab = 16
+    _, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=37)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k=5)
+
+    for direction in ("reverse_kl", "forward_kl"):
+        student_logits = teacher_logits.clone().float().requires_grad_(True)
+        token_loss, diagnostics = _call_loss(
+            student_logits,
+            teacher_logits.float(),
+            anchors,
+            response_mask,
+            candidate_ids,
+            pair_divergence=direction,
+        )
+        token_loss.sum().backward()
+
+        assert student_logits.grad.abs().max() < 1e-5, direction
+        assert diagnostics["bernoulli_kl"].max() < 1e-5, direction
+
+
+def test_reverse_kl_is_bounded_where_forward_diverges():
+    """A confidently misranked pair costs at most -log r_T under the reverse direction.
+
+    This is the substantive behavioural difference between the two: the reverse loss
+    saturates on confident disagreement and its gradient decays, while the forward
+    loss grows without bound and keeps a gradient of magnitude up to 1.
+    """
+    teacher_margin = -4.0
+    losses, grads = {}, {}
+    for direction in ("reverse_kl", "forward_kl"):
+        losses[direction], grads[direction] = [], []
+        for student_margin in (8.0, 30.0):
+            # A single pair: anchor plus one candidate, teacher margin fixed.
+            student_anchor = torch.zeros(1, 1, requires_grad=True)
+            student_cand = torch.full((1, 1, 1), -student_margin)
+            token_loss, _ = compute_l_apd_token_loss(
+                student_anchor_log_probs=student_anchor,
+                student_candidate_log_probs=student_cand,
+                teacher_anchor_log_probs=torch.zeros(1, 1),
+                teacher_candidate_log_probs=torch.full((1, 1, 1), -teacher_margin),
+                candidate_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+                response_mask=torch.ones(1, 1),
+                tail_candidate=False,
+                complement_candidate=False,
+                pair_divergence=direction,
+            )
+            token_loss.sum().backward()
+            losses[direction].append(token_loss.item())
+            grads[direction].append(student_anchor.grad.abs().item())
+
+    import math
+
+    ceiling = -math.log(torch.sigmoid(torch.tensor(teacher_margin)).item())
+    assert max(losses["reverse_kl"]) < ceiling + 1e-3
+    assert losses["forward_kl"][1] > 2 * losses["forward_kl"][0]
+    assert grads["reverse_kl"][1] < 1e-6
+    assert grads["forward_kl"][1] > 0.9
+
+
+def test_unknown_pair_divergence_is_rejected():
+    vocab, k = 16, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=41)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    try:
+        _call_loss(
+            student_logits, teacher_logits, anchors, response_mask, candidate_ids, pair_divergence="js"
+        )
+    except ValueError as error:
+        assert "pair_divergence" in str(error)
+    else:
+        raise AssertionError("an unknown pair_divergence should raise")
 
 
 if __name__ == "__main__":

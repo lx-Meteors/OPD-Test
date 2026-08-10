@@ -44,11 +44,14 @@ $$
 $$
 \boxed{\;
 L_t \;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
-\mathrm{KL_B}\bigl(r_T(y_t, z) \Vert r_S(y_t, z)\bigr)
+\mathrm{KL_B}\bigl(r_S(y_t, z) \Vert r_T(y_t, z)\bigr)
 \;+\; \frac{q_t(y_t)}{Z_t}\,
-\mathrm{KL_B}\bigl(q_t(y_t) \Vert p_t(y_t)\bigr)
+\mathrm{KL_B}\bigl(p_t(y_t) \Vert q_t(y_t)\bigr)
 \;}
 $$
+
+默认用**逆向**方向(student 在前),由 `l_apd.pair_divergence` 控制,`forward_kl` 是消融项。
+两个方向的最优点相同、且在最优点附近一阶一致,差别只在大误差处如何修正(见 §1.3)。
 
 所有乘数加起来恰好为 1（诊断 `actor/l_apd_candidate_weight_sum` 就是在查这一点），目标 token
 那一项的乘数记作 $a_t = q_t(y_t)/Z_t$（诊断 `actor/l_apd_anchor_weight`，实测均值约 0.65）。
@@ -70,39 +73,30 @@ r_S(y, \perp) = \sigma\Bigl(\log \tfrac{p(y)}{1 - p(y)}\Bigr) = p(y),
 r_T(y, \perp) = \sigma\Bigl(\log \tfrac{q(y)}{1 - q(y)}\Bigr) = q(y),
 $$
 
-代入 $\mathrm{KL_B}(r_T \Vert r_S)$ **恰好等于** $\mathrm{KL_B}\bigl(q_t(y_t) \Vert p_t(y_t)\bigr)$，
+代入 $\mathrm{KL_B}(r_S \Vert r_T)$ **恰好等于** $\mathrm{KL_B}\bigl(p_t(y_t) \Vert q_t(y_t)\bigr)$，
 也就是 boxed 公式里的最后一项。于是整个 loss 可以合并成一个统一的加权和：把 $\perp$ 当成
 一个额外"对手"、它的 teacher 质量取 $q_t(y_t)$，则
 
 $$
 L_t \;=\; \sum_{o \in \mathcal{V}_t \cup \lbrace \perp \rbrace} \frac{m_t(o)}{Z_t}\;
-\mathrm{KL_B}\bigl(r_T(y_t, o) \Vert r_S(y_t, o)\bigr),
+\mathrm{KL_B}\bigl(r_S(y_t, o) \Vert r_T(y_t, o)\bigr),
 \qquad
 m_t(z) = q_t(z),\quad m_t(\perp) = q_t(y_t).
 $$
 
-这也是代码的实现方式：目标 token 项作为一列追加进候选张量，归一化、BCE、诊断全部复用同一
+这也是代码的实现方式：目标 token 项作为一列追加进候选张量，归一化、散度、诊断全部复用同一
 套逻辑。所以它**不是一个带系数的附加 loss**，没有自由超参。
-
-梯度对每个成对 margin 的形式统一：
-
-$$
-\frac{\partial L_t}{\partial\bigl(S(y_t) - S(o)\bigr)}
-\;=\; \frac{m_t(o)}{Z_t}\,\bigl(r_S(y_t, o) - r_T(y_t, o)\bigr).
-$$
-
-代入 $o = \perp$ 就是 $a_t\bigl(p_t(y_t) - q_t(y_t)\bigr)$ —— 偏差本身就是梯度，
-$p_t(y_t) > q_t(y_t)$ 时压低 student 的置信度，反之抬高。它是**双向**的，不是 SFT 式的
-$-\log p_t(y_t)$。
 
 - 权重 $m_t/Z_t$ 与 teacher 胜率 $r_T$ 均为 stop-gradient，只有 student 接收梯度；
 - 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）。
 
 **实现上的两个要点**：
 
-1. $\mathrm{KL_B}$ 在代码里是用 Bernoulli 交叉熵算的（`binary_cross_entropy_with_logits`），与
-   KL 只差一个 teacher 侧的 Bernoulli 熵，是 student 无关的常数，梯度完全相同；诊断
-   `actor/l_apd_bernoulli_kl` 已把它减掉，所以日志里报的是纯 KL。
+1. 逆向下 student 持有熵项，所以 loss **本身就是 KL**，`actor/l_apd_loss` 会收敛到 0，和
+   `actor/l_apd_bernoulli_kl` 相等。正向下代码用 `binary_cross_entropy_with_logits`，算的是
+   Bernoulli 交叉熵，比 KL 多一个 teacher 侧熵（student 无关的常数，梯度相同），此时只有
+   `actor/l_apd_bernoulli_kl` 是纯 KL。两个方向的 $\mathrm{KL_B}$ 都用 log-sigmoid 写成,
+   任意实数 margin 下都有限。
 2. softmax 归一化项在 logit 差里会抵消，即 $T(y) - T(z) = \log q(y) - \log q(z)$。因此所有
    成对 margin 都能直接从框架已有的 top-$k$ log-prob 读出，**不需要传输或重算原始 logits，
    也不需要额外的 teacher forward**。每次更新仍然只有一次 student forward，显存与吞吐和 OPD
@@ -143,7 +137,7 @@ $p(y_t) = q(y_t)$。有两种选法：
 
 | | 聚合对手 $\perp$ | 该项的含义 | 权重（自动定标） |
 | --- | --- | --- | --- |
-| `complement_candidate=True`（默认） | $y_t$ 的补集，即"除 $y_t$ 外的全体" | $\mathrm{KL_B}(q(y_t) \Vert p(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65$ |
+| `complement_candidate=True`（默认） | $y_t$ 的补集，即"除 $y_t$ 外的全体" | $\mathrm{KL_B}(p(y_t) \Vert q(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65$ |
 | `tail_candidate=True` | top-$k$ 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | $q_{\text{tail}}/Z_t$，此时 $Z_t = 1 - q(y_t)$，实测约 $0.10$ |
 
 两者都是**同一个成对构造**在一个聚合对手上的特例，权重都由 teacher 质量自动决定，
@@ -174,6 +168,40 @@ $8.67\times10^{-3}$（真值 $2.37\times10^{-3}$，偏高 3.7 倍），因为成
 
 顺带一提，框架里没有其它项在约束这个方向：`USE_KL` 默认 `False`，而且 ref-KL 那段代码在
 `update_policy` 的非 L-APD 分支里；`entropy_coeff` 也是 0。
+
+### 1.3 梯度与方向的选择
+
+记 $m = S(y_t) - S(o)$ 为 student margin、$m_T = T(y_t) - T(o)$ 为 teacher margin。两个方向对
+每个成对 margin 的梯度都有闭式：
+
+$$
+\text{逆向（默认）：}\quad
+\frac{\partial L_t}{\partial m}
+\;=\; \frac{m_t(o)}{Z_t}\,\sigma'(m)\,\bigl(m - m_T\bigr)
+$$
+
+$$
+\text{正向：}\quad
+\frac{\partial L_t}{\partial m}
+\;=\; \frac{m_t(o)}{Z_t}\,\bigl(r_S(y_t, o) - r_T(y_t, o)\bigr)
+$$
+
+逆向就是**直接对齐 margin**：梯度正比于 $m$ 与 $m_T$ 之差，由 $\sigma'(m)$ 门控。两者都在
+$m = m_T$ 处归零，而且在最优点附近**一阶一致**（$\delta = 10^{-3}$ 时两者梯度都等于
+$\sigma'(m_T)\delta$，相对差 $10^{-3}$），所以这个选择**只影响大误差如何被修正**：
+
+| $m$（$m_T = -4$，student 越来越自信地站错边） | 逆向 loss | 正向 loss | 逆向梯度 | 正向梯度 |
+|---:|---:|---:|---:|---:|
+| 0 | 1.33 | 0.60 | 1.0e+0 | 0.482 |
+| 8 | 4.01 | 7.77 | 4.0e-3 | 0.982 |
+| 30 | **4.018** | 29.37 | **3.2e-12** | 0.982 |
+
+逆向 loss 封顶在 $-\log r_T$，自信站错边的代价有界、梯度按 $\sigma'(m)$ 指数衰减；正向无界，
+梯度饱和到 $\pm 1$ 但不消失。这也是唯一需要注意的取舍：代入 $o = \perp$ 时正向的锚点梯度是
+$a_t\bigl(p_t(y_t) - q_t(y_t)\bigr)$，逆向多了一个 $p_t(y_t)\bigl(1 - p_t(y_t)\bigr)$ 因子，
+在 $p_t(y_t) \to 1$ 时消失 —— 即逆向下 §1.2 的可辨识性在理论上仍成立（最优点唯一），但对
+**已经过度自信**的锚点没有拉回力。`L_APD_PAIR_DIVERGENCE=forward_kl` 可以切回正向做对照。
+`test_reverse_kl_is_bounded_where_forward_diverges` 锁住了上表的定性行为。
 
 ## 2. 代码位置
 
@@ -344,12 +372,17 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `False` | 聚合对手取"top-k 之外"，优先级高于补集 |
 | `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `True` | 聚合对手取"`y_t` 的补集"，即目标 token 的 loss，见 §1.2 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
+| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `reverse_kl` | 成对 Bernoulli KL 的方向，见 §1.3。`forward_kl` 为对照 |
 
 > 两个聚合对手**至少要开一个**。全关掉时锚点概率不可辨识（§1.2），只用于复现那个退化情形。
 
 消融示例：
 
 ```bash
+# KL 方向换成正向：自信站错边的 token 保留满强度梯度，代价是 loss 无界
+L_APD_PAIR_DIVERGENCE=forward_kl MODEL_ROOT=/input0/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
 # 聚合对手换成 tail：对手集合成为"非 y_t"的真正划分，锚点项不再需要
 L_APD_TAIL_CANDIDATE=True MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
@@ -396,11 +429,11 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | 指标 | 含义 |
 | --- | --- |
 | `actor/pg_loss` | L-APD 目标值（复用了原字段名） |
-| `actor/l_apd_bernoulli_kl` | teacher 加权的成对 Bernoulli KL（扣掉 teacher 熵的纯 KL），含聚合对手那一项 |
+| `actor/l_apd_bernoulli_kl` | teacher 加权的成对 Bernoulli KL（纯 KL，正向下已扣掉 teacher 熵），含聚合对手那一项。逆向下它与 `actor/pg_loss` 相等 |
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 $\lvert r_S - r_T \rvert$，student 与 teacher 胜率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 $q(y_t)$ / $p(y_t)$，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
-| `actor/l_apd_anchor_kl` | 锚点项 $\mathrm{KL_B}(q(y_t) \Vert p(y_t))$，$p(y_t) = q(y_t)$ 时恰好为 0；仅 `complement_candidate` 生效时记录 |
+| `actor/l_apd_anchor_kl` | 锚点项的 Bernoulli KL（方向随 `pair_divergence`），$p(y_t) = q(y_t)$ 时恰好为 0；仅 `complement_candidate` 生效时记录 |
 | `actor/l_apd_anchor_weight` | 补集对手拿到的权重 $a_t = q(y_t)/Z_t$（见 §1）；仅 `complement_candidate` 生效时记录 |
 | `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
@@ -419,12 +452,13 @@ PYTHONPATH=$(pwd) python tests/trainer/ppo/test_l_apd_on_cpu.py
 PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
 ```
 
-覆盖：全词表候选时与定义式逐元素相等；autograd 梯度等于解析式
-$\partial L / \partial\bigl(S(y) - S(z)\bigr) = \tilde q(z)\,(r_S - r_T)$；tail 候选只含一个
-token 时与全词表 loss 精确相等；$p = q$ 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的
-归一化性质；§1.2 的可辨识性（只有真实 token 对手时 loss 对"质量在 top-$k$ 与尾部之间如何
-分配"完全不变，而两种聚合对手都能破掉这个不变性）；补集对手那一项逐元素等于
-$\mathrm{KL_B}(q(y_t) \Vert p(y_t))$、权重逐元素等于 $q(y_t)/Z_t$、且含它的权重和恒为 1。
+覆盖：两个方向的 autograd 梯度分别等于 §1.3 的两个解析式；逆向 loss 逐元素等于加权的
+$\mathrm{KL_B}(r_S \Vert r_T)$ 且与 `bernoulli_kl` 诊断相等；逆向 loss 在自信站错边处有界而
+正向发散（锁住 §1.3 那张表的定性行为）；`reverse_kl` 确实是库的默认方向；未知方向名会报错；
+$p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐元素相等、tail 候选只含一个 token 时
+与全词表 loss 精确相等；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
+（只有真实 token 对手时 loss 对"质量在 top-$k$ 与尾部之间如何分配"完全不变，而两种聚合对手
+都能破掉这个不变性）；补集对手那一项的权重逐元素等于 $q(y_t)/Z_t$、且含它的权重和恒为 1。
 
 ## 9. 注意事项
 
