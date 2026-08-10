@@ -304,6 +304,50 @@ def test_complement_candidate_is_the_anchor_bernoulli_kl():
     )
 
 
+def test_matches_the_documented_two_part_form():
+    """The loss equals the explicit form documented in the README.
+
+    ``L_t = sum_z [q(z)/Z] H_B(r_T, r_S) + [q(y)/Z] H_B(q(y), p(y))`` with
+    ``Z = sum over the top-k ids including the anchor``, i.e. the weights are the
+    teacher probabilities renormalized over all k candidates rather than over the
+    k - 1 non-anchor ones.
+    """
+    vocab, k = 64, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=11)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=True,
+    )
+
+    p = torch.log_softmax(student_logits, dim=-1)
+    q = torch.log_softmax(teacher_logits, dim=-1)
+    p_anchor = p.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    q_anchor = q.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
+    p_cand, q_cand = p.gather(-1, candidate_ids), q.gather(-1, candidate_ids)
+    kept = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+
+    normalizer = q_anchor.exp() + (q_cand.exp() * kept).sum(-1)
+
+    def bernoulli_ce(target, prob):
+        return -(target * prob.log() + (1 - target) * (1 - prob).log())
+
+    r_s = torch.sigmoid(p_anchor.unsqueeze(-1) - p_cand)
+    r_t = torch.sigmoid(q_anchor.unsqueeze(-1) - q_cand)
+    pairwise = ((q_cand.exp() / normalizer.unsqueeze(-1)) * bernoulli_ce(r_t, r_s) * kept).sum(-1)
+    anchor = (q_anchor.exp() / normalizer) * bernoulli_ce(q_anchor.exp(), p_anchor.exp())
+
+    torch.testing.assert_close(
+        token_loss.double(), (pairwise + anchor) * response_mask, atol=1e-5, rtol=1e-4
+    )
+
+
 def test_weights_including_the_complement_sum_to_one():
     """With the complement candidate the whole loss is a convex combination."""
     vocab, k = 32, 8

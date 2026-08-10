@@ -26,33 +26,34 @@ $$
 \mathrm{KL_B}(a  \Vert  b) \;=\; a\log\frac{a}{b} \;+\; (1-a)\log\frac{1-a}{1-b}.
 $$
 
-每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$，对手集合为
+每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$，其余候选是
 
 $$
-\mathcal{O}_t \;=\; \mathcal{V}_t \cup \lbrace \perp \rbrace,
-\qquad
 \mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{student top-}K \;:\; z \neq y_t \,\bigr\rbrace,
+\qquad K = 16,\quad \text{通常 } \lvert \mathcal{V}_t \rvert = 15.
 $$
 
-其中 $K=16$、通常 $\lvert \mathcal{V}_t \rvert = 15$，而 $\perp$ 是一个**聚合对手**，默认取 $y_t$ 的补集
-（见 §1.2）。每个对手按自己的 teacher 质量 $m_t(\cdot)$ 加权并归一化到和为 1：
+**权重是 teacher 概率在这 $K$ 个 token（含目标 token $y_t$）上一起归一化**得到的：
 
 $$
-m_t(z) = q_t(z) \;\; (z \in \mathcal{V}_t),
-\qquad
-m_t(\perp) = q_t(y_t),
-\qquad
-Z_t = \sum_{o \in \mathcal{O}_t} m_t(o),
+Z_t \;=\; \sum_{v \in \text{top-}K} q_t(v) \;=\; q_t(y_t) + \sum_{z \in \mathcal{V}_t} q_t(z).
 $$
+
+损失由 $K-1$ 个成对项和一个目标 token 项组成，各自的乘数就是自己那个 token 的归一化概率：
 
 $$
 \boxed{\;
-L_t \;=\; \sum_{o \in \mathcal{O}_t} \frac{m_t(o)}{Z_t}\;
-\mathrm{KL_B}\bigl(\, r_T(y_t, o)  \Vert  r_S(y_t, o) \,\bigr)
+L_t \;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
+\mathrm{KL_B}\bigl(r_T(y_t, z) \Vert r_S(y_t, z)\bigr)
+\;+\; \frac{q_t(y_t)}{Z_t}\,
+\mathrm{KL_B}\bigl(q_t(y_t) \Vert p_t(y_t)\bigr)
 \;}
 $$
 
-胜率是 Bradley–Terry 式的归一化对，都有闭式。对真实 token 对手 $z \in \mathcal{V}_t$：
+所有乘数加起来恰好为 1（诊断 `actor/l_apd_candidate_weight_sum` 就是在查这一点），目标 token
+那一项的乘数记作 $a_t = q_t(y_t)/Z_t$（诊断 `actor/l_apd_anchor_weight`，实测均值约 0.65）。
+
+胜率是 Bradley–Terry 式的归一化对，都有闭式。对候选 $z \in \mathcal{V}_t$：
 
 $$
 r_S(y, z) = \sigma\bigl(\log p(y) - \log p(z)\bigr) = \frac{p(y)}{p(y) + p(z)},
@@ -60,27 +61,28 @@ r_S(y, z) = \sigma\bigl(\log p(y) - \log p(z)\bigr) = \frac{p(y)}{p(y) + p(z)},
 r_T(y, z) = \sigma\bigl(\log q(y) - \log q(z)\bigr) = \frac{q(y)}{q(y) + q(z)}.
 $$
 
-对聚合对手 $\perp$（取补集时）：
+**目标 token 项其实也是一个成对项**，只不过对手是"除 $y_t$ 外的全体 token 打包成一个"
+（代码里记作 $\perp$，即 `complement_candidate`）。它的 margin 是 $\log\frac{p(y)}{1-p(y)}$，于是
 
 $$
 r_S(y, \perp) = \sigma\Bigl(\log \tfrac{p(y)}{1 - p(y)}\Bigr) = p(y),
 \qquad
-r_T(y, \perp) = \sigma\Bigl(\log \tfrac{q(y)}{1 - q(y)}\Bigr) = q(y).
+r_T(y, \perp) = \sigma\Bigl(\log \tfrac{q(y)}{1 - q(y)}\Bigr) = q(y),
 $$
 
-第二组是关键：代入 $o = \perp$，那一项**恰好等于** $\mathrm{KL_B}\bigl(q_t(y_t)  \Vert  p_t(y_t)\bigr)$。
-所以**目标 token 的 loss 不是外加项**，而是这个统一公式在最粗对手上的特例，权重也照常由
-$q_t(y_t)$ 给出，因此没有自由系数。
-
-把 $a_t = m_t(\perp)/Z_t$ 记作聚合对手的权重（默认配置下实测均值约 0.65），上式精确等于一个
-凸组合：
+代入 $\mathrm{KL_B}(r_T \Vert r_S)$ **恰好等于** $\mathrm{KL_B}\bigl(q_t(y_t) \Vert p_t(y_t)\bigr)$，
+也就是 boxed 公式里的最后一项。于是整个 loss 可以合并成一个统一的加权和：把 $\perp$ 当成
+一个额外"对手"、它的 teacher 质量取 $q_t(y_t)$，则
 
 $$
-L_t \;=\; (1 - a_t) \underbrace{\sum_{z \in \mathcal{V}_t}
-\frac{q_t(z)}{\sum_{z' \in \mathcal{V}_t} q_t(z')}\,
-\mathrm{KL_B}\bigl(r_T(y_t, z)  \Vert  r_S(y_t, z)\bigr)}_{\text{在 top-}K\text{ 内部归一化的成对排序项}}
-\;+\; a_t \underbrace{\mathrm{KL_B}\bigl(q_t(y_t)  \Vert  p_t(y_t)\bigr)}_{\text{目标 token 项}}
+L_t \;=\; \sum_{o \in \mathcal{V}_t \cup \lbrace \perp \rbrace} \frac{m_t(o)}{Z_t}\;
+\mathrm{KL_B}\bigl(r_T(y_t, o) \Vert r_S(y_t, o)\bigr),
+\qquad
+m_t(z) = q_t(z),\quad m_t(\perp) = q_t(y_t).
 $$
+
+这也是代码的实现方式：目标 token 项作为一列追加进候选张量，归一化、BCE、诊断全部复用同一
+套逻辑。所以它**不是一个带系数的附加 loss**，没有自由超参。
 
 梯度对每个成对 margin 的形式统一：
 
