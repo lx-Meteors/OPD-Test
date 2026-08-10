@@ -124,6 +124,7 @@ run_opd() {
     export TEST_FREQ="${TEST_FREQ:-20}"
     export SAVE_FREQ="${SAVE_FREQ:-100}"
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
+    export N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
     # Check the evaluation files that TEST_DATASET actually lists.
@@ -135,7 +136,10 @@ run_opd() {
 
     export PYTHONUNBUFFERED=1
     export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.99}"
-    export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
+    # Keep this at 0: with blocking wait enabled, vLLM's CUDA graph capture
+    # deadlocks in ProcessGroupNCCL::waitForPendingWorks(), which never times out.
+    export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
     export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
     export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-INFO}"
     export TOKENIZERS_PARALLELISM=true
@@ -252,7 +256,7 @@ run_opd() {
         "trainer.project_name=${PROJECT_NAME}"
         "trainer.experiment_name=${experiment_name}"
         "trainer.validation_data_dir=${REPO_ROOT}/validation_log/${experiment_name}"
-        "trainer.n_gpus_per_node=8"
+        "trainer.n_gpus_per_node=${N_GPUS_PER_NODE}"
         "trainer.nnodes=1"
         "trainer.save_freq=${SAVE_FREQ}"
         "trainer.test_freq=${TEST_FREQ}"
@@ -298,9 +302,11 @@ run_opd() {
         return 0
     fi
 
-    trap cleanup_ray EXIT
-    cleanup_ray
-    ray start --head
-    sleep 5
+    if [[ "${MANAGE_RAY:-1}" == "1" ]]; then
+        trap cleanup_ray EXIT
+        cleanup_ray
+        ray start --head
+        sleep 5
+    fi
     "${cmd[@]}"
 }

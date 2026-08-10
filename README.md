@@ -102,7 +102,7 @@ student 与 teacher 必须共享 tokenizer 和词表（L-APD 直接比较同一 
 下载到任意目录后用 `MODEL_ROOT` 指向它：
 
 ```bash
-export MODEL_ROOT=/input0/yyy/models
+export MODEL_ROOT=/input0/models
 
 huggingface-cli download deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
   --local-dir "${MODEL_ROOT}/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -124,7 +124,7 @@ huggingface-cli download hbx/JustRL-DeepSeek-1.5B \
 ```bash
 cd /input0/yyy/Prune-OPD
 
-DRY_RUN=1 MODEL_ROOT=/input0/yyy/models \
+DRY_RUN=1 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
@@ -136,19 +136,20 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 cd /input0/yyy/Prune-OPD
 conda activate /openbayes/input/input0/miniconda3/envs/g-opd-verl
 
-MODEL_ROOT=/input0/yyy/models \
+MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
-脚本会自动 `ray stop --force` → `ray start --head` → 启动训练，退出时清理 ray。
-日志同时打到终端和 `logs/opd/<experiment_name>.log`。
+脚本会自动 `ray stop --force` → `ray start --head` → 启动训练，退出时清理 ray；
+想复用已有集群就传 `MANAGE_RAY=0`。日志同时打到终端和
+`logs/opd/<experiment_name>.log`。
 
 ### 5.3 后台长跑并跟踪日志
 
 ```bash
 cd /input0/yyy/Prune-OPD
 
-nohup env MODEL_ROOT=/input0/yyy/models \
+nohup env MODEL_ROOT=/input0/models \
   bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh \
   > /dev/null 2>&1 &
 
@@ -164,7 +165,7 @@ tail -f "$(ls -t logs/opd/l-apd-*.log | head -1)" \
 
 ```bash
 WANDB_API_KEY=<your-key> WANDB_MODE=online TRACKING_BACKENDS='[console,wandb]' \
-MODEL_ROOT=/input0/yyy/models \
+MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
@@ -176,7 +177,7 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 cd /input0/yyy/Prune-OPD
 export DATA_ROOT=/input0/yyy/Prune-OPD/datasets
 
-MODEL_ROOT=/input0/yyy/models \
+MODEL_ROOT=/input0/models \
 TEST_DATASET="[\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/AMC23/test.parquet\"]" \
 bash experiments_scripts/opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
@@ -186,11 +187,17 @@ bash experiments_scripts/opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deeps
 任何 Hydra override 都可以直接追加在脚本后面：
 
 ```bash
-MODEL_ROOT=/input0/yyy/models \
+MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh \
-  trainer.n_gpus_per_node=4 \
   trainer.test_freq=10 \
   actor_rollout_ref.actor.optim.lr=5e-7
+```
+
+卡数用 `N_GPUS_PER_NODE` 控制（脚本会传给 `trainer.n_gpus_per_node`）：
+
+```bash
+N_GPUS_PER_NODE=4 MODEL_ROOT=/input0/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
 ### 6.1 L-APD 自身的开关
@@ -207,15 +214,15 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 
 ```bash
 # 关掉 tail 候选（简单截断 top-16）
-L_APD_TAIL_CANDIDATE=False MODEL_ROOT=/input0/yyy/models \
+L_APD_TAIL_CANDIDATE=False MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
 # 候选改用 student top-k
-L_APD_CANDIDATE_SOURCE=student MODEL_ROOT=/input0/yyy/models \
+L_APD_CANDIDATE_SOURCE=student MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
 # 加上 target loss（idea 文档 §8 的消融）
-L_APD_TARGET_LOSS_COEF=1.0 MODEL_ROOT=/input0/yyy/models \
+L_APD_TARGET_LOSS_COEF=1.0 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
@@ -231,9 +238,21 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `LOG_PROB_TOP_K` | 16 | top-k 候选数 |
 | `TEST_FREQ` / `SAVE_FREQ` | 20 / 100 | 评测与存档间隔 |
 | `VAL_BEFORE_TRAIN` | True | 训练前先跑一次评测作为 step 0 基线 |
-| `TEST_DATASET` | AIME24/AIME25/AMC23（脚本内覆盖了 common.sh 的默认值） | 评测集，会按实际列出的文件逐个校验存在性 |
-| `MODEL_ROOT` / `DATA_ROOT` | 仓库内 `models/`、`datasets/` | 模型与数据根目录 |
+| `TEST_DATASET` | AMC23/AIME24/AIME25/HMMT24/HMMT25 | 评测集，会按实际列出的文件逐个校验存在性 |
+| `MODEL_ROOT` / `DATA_ROOT` | `/input0/models`、仓库内 `datasets/` | 模型与数据根目录 |
 | `CKPT_ROOT` / `LOG_DIR` | `checkpoint/`、`logs/opd` | 输出位置 |
+| `N_GPUS_PER_NODE` | 8 | 单节点卡数 |
+| `MANAGE_RAY` | 1 | 是否由脚本负责 `ray stop` / `ray start --head`；已有集群时设 0 |
+
+脚本默认评测 5 个测试集共 203 道题，`val_kwargs.n=16` 且生成上限 31744 token，
+所以 `VAL_BEFORE_TRAIN=True` 那一轮要生成 3248 条长序列，耗时较长（期间日志静默但
+GPU 满载，属正常）。只要 Table 1 的三个集时覆盖掉即可：
+
+```bash
+DATA_ROOT=/input0/yyy/Prune-OPD/datasets
+TEST_DATASET="[\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/AMC23/test.parquet\"]" \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+```
 
 ## 7. 训练日志里的 L-APD 指标
 
@@ -277,6 +296,12 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
   strategy 下都会被计算并传下来，L-APD 直接读 `teacher_top_k_ids` / `teacher_top_k_log_probs`
   与锚点上的 `teacher_log_probs`；该变量只影响 OPD 侧的 reward 构造。候选数由
   `LOG_PROB_TOP_K` 决定。
+- **不要打开 `TORCH_NCCL_BLOCKING_WAIT`**。它和 vLLM 的 CUDA graph capture 会死锁：8 个 rank
+  全堵在 torch 的 `ProcessGroupNCCL::waitForPendingWorks()` 里，而那个等待循环没有超时，
+  表现是显存占满、GPU 利用率 0%、日志停在
+  `Waiting for pending NCCL work to finish before starting graph capture` 且永不恢复。
+  `common.sh` 已默认置 0 并改用 `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`。若确实需要它，
+  必须同时加 `actor_rollout_ref.rollout.enforce_eager=True` 绕开 graph capture。
 - **恢复训练**：experiment name 带时间戳，所以每次启动都是新目录。要接着上次跑，需显式指定
   `trainer.default_local_dir=<旧 checkpoint 目录> trainer.resume_mode=auto`。
 - 单节点默认 8 卡（`trainer.n_gpus_per_node=8`），卡数不同时请追加 override。
