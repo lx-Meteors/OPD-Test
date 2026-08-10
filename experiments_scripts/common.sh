@@ -69,13 +69,24 @@ cleanup_ray() {
 }
 
 setup_tracking() {
+    # Credentials are never read from this repo. Run `wandb login` once; the key
+    # lands in ~/.netrc, outside the tree, so it cannot be committed by accident.
     export WANDB_API_KEY="${WANDB_API_KEY:-}"
-    export WANDB_MODE="${WANDB_MODE:-offline}"
+    export WANDB_MODE="${WANDB_MODE:-online}"
     export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/logs/wandb}"
     export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${REPO_ROOT}/.cache/wandb}"
-    export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console]}"
+    export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console,wandb]}"
 
     mkdir -p "${WANDB_DIR}" "${WANDB_CACHE_DIR}"
+
+    # Fall back to console-only rather than dying mid-run when no credentials exist.
+    if [[ "${TRACKING_BACKENDS}" == *wandb* && "${WANDB_MODE}" == "online" ]]; then
+        if [[ -z "${WANDB_API_KEY}" ]] && ! grep -q "api.wandb.ai" "${HOME}/.netrc" 2>/dev/null; then
+            echo "WARNING: wandb tracking requested but no credentials found."
+            echo "         Run 'wandb login' or set WANDB_API_KEY. Falling back to console only."
+            export TRACKING_BACKENDS="[console]"
+        fi
+    fi
 }
 
 run_opd() {
