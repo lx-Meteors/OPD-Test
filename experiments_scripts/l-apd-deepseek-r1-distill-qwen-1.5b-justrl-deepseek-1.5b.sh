@@ -32,9 +32,15 @@ export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-False}"
 # and it makes the weights normalize over the same 16 ids the baseline uses.
 export L_APD_COMPLEMENT_CANDIDATE="${L_APD_COMPLEMENT_CANDIDATE:-True}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
-# Direction of the per-pair Bernoulli KL. reverse_kl matches margins directly and
-# matches the direction the OPD baseline rewards; forward_kl is the ablation.
-export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-reverse_kl}"
+# Per-pair discrepancy. log_ratio keeps only the v = y_t outcome of the reverse KL,
+# so the loss is sum_z w(z) log[r_S/r_T] + w(y_t) log[p(y_t)/q(y_t)]. It is not a
+# divergence: the teacher side is an additive stop-gradient constant, so the margin
+# gradient 1 - r_S never vanishes and never sees the teacher, and the objective has no
+# lower bound. Expect actor/pg_loss to fall without bound and
+# actor/l_apd_student_anchor_prob to collapse; actor/l_apd_pair_kl still reports the
+# honest KL. reverse_kl (bounded, stationary at m = m_T) and forward_kl are the
+# alternatives.
+export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-log_ratio}"
 
 run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}" \
     "actor_rollout_ref.actor.l_apd.enable=True" \
