@@ -17,6 +17,42 @@ student：$y_t$ 相对每个重要候选 $z$ 应该排得更高还是更低、�
                            候选 z4
 ```
 
+## 0. 快速开始
+
+```bash
+conda activate /openbayes/input/input0/miniconda3/envs/g-opd-verl
+cd /input0/yyy/Prune-OPD
+
+# 先做一次路径校验，不启动 ray、不占 GPU
+DRY_RUN=1 MODEL_ROOT=/input0/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
+# 正式启动（方法本身用 reverse_kl，见下面的提醒）
+L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+```
+
+> [!IMPORTANT]
+> **启动脚本当前的 `pair_divergence` 默认值是 `log_ratio`，它不是方法的主目标。**
+> `log_ratio` 是一个刻意保留的消融：它把每对的 KL 砍掉一半，因此不是散度、没有下界，
+> 训练预期会退化（`actor/pg_loss` 一路往负走、`actor/l_apd_student_anchor_prob` 塌向 0）。
+> 详见 [§1.4](#14-log_ratio只保留一项的消融)。方法本身是 §1 那个逆向 KL 目标，跑它请显式传
+> `L_APD_PAIR_DIVERGENCE=reverse_kl`。
+
+## 目录
+
+| 节 | 内容 |
+| --- | --- |
+| [§1 目标函数](#1-目标函数) | 完整损失、候选集与权重、聚合对手、三种 `pair_divergence` |
+| [§2 代码位置](#2-代码位置) | 改动涉及的文件 |
+| [§3 实验配置](#3-实验配置与-table-1-对齐) | student / teacher / 数据 / 超参 |
+| [§4 准备](#4-准备) | 环境、数据、模型 |
+| [§5 启动训练](#5-启动训练) | dry run、前台与后台、W&B、baseline 对照 |
+| [§6 常用调整](#6-常用调整) | 全部开关与消融命令 |
+| [§7 训练日志里的指标](#7-训练日志里的-l-apd-指标) | 每个 `actor/l_apd_*` 字段的含义 |
+| [§8 单元测试](#8-单元测试) | 怎么跑、覆盖了什么 |
+| [§9 注意事项](#9-注意事项) | 共享词表、NCCL 死锁、恢复训练等坑 |
+
 ## 1. 目标函数
 
 记 $p_t$、$q_t$ 为 student / teacher 在位置 $t$ 的分布，$S$、$T$ 为对应的 logit，$\sigma$ 为
@@ -26,8 +62,11 @@ sigmoid。
 
 $$
 \mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{student top-}K \;:\; z \neq y_t \,\bigr\rbrace,
-\qquad K = 16,\quad \text{通常 } \lvert \mathcal{V}_t \rvert = 15.
+\qquad K = 16.
 $$
+
+锚点 $y_t$ 自己通常也落在 top-$K$ 里，会被剔除，所以候选数一般是 $\lvert \mathcal{V}_t \rvert = 15$
+（诊断 `actor/l_apd_candidate_count` 实测 15.03）。
 
 **权重是 teacher 概率在这 $K$ 个 token（含目标 token $y_t$）上一起归一化**得到的：
 
@@ -64,9 +103,15 @@ L_t \;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
 \;}
 $$
 
-方向由 `l_apd.pair_divergence` 控制，默认 `reverse_kl`（上式），`forward_kl`
-（把两个参数对调）是消融项。两个方向的最优点相同、且在最优点附近一阶一致，差别只在大误差处
-如何修正（见 §1.3）。
+上式是方法本身。每对用什么散度由 `l_apd.pair_divergence` 控制，一共三个取值：
+
+| 取值 | 每对的量 | 性质 |
+| --- | --- | --- |
+| `reverse_kl` | $\mathrm{KL}(\tilde p \Vert \tilde q)$，即上式 | 有下界，$m = m_T$ 处梯度归零。**方法本身** |
+| `forward_kl` | $\mathrm{KL}(\tilde q \Vert \tilde p)$，两个参数对调 | 同一个最优点，只改大误差如何修正（§1.3）。消融 |
+| `log_ratio` | 只保留 $\log\frac{\tilde p(y_t)}{\tilde q(y_t)}$ 一项 | **不是散度**，无下界，梯度里没有 teacher（§1.4）。消融 |
+
+库默认值（`actor.yaml`）是 `reverse_kl`；**启动脚本当前默认 `log_ratio`**，见文首提醒。
 
 最后一项的对手 $\perp$ 是**"除 $y_t$ 外的全体 token 打包成一个"**（`complement_candidate`）。
 这一对的两个结果概率之和本来就是 1，限制归一化是恒等的，于是
@@ -185,14 +230,16 @@ $8.67\times10^{-3}$（真值 $2.37\times10^{-3}$，偏高 3.7 倍），因为成
 记 $m = S(y_t) - S(o)$ 为 student margin、$m_T = T(y_t) - T(o)$ 为 teacher margin。两个方向对
 每个成对 margin 的梯度都有闭式：
 
+逆向（`reverse_kl`）：
+
 $$
-\text{逆向（默认）：}\quad
 \frac{\partial L_t}{\partial m}
 \;=\; \frac{w_t(o)}{Z_t}\,\sigma'(m)\,\bigl(m - m_T\bigr)
 $$
 
+正向（`forward_kl`）：
+
 $$
-\text{正向：}\quad
 \frac{\partial L_t}{\partial m}
 \;=\; \frac{w_t(o)}{Z_t}\,\bigl(\tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t)\bigr)
 $$
@@ -213,6 +260,38 @@ $a_t\bigl(p_t(y_t) - q_t(y_t)\bigr)$，逆向多了一个 $p_t(y_t)\bigl(1 - p_t
 在 $p_t(y_t) \to 1$ 时消失 —— 即逆向下 §1.2 的可辨识性在理论上仍成立（最优点唯一），但对
 **已经过度自信**的锚点没有拉回力。`L_APD_PAIR_DIVERGENCE=forward_kl` 可以切回正向做对照。
 `test_reverse_kl_is_bounded_where_forward_diverges` 锁住了上表的定性行为。
+
+### 1.4 `log_ratio`：只保留一项的消融
+
+`L_APD_PAIR_DIVERGENCE=log_ratio` 把每一对的 $\mathrm{KL}$ 换成只有 $v = y_t$ 那一项的裸对数比值，
+即 §1 的式子变成
+
+$$
+\tilde L_t
+\;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
+\log \frac{r_S(y_t,z)}{r_T(y_t,z)}
+\;+\; \frac{q_t(y_t)}{Z_t}\,
+\log \frac{p_t(y_t)}{q_t(y_t)},
+\qquad r_S = \tilde p_{y_t,z}(y_t),\; r_T = \tilde q_{y_t,z}(y_t)
+$$
+
+补集对手那一列会自动退化成锚点的裸对数比值，因为它的 margin 让两个受限概率恰好是
+$p_t(y_t)$ 和 $q_t(y_t)$。**这不是散度**，只能作为消融跑：teacher 侧是 stop-gradient 的加性常数，
+所以它对每个成对 margin 的梯度是
+
+$$
+\frac{\partial \tilde L_t}{\partial m} \;=\; \frac{w_t(o)}{Z_t}\,\bigl(1 - \sigma(m)\bigr) \;>\; 0
+$$
+
+恒为正、永不归零，而且式子里根本没有 $m_T$ —— 完全看不到 teacher。目标因此单调、无下界，最小化它就是把 $p_t(y_t)$ 推向 0：
+$m_T$ 只改变 loss 的数值，不改变任何一个梯度分量。teacher 的信息只剩下**权重**和**候选集**两个入口。
+200 词表上从 $p = q$ 出发做 300 步 SGD，loss 跌到 $-405$（仍在跌）、$p(y_t)$ 归零、
+$\mathrm{KL}(p \Vert q)$ 从 0 涨到 0.75；`test_log_ratio_has_no_stationary_point` 锁住了这个行为，
+`test_log_ratio_matches_the_two_part_bare_form` 锁住上式本身。
+
+同一个量当 **reward** 用是成立的，那就是 OPD baseline：`dp_actor.py` 的 `only_stu` 分支算
+`rm_scores = -(S_logp - T_on_S) * w`，在 `no_grad` 下作为 $\nabla \log \pi$ 的系数，本身不被求导，
+所以单调性无关。想要"一项版"的可微目标，直接对齐 margin 的 $\tfrac12 (m - m_T)^2$ 才是有下界的选择。
 
 ## 2. 代码位置
 
@@ -310,9 +389,11 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 cd /input0/yyy/Prune-OPD
 conda activate /openbayes/input/input0/miniconda3/envs/g-opd-verl
 
-MODEL_ROOT=/input0/models \
+L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
+
+不加 `L_APD_PAIR_DIVERGENCE` 就是脚本当前的默认 `log_ratio`，那是会退化的消融（文首提醒）。
 
 脚本会自动 `ray stop --force` → `ray start --head` → 启动训练，退出时清理 ray；
 想复用已有集群就传 `MANAGE_RAY=0`。日志同时打到终端和
@@ -383,13 +464,17 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `False` | 聚合对手取"top-k 之外"，优先级高于补集 |
 | `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `True` | 聚合对手取"`y_t` 的补集"，即目标 token 的 loss，见 §1.2 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
-| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `reverse_kl` | 成对 KL 的方向，见 §1.3。`forward_kl` 为对照 |
+| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `log_ratio` | 每对用什么散度。`reverse_kl` 是方法本身（§1.3），`forward_kl` 是方向对照，`log_ratio` 是只保留一项的裸对数比值消融、非散度且无下界（§1.4）。库默认是 `reverse_kl`，此处是脚本的默认 |
 
 > 两个聚合对手**至少要开一个**。全关掉时锚点概率不可辨识（§1.2），只用于复现那个退化情形。
 
 消融示例：
 
 ```bash
+# 方法本身：每对用完整的逆向 KL（脚本默认是 log_ratio，所以这一行必须显式加）
+L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
 # KL 方向换成正向：自信站错边的 token 保留满强度梯度，代价是 loss 无界
 L_APD_PAIR_DIVERGENCE=forward_kl MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
@@ -439,8 +524,8 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 
 | 指标 | 含义 |
 | --- | --- |
-| `actor/pg_loss` | L-APD 目标值（复用了原字段名） |
-| `actor/l_apd_pair_kl` | teacher 加权的成对 KL（纯 KL，正向下已扣掉 teacher 熵），含聚合对手那一项。逆向下它与 `actor/pg_loss` 相等 |
+| `actor/pg_loss` | L-APD 目标值（复用了原字段名）。`log_ratio` 下它无下界，会一路往负走，不能当收敛指标看 |
+| `actor/l_apd_pair_kl` | teacher 加权的成对 KL，含聚合对手那一项，**永远是诚实的 KL**（正向下已扣掉 teacher 熵，`log_ratio` 下另算一份逆向 KL）。逆向下它与 `actor/pg_loss` 相等；其余两种方向下它是唯一有界、$p = q$ 时归零的收敛指标 |
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 $\lvert \tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t) \rvert$，两侧成对概率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 $q(y_t)$ / $p(y_t)$，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
@@ -469,7 +554,9 @@ $\mathrm{KL}(\tilde p \Vert \tilde q)$ 且与 `pair_kl` 诊断相等；逆向 lo
 $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐元素相等、tail 候选只含一个 token 时
 与全词表 loss 精确相等；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
 （只有真实 token 对手时 loss 对"质量在 top-$k$ 与尾部之间如何分配"完全不变，而两种聚合对手
-都能破掉这个不变性）；补集对手那一项的权重逐元素等于 $q(y_t)/Z_t$、且含它的权重和恒为 1。
+都能破掉这个不变性）；补集对手那一项的权重逐元素等于 $q(y_t)/Z_t$、且含它的权重和恒为 1；
+`log_ratio` 逐元素等于 §1.4 那个两段式，且它在 $p = q$ 处仍有非零梯度、50 步 SGD 就把 loss
+推到 $-10$ 以下并把 $p(y_t)$ 压到 $e^{-10}$ 以下（锁住"它不是散度"这个性质）。
 
 ## 9. 注意事项
 
