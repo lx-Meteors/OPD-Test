@@ -21,10 +21,12 @@ export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
 export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parquet\",\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/HMMT24/test.parquet\",\"${DATA_ROOT}/test_data/HMMT25/test.parquet\"]}"
 
-# Competitor tokens: teacher (main method) or student
-export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-teacher}"
-# Aggregate the probability mass outside the top-k candidates into one candidate
-export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-True}"
+# Competitor tokens. The OPD baseline scores the student top-k, so L-APD ranks
+# against the same set to keep the two runs comparable.
+export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-student}"
+# Off to match the baseline, which renormalizes strictly inside the top-k and
+# carries no aggregate tail term.
+export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-False}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
 # Anchor-only Bernoulli KL term, ablation only
 export L_APD_TARGET_LOSS_COEF="${L_APD_TARGET_LOSS_COEF:-0.0}"

@@ -36,9 +36,16 @@ q̃_t(z) = q_t(z) / (1 − q_t(y_t))
 log-prob 读出，**不需要传输或重算原始 logits，也不需要额外的 teacher forward**。每次更新
 仍然只有一次 student forward，显存与吞吐和 OPD baseline 完全一致。
 
-**Top-K 尾部处理**：候选取 teacher top-k，另外追加一个聚合 tail 候选，用
-`logsumexp` 承载候选集之外的概率质量，使截断不需要引入额外的 target-loss 系数。加上
-tail 之后候选权重在有效位置上精确求和为 1。
+**候选集与归一化范围**：为了和 OPD baseline 可比，默认候选取 **student top-k**（baseline 的
+`top_k_strategy=only_stu` 打分的就是这一组），权重按 teacher 在这些 id 上的概率
+`q(z)` 在 **top-k 内部**重归一化，与 baseline 在 K 维上做一次 softmax 的做法一致。注意
+权重来源仍是 teacher 概率而非 baseline 的 student 概率，这是 `q̃(z) = q(z)/(1 − q(y_t))`
+的定义决定的，改掉就不是 L-APD 了。
+
+另有一个 tail 候选选项（`tail_candidate=True`）：追加一个聚合候选，用 `logsumexp` 承载
+候选集之外的概率质量，此时归一化基准变成全词表，等价于严格除以 `1 − q(y_t)`，截断的尾部
+也能获得监督。实测该 tail 会拿到约 10% 的权重，因此它是一个会改变目标的选项，默认关闭以
+保持与 baseline 的可比性。
 
 ## 2. 代码位置
 
@@ -205,20 +212,20 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | 环境变量 | Hydra key | 默认 | 含义 |
 | --- | --- | --- | --- |
 | — | `actor_rollout_ref.actor.l_apd.enable` | 脚本内置 `True` | 用 L-APD 替换 policy-gradient 目标 |
-| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `teacher` | 候选来源：teacher top-k（主方法）或 student top-k |
-| `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `True` | 是否追加聚合 tail 候选 |
+| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `student` | 候选来源：student top-k（与 baseline 对齐）或 teacher top-k |
+| `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `False` | 是否追加聚合 tail 候选 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
 | `L_APD_TARGET_LOSS_COEF` | `...l_apd.target_loss_coef` | `0.0` | 额外 `KL_B(q(y)‖p(y))` 项，仅用于消融 |
 
 消融示例：
 
 ```bash
-# 关掉 tail 候选（简单截断 top-16）
-L_APD_TAIL_CANDIDATE=False MODEL_ROOT=/input0/models \
+# 打开 tail 候选：归一化基准从 top-16 内部变成全词表，尾部也获得监督
+L_APD_TAIL_CANDIDATE=True MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 候选改用 student top-k
-L_APD_CANDIDATE_SOURCE=student MODEL_ROOT=/input0/models \
+# 候选改用 teacher top-16
+L_APD_CANDIDATE_SOURCE=teacher MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
 # 加上 target loss（idea 文档 §8 的消融）
@@ -263,11 +270,11 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 `abs(r_S − r_T)`，student 与 teacher 胜率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 `q(y_t)` / `p(y_t)` |
-| `actor/l_apd_tail_weight` | tail 候选拿到的权重 |
-| `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量 |
-| `actor/l_apd_anchor_in_candidates` | 锚点落在 teacher top-k 内的比例 |
+| `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
+| `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
+| `actor/l_apd_anchor_in_candidates` | 锚点落在候选 top-k 内的比例 |
 | `actor/l_apd_candidate_count` | 参与 loss 的候选数 |
-| `actor/l_apd_candidate_weight_sum` | 候选权重和，开 tail 时应约等于 1 |
+| `actor/l_apd_candidate_weight_sum` | 候选权重和，`normalize_weights=True` 时应约等于 1 |
 
 评测结果仍在 `val-core/*` 下（AIME24 / AIME25 / AMC23 的 Avg@16）。
 
