@@ -217,6 +217,57 @@ def test_weights_are_a_distribution_over_candidates():
     )
 
 
+def test_truncated_pairs_alone_leave_the_tail_mass_unidentified():
+    """Without a tail candidate the pairwise terms only constrain logit differences.
+
+    Scaling the mass of ``{anchor} + candidates`` up or down, with the slack absorbed
+    by the truncated tail, leaves every ``S(y) - S(z)`` untouched and so cannot change
+    the loss. The anchor term is what removes that freedom, which is why
+    ``target_loss_coef`` must be non-zero whenever ``tail_candidate`` is off.
+    """
+    vocab, k = 32, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=3)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    # Move mass from the candidate set into the tail without touching any pairwise margin.
+    shifted = student_logits.clone()
+    in_set = torch.zeros_like(student_logits, dtype=torch.bool)
+    in_set.scatter_(-1, candidate_ids, True)
+    in_set.scatter_(-1, anchors.unsqueeze(-1), True)
+    shifted[in_set] -= 2.0
+
+    for tail_candidate, target_loss_coef, should_differ in [
+        (False, 0.0, False),  # the unidentified direction
+        (False, 1.0, True),  # anchor term removes it
+        (True, 0.0, True),  # tail candidate removes it
+    ]:
+        kwargs = dict(tail_candidate=tail_candidate, target_loss_coef=target_loss_coef)
+        base, _ = _call_loss(student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs)
+        moved, _ = _call_loss(shifted, teacher_logits, anchors, response_mask, candidate_ids, **kwargs)
+        if should_differ:
+            assert (moved - base).abs().max() > 1e-3, (tail_candidate, target_loss_coef)
+        else:
+            torch.testing.assert_close(moved, base, atol=1e-5, rtol=1e-4)
+
+
+def test_anchor_term_is_minimized_when_anchor_probs_match():
+    """The reported anchor KL vanishes exactly when ``p(y_t) == q(y_t)``."""
+    vocab, k = 32, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=4)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    _, mismatched = _call_loss(
+        student_logits, teacher_logits, anchors, response_mask, candidate_ids, target_loss_coef=1.0
+    )
+    _, matched = _call_loss(
+        teacher_logits, teacher_logits, anchors, response_mask, candidate_ids, target_loss_coef=1.0
+    )
+
+    assert (matched["anchor_kl"] * response_mask).abs().max() < 1e-5
+    assert (mismatched["anchor_kl"] * response_mask).max() > 1e-3
+    assert (mismatched["anchor_kl"] * response_mask).min() >= -1e-5
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

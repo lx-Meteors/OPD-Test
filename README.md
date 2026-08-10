@@ -23,29 +23,69 @@ student：`y_t` 相对每个重要候选 `z` 应该排得更高还是更低、�
 
 ```text
 L_t = Σ_{z ≠ y_t}  q̃_t(z) · KL_B( σ(T(y_t) − T(z))  ‖  σ(S(y_t) − S(z)) )
+      + λ · KL_B( q_t(y_t) ‖ p_t(y_t) )
 
 q̃_t(z) = q_t(z) / (1 − q_t(y_t))
 ```
 
 - `S`、`T` 分别是 student / teacher 的 logit，`σ` 为 sigmoid；
 - teacher 候选权重 `q̃` 与 teacher 胜率均为 stop-gradient，只有 student 接收梯度；
-- 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）。
+- 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）；
+- 第二项是锚点项，`λ = target_loss_coef`，默认 `0.1`，原因见 §1.2。
 
 **实现上的关键点**：softmax 归一化项在 logit 差里会抵消，即
 `T(y) − T(z) = log q(y) − log q(z)`。因此所有成对 margin 都能直接从框架已有的 top-k
 log-prob 读出，**不需要传输或重算原始 logits，也不需要额外的 teacher forward**。每次更新
 仍然只有一次 student forward，显存与吞吐和 OPD baseline 完全一致。
 
-**候选集与归一化范围**：为了和 OPD baseline 可比，默认候选取 **student top-k**（baseline 的
+### 1.1 候选集与归一化范围
+
+为了和 OPD baseline 可比，默认候选取 **student top-k**（baseline 的
 `top_k_strategy=only_stu` 打分的就是这一组），权重按 teacher 在这些 id 上的概率
 `q(z)` 在 **top-k 内部**重归一化，与 baseline 在 K 维上做一次 softmax 的做法一致。注意
 权重来源仍是 teacher 概率而非 baseline 的 student 概率，这是 `q̃(z) = q(z)/(1 − q(y_t))`
 的定义决定的，改掉就不是 L-APD 了。
 
-另有一个 tail 候选选项（`tail_candidate=True`）：追加一个聚合候选，用 `logsumexp` 承载
-候选集之外的概率质量，此时归一化基准变成全词表，等价于严格除以 `1 − q(y_t)`，截断的尾部
-也能获得监督。实测该 tail 会拿到约 10% 的权重，因此它是一个会改变目标的选项，默认关闭以
-保持与 baseline 的可比性。
+`tail_candidate=True` 会追加一个**聚合候选**：把 top-k 之外那十几万个 token 打包成一个
+虚拟候选，概率用 `logsumexp` + `log1mexp` 算出（即 `1 − q(y_t) − Σ_z q(z)`），然后像普通
+候选一样参与成对比较，margin 是 `log q(y_t) − log q_tail`，含义是"锚点相对整个尾部应该排
+多高"。权重由 `q_tail` 自动定标，实测约 0.10。此时归一化基准从 top-k 内部变成全词表。
+默认关闭，以保持候选集与 baseline 的 16 个 id 逐一对应。
+
+### 1.2 为什么关掉 tail 之后必须加锚点项
+
+成对项只通过 logit 差 `S(y_t) − S(z)` 依赖 student，所以在 `tail_candidate=False` 下存在
+一个**精确的不变性**：把 `{y_t} ∪ top-k` 这些 token 的 logit 同时加上同一个常数（等价于把
+这一组的总质量整体缩放，多出/少掉的部分由截断掉的尾部吸收），所有成对 margin 不变，
+**loss 一个字都不变**。于是在成对最优点上只能推出比例关系
+
+```text
+p(y_t) = q(y_t) · M_S / N_S      M_S、N_S 分别是 student / teacher 在 {y_t} ∪ top-k 上的总质量
+```
+
+其中 `M_S` 完全自由 —— student 可以把 15 个成对关系全部拟合到完美，同时把大量质量漏进
+尾部。`tests/trainer/ppo/test_l_apd_on_cpu.py::test_truncated_pairs_alone_leave_the_tail_mass_unidentified`
+锁住了这个性质；一个数值实验里 student 最终停在 `p_tail = 18.9%`（teacher 只有 1.15%），
+top-k 内每个 token 都被统一压低 18%，而 loss 已经收敛。
+
+`tail_candidate=True` 时不存在这个问题：成对项覆盖了 `{y_t}, z_1..z_k, tail` 这个词表的
+**完整划分**，由 `p(y)/p(c) = q(y)/q(c)` 对每个划分块成立、两边求和且都归一到 1，立刻得到
+`p(y_t) = q(y_t)`，锚点概率严格可辨识，锚点项确实冗余（`L_APD_idea.md` §8 的论证成立的
+就是这个情形）。
+
+关掉 tail 后要恢复可辨识性只有两条路，二者解决的是同一个问题，只是从不同一侧下手：
+
+| | 做法 | 代价 |
+| --- | --- | --- |
+| `tail_candidate=True` | 补一个覆盖尾部的成对项 | 候选结构与 baseline 不同 |
+| `target_loss_coef > 0` | 直接把 `p(y_t)` 钉在 `q(y_t)`，再由成对比例传导到候选 | 多一个超参 |
+
+本仓库默认选后者（`0.1`，与 tail 候选启用时实测拿到的权重同量级），这样**候选集与 baseline
+的 16 个 id 完全一致**。锚点一钉住，`p(z_j) = q(z_j)` 随之确定，尾部质量也被间接约束。
+同一个数值实验里，加上 `λ = 0.1` 后 `p(y_t)`、`p_tail` 与 top-k 内各 token 的误差全部归零。
+
+顺带一提，框架里没有其它项在约束这个方向：`USE_KL` 默认 `False`，而且 ref-KL 那段代码在
+`update_policy` 的非 L-APD 分支里；`entropy_coeff` 也是 0。
 
 ## 2. 代码位置
 
@@ -215,20 +255,23 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `student` | 候选来源：student top-k（与 baseline 对齐）或 teacher top-k |
 | `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `False` | 是否追加聚合 tail 候选 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
-| `L_APD_TARGET_LOSS_COEF` | `...l_apd.target_loss_coef` | `0.0` | 额外 `KL_B(q(y)‖p(y))` 项，仅用于消融 |
+| `L_APD_TARGET_LOSS_COEF` | `...l_apd.target_loss_coef` | `0.1` | 锚点项 `KL_B(q(y)‖p(y))` 的系数，见 §1.2 |
+
+> `tail_candidate=False` 且 `target_loss_coef=0.0` 是**不要用的组合**：此时锚点概率不可辨识
+> （§1.2）。要么开 tail，要么保留非零的锚点系数。
 
 消融示例：
 
 ```bash
-# 打开 tail 候选：归一化基准从 top-16 内部变成全词表，尾部也获得监督
-L_APD_TAIL_CANDIDATE=True MODEL_ROOT=/input0/models \
+# 换成用 tail 候选来恢复可辨识性：归一化基准变成全词表，锚点项就不需要了
+L_APD_TAIL_CANDIDATE=True L_APD_TARGET_LOSS_COEF=0.0 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
 # 候选改用 teacher top-16
 L_APD_CANDIDATE_SOURCE=teacher MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 加上 target loss（idea 文档 §8 的消融）
+# 锚点项加重到和全部成对项同量级
 L_APD_TARGET_LOSS_COEF=1.0 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
@@ -269,12 +312,13 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/l_apd_bernoulli_kl` | teacher 加权的成对 Bernoulli KL（扣掉 teacher 熵的纯 KL） |
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 `abs(r_S − r_T)`，student 与 teacher 胜率的差距 |
-| `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 `q(y_t)` / `p(y_t)` |
+| `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 `q(y_t)` / `p(y_t)`，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
+| `actor/l_apd_anchor_kl` | 锚点项 `KL_B(q(y_t)‖p(y_t))`，`p(y_t) = q(y_t)` 时恰好为 0；仅 `target_loss_coef ≠ 0` 时记录 |
 | `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_anchor_in_candidates` | 锚点落在候选 top-k 内的比例 |
 | `actor/l_apd_candidate_count` | 参与 loss 的候选数 |
-| `actor/l_apd_candidate_weight_sum` | 候选权重和，`normalize_weights=True` 时应约等于 1 |
+| `actor/l_apd_candidate_weight_sum` | 候选权重和，`normalize_weights=True` 时应约等于 1；明显小于 1 说明有一部分 token 撞上了权重归一化的 eps 下限（见 §9） |
 
 评测结果仍在 `val-core/*` 下（AIME24 / AIME25 / AMC23 的 Avg@16）。
 
@@ -289,7 +333,9 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
 
 覆盖：全词表候选时与定义式逐元素相等；autograd 梯度等于解析式
 `∂L/∂(S(y)−S(z)) = q̃(z)·(r_S − r_T)`；tail 候选只含一个 token 时与全词表 loss 精确相等；
-`p = q` 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的归一化性质。
+`p = q` 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
+（成对项对"质量在 top-k 与尾部之间如何分配"完全不变，而 tail 候选或锚点项都能破掉这个
+不变性）；锚点 KL 在 `p(y_t) = q(y_t)` 时归零。
 
 ## 9. 注意事项
 
@@ -303,6 +349,14 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
   strategy 下都会被计算并传下来，L-APD 直接读 `teacher_top_k_ids` / `teacher_top_k_log_probs`
   与锚点上的 `teacher_log_probs`；该变量只影响 OPD 侧的 reward 构造。候选数由
   `LOG_PROB_TOP_K` 决定。
+- **已知问题：`tail_candidate=False` 下权重归一化的 eps 下限**。权重按
+  `raw / max(Σ raw, 1e-6)` 归一化。当 teacher 在采样 token 上几乎确定
+  （`q(y_t) > 1 − 1e-6`，此时 15 个竞争者的总质量小于 `1e-6`）时，eps 下限生效，该位置所有
+  权重被压到接近 0，成对项失去梯度。`tail_candidate=True` 时不会发生，因为 `_log1mexp` 内部
+  的 clamp 给尾部概率兜了一个 `~1e-6` 的地板，正好把归一化分母托在 eps 之上。实测
+  `candidate_weight_sum ≈ 0.94`，对应约 6% 的 token 落在这个区间。锚点项不受影响（它不经过
+  这个分母），所以默认的 `target_loss_coef=0.1` 会在这些位置继续提供梯度。彻底修法是把
+  "先 exp 再除"换成在有效候选上做 log 空间的 masked softmax，届时权重恒等于 1、无需 eps。
 - **不要打开 `TORCH_NCCL_BLOCKING_WAIT`**。它和 vLLM 的 CUDA graph capture 会死锁：8 个 rank
   全堵在 torch 的 `ProcessGroupNCCL::waitForPendingWorks()` 里，而那个等待循环没有超时，
   表现是显存占满、GPU 利用率 0%、日志停在

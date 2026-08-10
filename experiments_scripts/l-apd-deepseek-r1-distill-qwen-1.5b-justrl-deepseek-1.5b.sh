@@ -28,8 +28,11 @@ export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-student}"
 # carries no aggregate tail term.
 export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-False}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
-# Anchor-only Bernoulli KL term, ablation only
-export L_APD_TARGET_LOSS_COEF="${L_APD_TARGET_LOSS_COEF:-0.0}"
+# Anchor-only Bernoulli KL term. Required here because the tail candidate is off:
+# the pairwise terms then only constrain logit differences, leaving the student
+# free to bleed mass into the truncated tail. 0.1 matches the weight the tail
+# candidate carried when it was enabled.
+export L_APD_TARGET_LOSS_COEF="${L_APD_TARGET_LOSS_COEF:-0.1}"
 
 run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-tgt_${L_APD_TARGET_LOSS_COEF}" \
     "actor_rollout_ref.actor.l_apd.enable=True" \

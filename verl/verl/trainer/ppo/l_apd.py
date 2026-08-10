@@ -116,9 +116,15 @@ def compute_l_apd_token_loss(
             of by ``1 - q(y_t)``. With ``tail_candidate=True`` both are
             equivalent up to floating point error; without it, normalizing keeps
             the loss scale independent of how much mass top-k retains.
-        target_loss_coef: weight of the optional ``KL_B(q(y) || p(y))`` anchor
-            term. The main objective already identifies the anchor probability,
-            so this stays at 0 outside ablations.
+        target_loss_coef: weight of the ``KL_B(q(y) || p(y))`` anchor term.
+            The pairwise terms only constrain the logit differences ``S(y) - S(z)``,
+            so with ``tail_candidate=False`` they leave one direction free: scaling
+            the mass of ``{y} + candidates`` up or down, with the slack absorbed by
+            the truncated tail, does not change the loss at all. The anchor term
+            removes that freedom by pinning ``p(y)`` to ``q(y)``, which the pairwise
+            ratios then propagate to the candidates. Only redundant when
+            ``tail_candidate=True``, where the pairs already cover a full partition
+            of the vocabulary and therefore identify ``p(y)`` on their own.
         eps: floor for the weight normalizer.
 
     Returns:
@@ -165,6 +171,7 @@ def compute_l_apd_token_loss(
     pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
     token_loss = (weights * pair_loss).sum(dim=-1)
 
+    anchor_loss = None
     if target_loss_coef != 0.0:
         # KL_B(q(y) || p(y)) up to a student-independent constant.
         anchor_logit = student_anchor - _log1mexp(student_anchor)
@@ -194,5 +201,8 @@ def compute_l_apd_token_loss(
             diagnostics["tail_weight"] = weights[..., -1]
             diagnostics["teacher_tail_prob"] = torch.exp(teacher_tail)
             diagnostics["student_tail_prob"] = torch.exp(student_tail)
+        if anchor_loss is not None:
+            # Reported as a KL so it reaches 0 exactly when p(y) == q(y).
+            diagnostics["anchor_kl"] = anchor_loss - _bernoulli_entropy(torch.exp(teacher_anchor))
 
     return token_loss, diagnostics

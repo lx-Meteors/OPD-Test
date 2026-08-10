@@ -47,8 +47,10 @@ class LAPDConfig(BaseConfig):
             candidate set, so top-k truncation does not need a separate target loss.
         normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
             by ``1 - q(y_t)``.
-        target_loss_coef (float): Weight of the optional anchor-only Bernoulli KL term. Ablation only;
-            the pairwise objective already identifies the anchor probability.
+        target_loss_coef (float): Weight of the anchor-only Bernoulli KL term ``KL_B(q(y_t) || p(y_t))``.
+            Redundant when ``tail_candidate=True``, but required when it is off: the pairwise terms then
+            only constrain logit differences and leave the mass split between the top-k set and the
+            truncated tail unidentified.
     """
 
     enable: bool = False
