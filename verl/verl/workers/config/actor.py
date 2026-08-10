@@ -46,17 +46,19 @@ class LAPDConfig(BaseConfig):
         tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
             candidate set, so the opponents form a genuine partition of the non-anchor vocabulary.
         complement_candidate (bool): Add one aggregated candidate standing for everything except the
-            anchor, which is the anchor term -- the Bernoulli KL between ``q(y_t)`` and ``p(y_t)`` --
-            in pairwise form, weighted by ``q(y_t)`` like any other candidate. Ignored when ``tail_candidate`` is set. One of the two
+            anchor, which is the anchor term -- the KL between ``(p(y_t), 1 - p(y_t))`` and
+            ``(q(y_t), 1 - q(y_t))`` -- in pairwise form, weighted by ``q(y_t)`` like any other
+            candidate. Ignored when ``tail_candidate`` is set. One of the two
             is required: token candidates alone only constrain logit differences and leave the mass
             split between the top-k set and the truncated tail unidentified.
         normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
             by ``1 - q(y_t)``.
-        pair_divergence (str): Direction of the per-pair Bernoulli KL. 'reverse_kl' scores each pair
-            with ``KL(r_S || r_T)``, whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins
-            directly but decays on confidently misranked pairs; 'forward_kl' uses
-            ``KL(r_T || r_S)``, whose margin gradient ``r_S - r_T`` keeps full pull there. Both share
-            the same optimum and agree to first order around it.
+        pair_divergence (str): Direction of the per-pair KL, taken between the two sides restricted to
+            ``{y_t, z}`` and renormalized there. 'reverse_kl' scores each pair with ``KL(p~ || q~)``,
+            whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins directly but decays on
+            confidently misranked pairs; 'forward_kl' uses ``KL(q~ || p~)``, whose margin gradient
+            ``p~(y_t) - q~(y_t)`` keeps full pull there. Both share the same optimum and agree to
+            first order around it.
     """
 
     enable: bool = False

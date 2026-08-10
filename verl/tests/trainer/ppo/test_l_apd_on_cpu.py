@@ -118,7 +118,7 @@ def test_tail_candidate_recovers_the_truncated_token():
 
 
 def test_gradient_matches_analytical_margin_gradient():
-    """dL/d(S(y) - S(z)) = q~(z) * (r_S(y, z) - r_T(y, z))."""
+    """dL/d(S(y) - S(z)) = q~(z) * (p~(y, z) - q~(y, z))."""
     vocab = 12
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=7)
     student_logits = student_logits.float().requires_grad_(True)
@@ -168,7 +168,7 @@ def test_student_matching_teacher_is_a_stationary_point():
     token_loss.sum().backward()
 
     assert student_logits.grad.abs().max() < 1e-5
-    assert diagnostics["bernoulli_kl"].max() < 1e-5
+    assert diagnostics["pair_kl"].max() < 1e-5
     torch.testing.assert_close(
         diagnostics["pairwise_agreement"][response_mask.bool()],
         torch.ones(int(response_mask.sum())),
@@ -272,8 +272,8 @@ def test_token_candidates_alone_leave_the_tail_mass_unidentified():
             torch.testing.assert_close(moved, base, atol=1e-5, rtol=1e-4)
 
 
-def test_complement_candidate_is_the_anchor_bernoulli_kl():
-    """The complement pair reproduces ``KL_B(q(y_t) || p(y_t))`` and its ``q(y_t)`` weight."""
+def test_complement_candidate_is_the_anchor_kl():
+    """The complement pair reproduces the anchor KL and carries its ``q(y_t)`` weight."""
     vocab, k = 32, 8
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=4)
     candidate_ids = _candidates_from_teacher(teacher_logits, k)
@@ -310,7 +310,7 @@ def test_complement_candidate_is_the_anchor_bernoulli_kl():
 def test_matches_the_documented_two_part_form():
     """The loss equals the explicit form documented in the README.
 
-    ``L_t = sum_z [q(z)/Z] H_B(r_T, r_S) + [q(y)/Z] H_B(q(y), p(y))`` with
+    ``L_t = sum_z [q(z)/Z] H(q~, p~) + [q(y)/Z] H(q(y), p(y))`` with
     ``Z = sum over the top-k ids including the anchor``, i.e. the weights are the
     teacher probabilities renormalized over all k candidates rather than over the
     k - 1 non-anchor ones.
@@ -338,13 +338,13 @@ def test_matches_the_documented_two_part_form():
 
     normalizer = q_anchor.exp() + (q_cand.exp() * kept).sum(-1)
 
-    def bernoulli_ce(target, prob):
+    def pair_ce(target, prob):
         return -(target * prob.log() + (1 - target) * (1 - prob).log())
 
     r_s = torch.sigmoid(p_anchor.unsqueeze(-1) - p_cand)
     r_t = torch.sigmoid(q_anchor.unsqueeze(-1) - q_cand)
-    pairwise = ((q_cand.exp() / normalizer.unsqueeze(-1)) * bernoulli_ce(r_t, r_s) * kept).sum(-1)
-    anchor = (q_anchor.exp() / normalizer) * bernoulli_ce(q_anchor.exp(), p_anchor.exp())
+    pairwise = ((q_cand.exp() / normalizer.unsqueeze(-1)) * pair_ce(r_t, r_s) * kept).sum(-1)
+    anchor = (q_anchor.exp() / normalizer) * pair_ce(q_anchor.exp(), p_anchor.exp())
 
     torch.testing.assert_close(
         token_loss.double(), (pairwise + anchor) * response_mask, atol=1e-5, rtol=1e-4
@@ -398,8 +398,8 @@ def test_reverse_kl_is_the_default_direction():
     torch.testing.assert_close(default, explicit)
 
 
-def test_reverse_kl_matches_the_bernoulli_kl_definition():
-    """The reverse loss is ``sum_o w(o) KL_B(r_S(o) || r_T(o))``, an honest KL."""
+def test_reverse_kl_matches_the_kl_definition():
+    """The reverse loss is ``sum_o w(o) KL(p~(o) || q~(o))``, an honest KL."""
     vocab, k = 64, 8
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=29)
     candidate_ids = _candidates_from_teacher(teacher_logits, k)
@@ -438,7 +438,7 @@ def test_reverse_kl_matches_the_bernoulli_kl_definition():
     )
     # Reverse scores the pairs with the KL itself, so the reported loss is the KL.
     torch.testing.assert_close(
-        diagnostics["bernoulli_kl"].double() * response_mask,
+        diagnostics["pair_kl"].double() * response_mask,
         (pairwise + anchor) * response_mask,
         atol=1e-5,
         rtol=1e-4,
@@ -502,11 +502,11 @@ def test_both_directions_vanish_on_a_perfect_student():
         token_loss.sum().backward()
 
         assert student_logits.grad.abs().max() < 1e-5, direction
-        assert diagnostics["bernoulli_kl"].max() < 1e-5, direction
+        assert diagnostics["pair_kl"].max() < 1e-5, direction
 
 
 def test_reverse_kl_is_bounded_where_forward_diverges():
-    """A confidently misranked pair costs at most -log r_T under the reverse direction.
+    """A confidently misranked pair costs at most -log q~(y) under the reverse direction.
 
     This is the substantive behavioural difference between the two: the reverse loss
     saturates on confident disagreement and its gradient decays, while the forward

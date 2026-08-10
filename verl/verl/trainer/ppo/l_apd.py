@@ -20,15 +20,21 @@ teacher states how ``y`` should be ranked against each important competitor
 
 .. math::
 
-    L_t = \\sum_{z \\ne y_t} w_t(z)
-          \\mathrm{KL}(r_S(y_t, z) \\| r_T(y_t, z))
+    L_t = \\sum_{z \\ne y_t} w_t(z)\\,
+          \\mathrm{KL}(\\tilde p_{y_t, z} \\| \\tilde q_{y_t, z})
 
-with Bradley-Terry style soft win rates ``r(y, z) = sigmoid(logit(y) - logit(z))``
-and teacher weights ``w_t(v) = q_t(v) / Z_t`` renormalized over the whole
+A single comparison only asks which of ``y_t`` and ``z`` wins, so both sides are
+restricted to ``{y_t, z}`` and renormalized there,
+``p~(v) = p(v) / (p(y_t) + p(z))``, and each pair is scored with the plain
+reverse KL between those two-outcome distributions, i.e. the usual
+``sum_v p~(v) log[p~(v) / q~(v)]`` over the two outcomes. Dropping either
+outcome would leave a bare log-ratio, which is not a divergence and is unbounded
+below.
+
+Teacher weights ``w_t(v) = q_t(v) / Z_t`` are renormalized over the whole
 candidate axis, the anchor included: ``Z_t = q_t(y_t) + sum_z q_t(z)``.
 
-The direction of the per-pair Bernoulli KL is set by ``pair_divergence`` and
-defaults to the reverse one shown above.
+``pair_divergence`` picks the direction and defaults to the reverse one above.
 
 Because the candidate set is a truncated top-k, the token candidates alone do not
 cover the vocabulary, and an objective built only from them cannot identify
@@ -38,13 +44,13 @@ choices for it (see ``tail_candidate`` / ``complement_candidate``). Both enter a
 ordinary candidates, weighted by their own teacher mass, so neither introduces a
 free coefficient.
 
-Because a softmax normalizer cancels inside a logit difference, all pairwise
-margins can be computed from log-probabilities alone, so no raw logits have to
-be materialized or communicated:
-``logit(y) - logit(z) = log p(y) - log p(z)``.
+Because a softmax normalizer cancels inside a logit difference, every restricted
+pair probability is just ``p~(y) = sigmoid(log p(y) - log p(z))``, so all pairs
+can be scored from log-probabilities alone and no raw logits have to be
+materialized or communicated.
 
-Only the student receives gradients: teacher candidate weights and teacher win
-rates enter as constants.
+Only the student receives gradients: teacher candidate weights and the teacher
+side of every pair enter as constants.
 
 This module deliberately depends on ``torch`` only, so the objective can be
 tested in isolation from the training stack.
@@ -76,8 +82,8 @@ def l_apd_batch_keys(candidate_source: str = "teacher") -> tuple[str, ...]:
         )
     return _CANDIDATE_SOURCES[candidate_source] + ("teacher_log_probs",)
 
-# Bernoulli probabilities are clamped away from {0, 1} before taking logs so
-# that the reported KL/entropy diagnostics stay finite.
+# Pair probabilities are clamped away from {0, 1} before taking logs so that the
+# reported KL/entropy diagnostics stay finite.
 _PROB_EPS = 1.0e-7
 # ``log(1 - exp(x))`` is only meaningful for x < 0; this bounds the aggregate
 # tail probability from below by roughly 1e-6.
@@ -92,7 +98,8 @@ def _log1mexp(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x > -0.6931471805599453, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
 
 
-def _bernoulli_entropy(prob: torch.Tensor) -> torch.Tensor:
+def _pair_entropy(prob: torch.Tensor) -> torch.Tensor:
+    """Entropy of the two-outcome distribution ``(prob, 1 - prob)``."""
     p = prob.clamp(min=_PROB_EPS, max=1.0 - _PROB_EPS)
     return -(p * p.log() + (1.0 - p) * (1.0 - p).log())
 
@@ -128,8 +135,9 @@ def compute_l_apd_token_loss(
             outside the candidate set. Its opponents then form a genuine partition of
             the non-anchor vocabulary, so the tail is supervised too.
         complement_candidate: append one aggregated candidate standing for everything
-            except the anchor, i.e. the anchor term -- the Bernoulli KL between
-            ``q(y)`` and ``p(y)`` -- written in pairwise form. Ignored when
+            except the anchor, i.e. the anchor term -- the KL between the two-outcome
+            distributions ``(p(y), 1 - p(y))`` and ``(q(y), 1 - q(y))`` -- written in
+            the same pairwise form as every other candidate. Ignored when
             ``tail_candidate`` is set, which already covers the vocabulary.
 
             One of the two is required. Token candidates alone constrain the student
@@ -143,18 +151,18 @@ def compute_l_apd_token_loss(
             of by ``1 - q(y_t)``. Only meaningful together with an aggregated
             candidate; with ``tail_candidate=True`` the two are equivalent up to
             floating point error.
-        pair_divergence: which direction of the Bernoulli KL each pair is scored
-            with. Both vanish exactly at ``r_S == r_T`` and agree to first order
-            around it, so this only changes how large disagreements are treated.
+        pair_divergence: which direction each pair is scored with. Both vanish
+            exactly at ``p~ == q~`` and agree to first order around it, so this only
+            changes how large disagreements are treated.
 
-            ``reverse_kl`` uses ``KL(r_S || r_T)``, whose margin gradient is
+            ``reverse_kl`` uses ``KL(p~ || q~)``, whose margin gradient is
             ``sigmoid'(m) * (m - m_T)``: direct margin matching, but bounded in the
             student margin, so a confidently misranked pair contributes at most
-            ``-log r_T`` and its gradient decays like ``sigmoid'(m)``.
+            ``-log q~(y)`` and its gradient decays like ``sigmoid'(m)``.
 
-            ``forward_kl`` uses ``KL(r_T || r_S)``, whose margin gradient is
-            ``r_S - r_T``: unbounded loss, and the gradient saturates at magnitude 1
-            instead of vanishing, so confident misrankings keep full pull.
+            ``forward_kl`` uses ``KL(q~ || p~)``, whose margin gradient is
+            ``p~(y) - q~(y)``: unbounded loss, and the gradient saturates at magnitude
+            1 instead of vanishing, so confident misrankings keep full pull.
         eps: floor for the weight normalizer.
 
     Returns:
@@ -196,9 +204,10 @@ def compute_l_apd_token_loss(
         )
     elif complement_candidate:
         # The coarsest opponent: everything except the anchor, aggregated. Its margin
-        # log(p(y) / (1 - p(y))) makes the win rates exactly p(y) and q(y), so this pair
-        # is the Bernoulli KL between them -- the anchor term -- expressed in the same pairwise
-        # form as every other candidate, and weighted by q(y) like every other candidate.
+        # log(p(y) / (1 - p(y))) makes the restricted pair probabilities exactly p(y) and
+        # q(y), so this pair is the anchor term -- KL between (p(y), 1 - p(y)) and
+        # (q(y), 1 - q(y)) -- in the same form as every other candidate, and weighted by
+        # q(y) like every other candidate.
         student_complement = _log1mexp(student_anchor)
         teacher_complement = _log1mexp(teacher_anchor)
 
@@ -219,9 +228,10 @@ def compute_l_apd_token_loss(
     weights = (raw_weights / normalizer.clamp(min=eps)).detach()
 
     if pair_divergence == "reverse_kl":
-        # KL(r_S || r_T) written from log-sigmoids, which stay finite for every
-        # real margin. The r_S * log r_S terms vanish at the saturated ends because
-        # r_S decays exponentially while its log only grows linearly.
+        # sum_v p~(v) log[p~(v) / q~(v)] over the two outcomes of the pair, written
+        # from log-sigmoids so it stays finite for every real margin. The
+        # p~ * log p~ terms vanish at the saturated ends because p~ decays
+        # exponentially while its log only grows linearly.
         student_pair_prob_grad = torch.sigmoid(pair_logits)
         pair_loss = student_pair_prob_grad * (F.logsigmoid(pair_logits) - F.logsigmoid(teacher_margins)) + (
             1.0 - student_pair_prob_grad
@@ -231,7 +241,7 @@ def compute_l_apd_token_loss(
     else:
         pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
         # Cross-entropy; the teacher-side entropy is a stop-gradient constant.
-        pair_kl = pair_loss - _bernoulli_entropy(teacher_pair_prob)
+        pair_kl = pair_loss - _pair_entropy(teacher_pair_prob)
 
     token_loss = (weights * pair_loss).sum(dim=-1) * response_mask
 
@@ -240,7 +250,7 @@ def compute_l_apd_token_loss(
         pairwise_kl = (weights * pair_kl).sum(dim=-1)
         agreement = ((student_pair_prob - 0.5) * (teacher_pair_prob - 0.5) > 0).float()
         diagnostics = {
-            "bernoulli_kl": pairwise_kl,
+            "pair_kl": pairwise_kl,
             "pairwise_agreement": (weights * agreement).sum(dim=-1),
             "pairwise_gap": (weights * (student_pair_prob - teacher_pair_prob).abs()).sum(dim=-1),
             "teacher_anchor_prob": torch.exp(teacher_anchor),
@@ -256,8 +266,8 @@ def compute_l_apd_token_loss(
             diagnostics["student_tail_prob"] = torch.exp(student_tail)
         elif complement_candidate:
             diagnostics["anchor_weight"] = weights[..., -1]
-            # Bernoulli KL between q(y) and p(y), so it reaches 0 exactly when
-            # p(y) == q(y) whichever direction the pairs are scored with.
+            # KL between (p(y), 1 - p(y)) and (q(y), 1 - q(y)), so it reaches 0 exactly
+            # when p(y) == q(y) whichever direction the pairs are scored with.
             diagnostics["anchor_kl"] = pair_kl[..., -1]
 
     return token_loss, diagnostics
