@@ -53,9 +53,9 @@ class LAPDConfig(BaseConfig):
         normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
             by ``1 - q(y_t)``.
         pair_divergence (str): Direction of the per-pair Bernoulli KL. 'reverse_kl' scores each pair
-            with ``KL_B(r_S || r_T)``, whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins
+            with ``KL(r_S || r_T)``, whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins
             directly but decays on confidently misranked pairs; 'forward_kl' uses
-            ``KL_B(r_T || r_S)``, whose margin gradient ``r_S - r_T`` keeps full pull there. Both share
+            ``KL(r_T || r_S)``, whose margin gradient ``r_S - r_T`` keeps full pull there. Both share
             the same optimum and agree to first order around it.
     """
 

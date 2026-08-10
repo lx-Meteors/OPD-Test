@@ -21,7 +21,7 @@ teacher states how ``y`` should be ranked against each important competitor
 .. math::
 
     L_t = \\sum_{z \\ne y_t} w_t(z)
-          \\mathrm{KL}_{\\mathrm B}(r_S(y_t, z) \\| r_T(y_t, z))
+          \\mathrm{KL}(r_S(y_t, z) \\| r_T(y_t, z))
 
 with Bradley-Terry style soft win rates ``r(y, z) = sigmoid(logit(y) - logit(z))``
 and teacher weights ``w_t(v) = q_t(v) / Z_t`` renormalized over the whole
@@ -147,12 +147,12 @@ def compute_l_apd_token_loss(
             with. Both vanish exactly at ``r_S == r_T`` and agree to first order
             around it, so this only changes how large disagreements are treated.
 
-            ``reverse_kl`` uses ``KL_B(r_S || r_T)``, whose margin gradient is
+            ``reverse_kl`` uses ``KL(r_S || r_T)``, whose margin gradient is
             ``sigmoid'(m) * (m - m_T)``: direct margin matching, but bounded in the
             student margin, so a confidently misranked pair contributes at most
             ``-log r_T`` and its gradient decays like ``sigmoid'(m)``.
 
-            ``forward_kl`` uses ``KL_B(r_T || r_S)``, whose margin gradient is
+            ``forward_kl`` uses ``KL(r_T || r_S)``, whose margin gradient is
             ``r_S - r_T``: unbounded loss, and the gradient saturates at magnitude 1
             instead of vanishing, so confident misrankings keep full pull.
         eps: floor for the weight normalizer.
@@ -219,7 +219,7 @@ def compute_l_apd_token_loss(
     weights = (raw_weights / normalizer.clamp(min=eps)).detach()
 
     if pair_divergence == "reverse_kl":
-        # KL_B(r_S || r_T) written from log-sigmoids, which stay finite for every
+        # KL(r_S || r_T) written from log-sigmoids, which stay finite for every
         # real margin. The r_S * log r_S terms vanish at the saturated ends because
         # r_S decays exponentially while its log only grows linearly.
         student_pair_prob_grad = torch.sigmoid(pair_logits)

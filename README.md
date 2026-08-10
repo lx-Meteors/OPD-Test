@@ -20,11 +20,14 @@ student：$y_t$ 相对每个重要候选 $z$ 应该排得更高还是更低、�
 ## 1. 目标函数
 
 记 $p_t$、$q_t$ 为 student / teacher 在位置 $t$ 的分布，$S$、$T$ 为对应的 logit，$\sigma$ 为
-sigmoid，二值 KL 为
+sigmoid。下文 $\mathrm{KL}$ 的两个参数都是**标量**（一次成对比较的胜率，即 Bernoulli 参数）：
 
 $$
-\mathrm{KL_B}(a  \Vert  b) \;=\; a\log\frac{a}{b} \;+\; (1-a)\log\frac{1-a}{1-b}.
+\mathrm{KL}(a  \Vert  b) \;=\; a\log\frac{a}{b} \;+\; (1-a)\log\frac{1-a}{1-b}.
 $$
+
+这与 OPD baseline 那种整个词表上的类别 KL 是不同的对象（那里的参数是完整分布），只是共用
+$\mathrm{KL}$ 这个符号，靠参数区分。
 
 每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$，其余候选是
 
@@ -44,9 +47,9 @@ $$
 $$
 \boxed{\;
 L_t \;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
-\mathrm{KL_B}\bigl(r_S(y_t, z) \Vert r_T(y_t, z)\bigr)
+\mathrm{KL}\bigl(r_S(y_t, z) \Vert r_T(y_t, z)\bigr)
 \;+\; \frac{q_t(y_t)}{Z_t}\,
-\mathrm{KL_B}\bigl(p_t(y_t) \Vert q_t(y_t)\bigr)
+\mathrm{KL}\bigl(p_t(y_t) \Vert q_t(y_t)\bigr)
 \;}
 $$
 
@@ -73,13 +76,13 @@ r_S(y, \perp) = \sigma\Bigl(\log \tfrac{p(y)}{1 - p(y)}\Bigr) = p(y),
 r_T(y, \perp) = \sigma\Bigl(\log \tfrac{q(y)}{1 - q(y)}\Bigr) = q(y),
 $$
 
-代入 $\mathrm{KL_B}(r_S \Vert r_T)$ **恰好等于** $\mathrm{KL_B}\bigl(p_t(y_t) \Vert q_t(y_t)\bigr)$，
+代入 $\mathrm{KL}(r_S \Vert r_T)$ **恰好等于** $\mathrm{KL}\bigl(p_t(y_t) \Vert q_t(y_t)\bigr)$，
 也就是 boxed 公式里的最后一项。于是整个 loss 可以合并成一个统一的加权和：把 $\perp$ 当成
 一个额外"对手"、它的 teacher 质量取 $q_t(y_t)$，则
 
 $$
 L_t \;=\; \sum_{o \in \mathcal{V}_t \cup \lbrace \perp \rbrace} \frac{m_t(o)}{Z_t}\;
-\mathrm{KL_B}\bigl(r_S(y_t, o) \Vert r_T(y_t, o)\bigr),
+\mathrm{KL}\bigl(r_S(y_t, o) \Vert r_T(y_t, o)\bigr),
 \qquad
 m_t(z) = q_t(z),\quad m_t(\perp) = q_t(y_t).
 $$
@@ -95,7 +98,7 @@ $$
 1. 逆向下 student 持有熵项，所以 loss **本身就是 KL**，`actor/l_apd_loss` 会收敛到 0，和
    `actor/l_apd_bernoulli_kl` 相等。正向下代码用 `binary_cross_entropy_with_logits`，算的是
    Bernoulli 交叉熵，比 KL 多一个 teacher 侧熵（student 无关的常数，梯度相同），此时只有
-   `actor/l_apd_bernoulli_kl` 是纯 KL。两个方向的 $\mathrm{KL_B}$ 都用 log-sigmoid 写成,
+   `actor/l_apd_bernoulli_kl` 是纯 KL。两个方向的 $\mathrm{KL}$ 都用 log-sigmoid 写成,
    任意实数 margin 下都有限。
 2. softmax 归一化项在 logit 差里会抵消，即 $T(y) - T(z) = \log q(y) - \log q(z)$。因此所有
    成对 margin 都能直接从框架已有的 top-$k$ log-prob 读出，**不需要传输或重算原始 logits，
@@ -137,7 +140,7 @@ $p(y_t) = q(y_t)$。有两种选法：
 
 | | 聚合对手 $\perp$ | 该项的含义 | 权重（自动定标） |
 | --- | --- | --- | --- |
-| `complement_candidate=True`（默认） | $y_t$ 的补集，即"除 $y_t$ 外的全体" | $\mathrm{KL_B}(p(y_t) \Vert q(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65$ |
+| `complement_candidate=True`（默认） | $y_t$ 的补集，即"除 $y_t$ 外的全体" | $\mathrm{KL}(p(y_t) \Vert q(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65$ |
 | `tail_candidate=True` | top-$k$ 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | $q_{\text{tail}}/Z_t$，此时 $Z_t = 1 - q(y_t)$，实测约 $0.10$ |
 
 两者都是**同一个成对构造**在一个聚合对手上的特例，权重都由 teacher 质量自动决定，
@@ -453,7 +456,7 @@ PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
 ```
 
 覆盖：两个方向的 autograd 梯度分别等于 §1.3 的两个解析式；逆向 loss 逐元素等于加权的
-$\mathrm{KL_B}(r_S \Vert r_T)$ 且与 `bernoulli_kl` 诊断相等；逆向 loss 在自信站错边处有界而
+$\mathrm{KL}(r_S \Vert r_T)$ 且与 `bernoulli_kl` 诊断相等；逆向 loss 在自信站错边处有界而
 正向发散（锁住 §1.3 那张表的定性行为）；`reverse_kl` 确实是库的默认方向；未知方向名会报错；
 $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐元素相等、tail 候选只含一个 token 时
 与全词表 loss 精确相等；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
