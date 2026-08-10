@@ -25,7 +25,37 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "LAPDConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+
+
+@dataclass
+class LAPDConfig(BaseConfig):
+    """Configuration for L-APD (anchored pairwise distillation).
+
+    When enabled, the actor loss is replaced by the teacher-anchored pairwise
+    distillation objective, which needs no reward, advantage or PPO ratio. It
+    requires a teacher (``reward_model.enable=True``) that shares the student
+    tokenizer, and ``actor_rollout_ref.rollout.log_prob_top_k > 0``.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        enable (bool): Whether to train with the L-APD loss instead of the policy-gradient surrogate.
+        candidate_source (str): Where competitor tokens come from. 'teacher' uses the teacher top-k
+            (the main method), 'student' uses the student top-k.
+        tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
+            candidate set, so top-k truncation does not need a separate target loss.
+        normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
+            by ``1 - q(y_t)``.
+        target_loss_coef (float): Weight of the optional anchor-only Bernoulli KL term. Ablation only;
+            the pairwise objective already identifies the anchor probability.
+    """
+
+    enable: bool = False
+    candidate_source: str = "teacher"
+    tail_candidate: bool = True
+    normalize_weights: bool = True
+    target_loss_coef: float = 0.0
 
 
 @dataclass
@@ -69,6 +99,7 @@ class ActorConfig(BaseConfig):
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
+        l_apd (LAPDConfig): Configuration for the L-APD distillation loss.
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         entropy_coeff (float): Entropy coefficient for regularization.
@@ -103,6 +134,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    l_apd: LAPDConfig = field(default_factory=LAPDConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0

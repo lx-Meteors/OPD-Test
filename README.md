@@ -1,147 +1,282 @@
-<div align="center">
+# L-APD：锚点式成对蒸馏（Anchored Pairwise Distillation）
 
-<h1 style="display: flex; justify-content: center; align-items: center; gap: 10px; margin: 0;">
-  Prune-OPD: Efficient and Reliable On-Policy Distillation for Long-Horizon Reasoning
-</h1>
+> 本仓库是在 Prune-OPD 框架上实现的 L-APD。框架本身（Prune-OPD / OPD baseline 的说明、
+> 安装步骤、其他实验脚本）见 [`README_Prune-OPD.md`](README_Prune-OPD.md)。
 
-<p align="center">
-  <em>Reliability-aware pruning for scalable on-policy distillation.</em>
-</p>
-
-<div align="center">
-  <a href="https://arxiv.org/abs/2605.07804"><img src="https://img.shields.io/badge/arXiv-2605.07804-b31b1b.svg" alt="arXiv"></a>
-</div>
-
-<div align="center">
-  <img src="./figs/main_compat.png" alt="Prune-OPD overview" style="width: 80%; height: auto;">
-</div>
-
-</div>
-
-## Setup
-
-We recommend a CUDA 12 machine with 8 NVIDIA GPUs. The training code is based on `verl`.
-
-```sh
-# 1. Clone and enter the repository.
-git clone <repo-url> prune-opd
-cd prune-opd
-
-# 2. Create the environment.
-conda create -n opd python=3.12 -y
-conda activate opd
-
-# 3. Install verl runtime dependencies.
-cd verl
-USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
-cd ..
-
-# 4. Install local packages.
-pip install -e ./verl
-pip install math-verify
-```
-
-If the FlashAttention wheel selected by `verl/scripts/install_vllm_sglang_mcore.sh` does not match your CUDA/PyTorch platform, install the matching wheel manually and rerun the remaining pip installs.
-
-## Data and Models
-
-Set the data and model roots before running scripts:
-
-```sh
-export DATA_ROOT=/path/to/datasets
-export MODEL_ROOT=/path/to/models
-```
-
-Expected data layout:
+L-APD 是在 Prune-OPD 框架内实现的一个**不依赖 reward、advantage、PPO ratio 和 GRPO 分组**的
+on-policy 蒸馏目标。student 先在自己的轨迹上采样出真实 token `y_t` 作为锚点，teacher 再告诉
+student：`y_t` 相对每个重要候选 `z` 应该排得更高还是更低、以及应当相差多少。
 
 ```text
-${DATA_ROOT}/dapo-math-17k.parquet
-${DATA_ROOT}/test_data/AMC23/test.parquet
-${DATA_ROOT}/test_data/AIME24/test.parquet
-${DATA_ROOT}/test_data/AIME25/test.parquet
-${DATA_ROOT}/test_data/HMMT24/test.parquet
-${DATA_ROOT}/test_data/HMMT25/test.parquet
+                           候选 z1
+                              ↑
+                              |
+候选 z2  ←── 真实 token y ──→  候选 z3
+                              |
+                              ↓
+                           候选 z4
 ```
 
-Expected model directories:
+## 1. 目标函数
+
+单个位置的损失为 teacher 加权的成对 Bernoulli KL：
 
 ```text
-${MODEL_ROOT}/DeepSeek-R1-Distill-Qwen-1.5B
-${MODEL_ROOT}/JustRL-DeepSeek-1.5B
-${MODEL_ROOT}/Qwen3-4B-Base
-${MODEL_ROOT}/Qwen3-4B
+L_t = Σ_{z ≠ y_t}  q̃_t(z) · KL_B( σ(T(y_t) − T(z))  ‖  σ(S(y_t) − S(z)) )
+
+q̃_t(z) = q_t(z) / (1 − q_t(y_t))
 ```
 
-You may also set `ACTOR_MODEL_PATH` and `REWARD_MODEL_PATH` directly.
+- `S`、`T` 分别是 student / teacher 的 logit，`σ` 为 sigmoid；
+- teacher 候选权重 `q̃` 与 teacher 胜率均为 stop-gradient，只有 student 接收梯度；
+- 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）。
 
-## Training
+**实现上的关键点**：softmax 归一化项在 logit 差里会抵消，即
+`T(y) − T(z) = log q(y) − log q(z)`。因此所有成对 margin 都能直接从框架已有的 top-k
+log-prob 读出，**不需要传输或重算原始 logits，也不需要额外的 teacher forward**。每次更新
+仍然只有一次 student forward，显存与吞吐和 OPD baseline 完全一致。
 
-We provide OPD and Prune-OPD scripts for two teacher-student pairs.
+**Top-K 尾部处理**：候选取 teacher top-k，另外追加一个聚合 tail 候选，用
+`logsumexp` 承载候选集之外的概率质量，使截断不需要引入额外的 target-loss 系数。加上
+tail 之后候选权重在有效位置上精确求和为 1。
 
-| Script | Description |
+## 2. 代码位置
+
+| 文件 | 作用 |
 | --- | --- |
-| `experiments_scripts/opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh` | OPD baseline for DeepSeek-R1-Distill-Qwen-1.5B / JustRL-DeepSeek-1.5B |
-| `experiments_scripts/prune-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh` | Prune-OPD for DeepSeek-R1-Distill-Qwen-1.5B / JustRL-DeepSeek-1.5B |
-| `experiments_scripts/opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.sh` | OPD baseline for Qwen3-4B-Base / Qwen3-4B (Non-thinking) |
-| `experiments_scripts/prune-opd-qwen3-4b-base-qwen3-4b-non-thinking.sh` | Prune-OPD for Qwen3-4B-Base / Qwen3-4B (Non-thinking) |
+| `verl/verl/trainer/ppo/l_apd.py` | 目标函数本体（只依赖 torch，可独立测试） |
+| `verl/verl/workers/actor/dp_actor.py` | `update_policy` 中的 L-APD 分支与 `_compute_l_apd_loss` |
+| `verl/verl/workers/config/actor.py` | `LAPDConfig` 配置项 |
+| `verl/verl/trainer/config/actor/actor.yaml` | `actor_rollout_ref.actor.l_apd.*` 默认值 |
+| `verl/verl/trainer/ppo/ray_trainer.py` | 保留 L-APD 需要的 teacher 张量到 actor update |
+| `experiments_scripts/l-apd-*.sh` | Table 1 配置的启动脚本 |
+| `verl/tests/trainer/ppo/test_l_apd_on_cpu.py` | 单元测试 |
 
-Preview the resolved command without launching training:
+`l_apd.enable=false` 时以上改动全部旁路，OPD / Prune-OPD 原有行为逐字不变。
 
-```sh
-DRY_RUN=1 DATA_ROOT=/path/to/datasets MODEL_ROOT=/path/to/models \
-bash experiments_scripts/prune-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+## 3. 实验配置（与 Table 1 对齐）
+
+| 项目 | 取值 |
+| --- | --- |
+| Student | DeepSeek-R1-Distill-Qwen-1.5B |
+| Teacher | JustRL-DeepSeek-1.5B（冻结） |
+| 训练数据 | DAPO-Math-17K |
+| 评测 | AIME24 + AIME25 + AMC23，Avg@16 |
+| max response length | 12288（validation 31744） |
+| rollout number | 4 |
+| mini-batch size | 64 |
+| log-prob top-k | 16 |
+| learning rate | 1e-6 |
+| 训练步数 | 203 |
+| 采样温度 | student 1.0 / teacher 1.0 |
+| 硬件 | 单节点 8 卡 |
+
+## 4. 准备
+
+### 4.1 环境
+
+本机可直接复用已有的 conda 环境（已含 torch 2.6 / vllm 0.8.5 / ray 2.56 / hydra / tensordict）：
+
+```bash
+conda activate /openbayes/input/input0/miniconda3/envs/g-opd-verl
+cd /input0/yyy/Prune-OPD
 ```
 
-Run training:
+若要从零搭建，按 [`README_Prune-OPD.md`](README_Prune-OPD.md) 的 Setup 一节创建 `opd` 环境即可。
+下文命令里的 `/input0/yyy/Prune-OPD` 是本机的仓库路径，换机器时替换成实际 clone 位置。
 
-```sh
-DATA_ROOT=/path/to/datasets MODEL_ROOT=/path/to/models \
-bash experiments_scripts/prune-opd-qwen3-4b-base-qwen3-4b-non-thinking.sh
+### 4.2 数据
+
+仓库自带的 `datasets/` 已包含所需文件，无需额外准备：
+
+```text
+datasets/dapo-math-17k.parquet
+datasets/test_data/AIME24/test.parquet
+datasets/test_data/AIME25/test.parquet
+datasets/test_data/AMC23/test.parquet
 ```
 
-Extra Hydra overrides can be appended:
+### 4.3 模型
 
-```sh
-bash experiments_scripts/prune-opd-qwen3-4b-base-qwen3-4b-non-thinking.sh \
-  trainer.test_freq=10 actor_rollout_ref.actor.optim.lr=5e-7
+student 与 teacher 必须共享 tokenizer 和词表（L-APD 直接比较同一 token 上的 margin）。
+下载到任意目录后用 `MODEL_ROOT` 指向它：
+
+```bash
+export MODEL_ROOT=/input0/yyy/models
+
+huggingface-cli download deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --local-dir "${MODEL_ROOT}/DeepSeek-R1-Distill-Qwen-1.5B"
+
+huggingface-cli download hbx/JustRL-DeepSeek-1.5B \
+  --local-dir "${MODEL_ROOT}/JustRL-DeepSeek-1.5B"
 ```
 
-Main defaults:
+目录名必须与上面一致，脚本按 `${MODEL_ROOT}/<模型名>` 拼路径；也可以用
+`ACTOR_MODEL_PATH` / `REWARD_MODEL_PATH` 直接指定完整路径。
 
-- train data: DAPO-Math-17K
-- evaluation: AMC23, AIME24, AIME25, HMMT24, HMMT25
-- evaluation metric: Avg@16
-- max response length: 12288
-- validation max response length: 31744
-- rollout number: 4
-- mini-batch size: 64
-- log-prob top-k: 16
-- training steps: 203
-- Prune-OPD metric: overlap ratio, threshold 0.7
+## 5. 启动训练
 
-Logging is console-only by default. To enable W&B:
+### 5.1 先做一次 dry run
 
-```sh
+`DRY_RUN=1` 会走完全部路径校验（student / teacher 权重、训练集、`TEST_DATASET` 里实际列出的
+每个评测文件），打印展开后的完整命令后退出，不启动 ray、不占用 GPU：
+
+```bash
+cd /input0/yyy/Prune-OPD
+
+DRY_RUN=1 MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+```
+
+看到 `Required path does not exist: ...` 说明对应模型或数据还没准备好。
+
+### 5.2 正式启动
+
+```bash
+cd /input0/yyy/Prune-OPD
+conda activate /openbayes/input/input0/miniconda3/envs/g-opd-verl
+
+MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+```
+
+脚本会自动 `ray stop --force` → `ray start --head` → 启动训练，退出时清理 ray。
+日志同时打到终端和 `logs/opd/<experiment_name>.log`。
+
+### 5.3 后台长跑并跟踪日志
+
+```bash
+cd /input0/yyy/Prune-OPD
+
+nohup env MODEL_ROOT=/input0/yyy/models \
+  bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh \
+  > /dev/null 2>&1 &
+
+# 跟踪最新日志
+tail -f "$(ls -t logs/opd/l-apd-*.log | head -1)"
+
+# 每个 step 的指标是一整行（step:N - key:value - ...），抽出其中的 L-APD 字段
+tail -f "$(ls -t logs/opd/l-apd-*.log | head -1)" \
+  | grep --line-buffered -oE "step:[0-9]+|actor/l_apd_[a-z_]+:[-0-9.e+]+|val-core[^ ]+"
+```
+
+### 5.4 开启 W&B
+
+```bash
 WANDB_API_KEY=<your-key> WANDB_MODE=online TRACKING_BACKENDS='[console,wandb]' \
+MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+```
+
+### 5.5 对照组：OPD baseline（相同 rollout / teacher / optimizer / token budget / batch）
+
+只有蒸馏 loss 不同，因此必须用同一套评测集，才能和 L-APD 直接比较：
+
+```bash
+cd /input0/yyy/Prune-OPD
+export DATA_ROOT=/input0/yyy/Prune-OPD/datasets
+
+MODEL_ROOT=/input0/yyy/models \
+TEST_DATASET="[\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/AMC23/test.parquet\"]" \
 bash experiments_scripts/opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
-## Citation
+## 6. 常用调整
 
-If you find this repository useful, please cite our paper:
+任何 Hydra override 都可以直接追加在脚本后面：
 
-```bibtex
-@misc{yang2026pruneopd,
-  title={Prune-OPD: Efficient and Reliable On-Policy Distillation for Long-Horizon Reasoning},
-  author={Zhicheng Yang and Zhijiang Guo and Yifan Song and Minrui Xu and Yongxin Wang and Yiwei Wang and Xiaodan Liang and Jing Tang},
-  year={2026},
-  eprint={2605.07804},
-  archivePrefix={arXiv},
-  primaryClass={cs.LG},
-  url={https://arxiv.org/abs/2605.07804}
-}
+```bash
+MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh \
+  trainer.n_gpus_per_node=4 \
+  trainer.test_freq=10 \
+  actor_rollout_ref.actor.optim.lr=5e-7
 ```
 
-## Acknowledgement
+### 6.1 L-APD 自身的开关
 
-This codebase builds on the excellent [verl](https://github.com/volcengine/verl) training framework and the [THUNLP/OPD](https://github.com/thunlp/OPD) implementation for on-policy distillation.
+| 环境变量 | Hydra key | 默认 | 含义 |
+| --- | --- | --- | --- |
+| — | `actor_rollout_ref.actor.l_apd.enable` | 脚本内置 `True` | 用 L-APD 替换 policy-gradient 目标 |
+| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `teacher` | 候选来源：teacher top-k（主方法）或 student top-k |
+| `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `True` | 是否追加聚合 tail 候选 |
+| `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
+| `L_APD_TARGET_LOSS_COEF` | `...l_apd.target_loss_coef` | `0.0` | 额外 `KL_B(q(y)‖p(y))` 项，仅用于消融 |
+
+消融示例：
+
+```bash
+# 关掉 tail 候选（简单截断 top-16）
+L_APD_TAIL_CANDIDATE=False MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
+# 候选改用 student top-k
+L_APD_CANDIDATE_SOURCE=student MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
+# 加上 target loss（idea 文档 §8 的消融）
+L_APD_TARGET_LOSS_COEF=1.0 MODEL_ROOT=/input0/yyy/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+```
+
+### 6.2 训练/评测规模
+
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `TOTAL_TRAINING_STEPS` | 203 | 训练步数 |
+| `MAX_RESP_LENGTH` | 12288 | 训练最大生成长度 |
+| `MAX_VAL_RESP_LENGTH` | 31744 | 评测最大生成长度 |
+| `N_RESPONSES` | 4 | 每个 prompt 的 rollout 数 |
+| `MINI_BATCH_SIZE` | 64 | mini-batch |
+| `LOG_PROB_TOP_K` | 16 | top-k 候选数 |
+| `TEST_FREQ` / `SAVE_FREQ` | 20 / 100 | 评测与存档间隔 |
+| `VAL_BEFORE_TRAIN` | True | 训练前先跑一次评测作为 step 0 基线 |
+| `TEST_DATASET` | AIME24/AIME25/AMC23（脚本内覆盖了 common.sh 的默认值） | 评测集，会按实际列出的文件逐个校验存在性 |
+| `MODEL_ROOT` / `DATA_ROOT` | 仓库内 `models/`、`datasets/` | 模型与数据根目录 |
+| `CKPT_ROOT` / `LOG_DIR` | `checkpoint/`、`logs/opd` | 输出位置 |
+
+## 7. 训练日志里的 L-APD 指标
+
+| 指标 | 含义 |
+| --- | --- |
+| `actor/pg_loss` | L-APD 目标值（复用了原字段名） |
+| `actor/l_apd_bernoulli_kl` | teacher 加权的成对 Bernoulli KL（扣掉 teacher 熵的纯 KL） |
+| `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
+| `actor/l_apd_pairwise_gap` | 加权的 `abs(r_S − r_T)`，student 与 teacher 胜率的差距 |
+| `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 `q(y_t)` / `p(y_t)` |
+| `actor/l_apd_tail_weight` | tail 候选拿到的权重 |
+| `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量 |
+| `actor/l_apd_anchor_in_candidates` | 锚点落在 teacher top-k 内的比例 |
+| `actor/l_apd_candidate_count` | 参与 loss 的候选数 |
+| `actor/l_apd_candidate_weight_sum` | 候选权重和，开 tail 时应约等于 1 |
+
+评测结果仍在 `val-core/*` 下（AIME24 / AIME25 / AMC23 的 Avg@16）。
+
+## 8. 单元测试
+
+```bash
+cd /input0/yyy/Prune-OPD/verl
+PYTHONPATH=$(pwd) python tests/trainer/ppo/test_l_apd_on_cpu.py
+# 或
+PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
+```
+
+覆盖：全词表候选时与定义式逐元素相等；autograd 梯度等于解析式
+`∂L/∂(S(y)−S(z)) = q̃(z)·(r_S − r_T)`；tail 候选只含一个 token 时与全词表 loss 精确相等；
+`p = q` 时梯度为 0；padding 位置无 loss、无 NaN；候选权重的归一化性质。
+
+## 9. 注意事项
+
+- **必须共享词表**。teacher 与 student 的 tokenizer / vocabulary 必须一致，否则单 token
+  margin 不可比。DeepSeek-R1-Distill-Qwen-1.5B 与 JustRL-DeepSeek-1.5B 满足该条件。
+- **teacher 必须真的更强**。训练前建议先确认 teacher 在同样的 prompt 格式下优于 student，
+  否则蒸馏到的只是措辞偏好。`VAL_BEFORE_TRAIN=True` 会给出 student 的 step 0 基线。
+- **L-APD 不读 reward**。框架仍会计算 rm_scores / advantage 用于诊断与对照，但 L-APD 的
+  梯度完全不经过它们（`update_policy` 在 L-APD 分支下根本不会取 `advantages`）。
+- **`TOP_K_STRATEGY` 不影响 L-APD 的候选集**。teacher top-k 的 id 与 log-prob 在任何
+  strategy 下都会被计算并传下来，L-APD 直接读 `teacher_top_k_ids` / `teacher_top_k_log_probs`
+  与锚点上的 `teacher_log_probs`；该变量只影响 OPD 侧的 reward 构造。候选数由
+  `LOG_PROB_TOP_K` 决定。
+- **恢复训练**：experiment name 带时间戳，所以每次启动都是新目录。要接着上次跑，需显式指定
+  `trainer.default_local_dir=<旧 checkpoint 目录> trainer.resume_mode=auto`。
+- 单节点默认 8 卡（`trainer.n_gpus_per_node=8`），卡数不同时请追加 override。

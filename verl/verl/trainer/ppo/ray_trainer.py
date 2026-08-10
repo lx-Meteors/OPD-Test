@@ -44,6 +44,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.l_apd import l_apd_batch_keys
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -2557,6 +2558,12 @@ class RayPPOTrainer:
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
                     ]
+                    # L-APD computes its loss from teacher log-probs inside the actor update,
+                    # so the tensors it consumes must survive until then.
+                    l_apd_cfg = self.config.actor_rollout_ref.actor.get("l_apd", None)
+                    if l_apd_cfg is not None and l_apd_cfg.get("enable", False):
+                        keys_needed = set(l_apd_batch_keys(l_apd_cfg.get("candidate_source", "teacher")))
+                        keys_to_pop = [key for key in keys_to_pop if key not in keys_needed]
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
                             batch.batch.pop(key)

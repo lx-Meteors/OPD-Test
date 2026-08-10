@@ -126,11 +126,12 @@ run_opd() {
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME24/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME25/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/HMMT24/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/HMMT25/test.parquet")"
+    # Check the evaluation files that TEST_DATASET actually lists.
+    local test_file
+    while IFS= read -r test_file; do
+        [[ -z "${test_file}" ]] && continue
+        require_path "$(resolve_path "${test_file}")"
+    done < <(printf '%s\n' "${TEST_DATASET}" | tr -d '[]"'"'"' ' | tr ',' '\n')
 
     export PYTHONUNBUFFERED=1
     export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.99}"

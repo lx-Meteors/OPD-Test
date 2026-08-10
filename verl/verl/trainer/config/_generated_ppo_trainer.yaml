@@ -60,6 +60,13 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+    l_apd:
+      _target_: verl.workers.config.LAPDConfig
+      enable: false
+      candidate_source: teacher
+      tail_candidate: true
+      normalize_weights: true
+      target_loss_coef: 0.0
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     entropy_coeff: 0

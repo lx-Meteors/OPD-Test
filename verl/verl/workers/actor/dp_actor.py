@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.l_apd import compute_l_apd_token_loss, l_apd_batch_keys
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -68,6 +69,16 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_fused_kernels={self.use_fused_kernels}")
+
+        # L-APD replaces the policy-gradient surrogate by a teacher-anchored
+        # pairwise distillation loss, so it only applies to the trainable actor.
+        self.l_apd_config = None
+        if actor_optimizer is not None:
+            l_apd_config = self.config.get("l_apd", None)
+            if l_apd_config is not None and l_apd_config.get("enable", False):
+                self.l_apd_config = l_apd_config
+        if torch.distributed.get_rank() == 0:
+            print(f"{role} l_apd={self.l_apd_config is not None}")
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
@@ -743,6 +754,61 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys, topk_ids_tensor, topk_log_probs_tensor
 
+    def _compute_l_apd_loss(self, model_inputs, response_mask, temperature, calculate_entropy, loss_agg_mode):
+        """Compute the L-APD loss for one micro batch.
+
+        The student is forwarded once on its own trajectory: the same pass yields
+        the anchor log-probs of the sampled tokens and the log-probs of the
+        teacher-selected competitors, both differentiable.
+
+        Returns:
+            entropy: ``(bs, response_length)`` or None
+            log_prob: ``(bs, response_length)`` student log-probs of the anchors
+            loss: aggregated scalar loss
+            metrics: dict of scalar diagnostics
+        """
+        candidate_source = self.l_apd_config.get("candidate_source", "teacher")
+        candidate_key, teacher_candidate_key, teacher_anchor_key = l_apd_batch_keys(candidate_source)
+
+        missing = [key for key in (candidate_key, teacher_candidate_key, teacher_anchor_key) if key not in model_inputs]
+        if missing:
+            raise ValueError(
+                f"L-APD requires teacher tensors {missing} in the actor batch. Enable the teacher "
+                "(reward_model.enable=True) with actor_rollout_ref.rollout.log_prob_top_k > 0."
+            )
+
+        candidate_ids = model_inputs[candidate_key]
+        teacher_candidate_log_probs = model_inputs[teacher_candidate_key]
+        teacher_anchor_log_probs = model_inputs[teacher_anchor_key]
+        responses = model_inputs["responses"]
+
+        entropy, log_prob, _, candidate_log_probs = self._forward_micro_batch(
+            model_inputs,
+            temperature=temperature,
+            calculate_entropy=calculate_entropy,
+            top_k=candidate_ids.shape[-1],
+            student_top_k_ids=candidate_ids,
+        )
+
+        token_loss, diagnostics = compute_l_apd_token_loss(
+            student_anchor_log_probs=log_prob,
+            student_candidate_log_probs=candidate_log_probs,
+            teacher_anchor_log_probs=teacher_anchor_log_probs,
+            teacher_candidate_log_probs=teacher_candidate_log_probs,
+            candidate_mask=candidate_ids != responses.unsqueeze(-1),
+            response_mask=response_mask,
+            tail_candidate=self.l_apd_config.get("tail_candidate", True),
+            normalize_weights=self.l_apd_config.get("normalize_weights", True),
+            target_loss_coef=self.l_apd_config.get("target_loss_coef", 0.0),
+        )
+        loss = agg_loss(loss_mat=token_loss, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+        metrics = {
+            f"actor/l_apd_{name}": verl_F.masked_mean(value, response_mask).detach().item()
+            for name, value in diagnostics.items()
+        }
+        return entropy, log_prob, loss, metrics
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -757,8 +823,12 @@ class DataParallelPPOActor(BasePPOActor):
             "attention_mask",
             "position_ids",
             "old_log_probs",
-            "advantages",
         ]
+        if self.l_apd_config is None:
+            # L-APD is reward-free: it never reads advantages.
+            select_keys.append("advantages")
+        else:
+            select_keys.extend(l_apd_batch_keys(self.l_apd_config.get("candidate_source", "teacher")))
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -768,29 +838,30 @@ class DataParallelPPOActor(BasePPOActor):
 
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
-        
-        # Include student_top_k_log_probs if present (for top-k distillation)
-        if "student_top_k_log_probs" in data.batch.keys():
-            select_keys.append("student_top_k_log_probs")
 
-        # Include student_top_k_ids if present (for fixing "apples-to-oranges" bug)
-        if "student_top_k_ids" in data.batch.keys():
-            select_keys.append("student_top_k_ids")
+        if self.l_apd_config is None:
+            # Include student_top_k_log_probs if present (for top-k distillation)
+            if "student_top_k_log_probs" in data.batch.keys():
+                select_keys.append("student_top_k_log_probs")
 
-        # Include union_top_k_ids/log_probs for union strategy
-        if "union_top_k_ids" in data.batch.keys():
-            print("Now we are using union strategy, get union_top_k_ids")
-            select_keys.append("union_top_k_ids")
-            # now we don't need to store student_top_k_ids and student_top_k_log_probs for union strategy
-            if "student_top_k_ids" in select_keys:
-                select_keys.remove("student_top_k_ids")
+            # Include student_top_k_ids if present (for fixing "apples-to-oranges" bug)
+            if "student_top_k_ids" in data.batch.keys():
+                select_keys.append("student_top_k_ids")
 
-        if "union_top_k_log_probs" in data.batch.keys():
-            print("Now we are using union strategy, get union_top_k_log_probs")
-            select_keys.append("union_top_k_log_probs")
-            # now we don't need to store student_top_k_log_probs for union strategy
-            if "student_top_k_log_probs" in select_keys:
-                select_keys.remove("student_top_k_log_probs")   
+            # Include union_top_k_ids/log_probs for union strategy
+            if "union_top_k_ids" in data.batch.keys():
+                print("Now we are using union strategy, get union_top_k_ids")
+                select_keys.append("union_top_k_ids")
+                # now we don't need to store student_top_k_ids and student_top_k_log_probs for union strategy
+                if "student_top_k_ids" in select_keys:
+                    select_keys.remove("student_top_k_ids")
+
+            if "union_top_k_log_probs" in data.batch.keys():
+                print("Now we are using union strategy, get union_top_k_log_probs")
+                select_keys.append("union_top_k_log_probs")
+                # now we don't need to store student_top_k_log_probs for union strategy
+                if "student_top_k_log_probs" in select_keys:
+                    select_keys.remove("student_top_k_log_probs")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -823,7 +894,7 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
+                    advantages = model_inputs.get("advantages", None)
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -838,85 +909,94 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     
-                    # Check if we have 3D advantages (top-k sampling case)
-                    # If so, we need to recompute top-k log probs for correct gradient
-                    if advantages.dim() == 3:
-                        top_k = advantages.shape[-1]
-                        # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
-                        student_top_k_ids = None
-                        if "union_top_k_ids" in model_inputs:
-                            student_top_k_ids = model_inputs["union_top_k_ids"]
-                        elif "student_top_k_ids" in model_inputs:
-                            student_top_k_ids = model_inputs["student_top_k_ids"]
-
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                            top_k=top_k, student_top_k_ids=student_top_k_ids
+                    if self.l_apd_config is not None:
+                        entropy, log_prob, pg_loss, pg_metrics = self._compute_l_apd_loss(
+                            model_inputs=model_inputs,
+                            response_mask=response_mask,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            loss_agg_mode=loss_agg_mode,
                         )
-                        log_prob_for_loss = topk_log_probs
-                        
+                        micro_batch_metrics.update(pg_metrics)
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                        )
-                        log_prob_for_loss = log_prob
+                        # Check if we have 3D advantages (top-k sampling case)
+                        # If so, we need to recompute top-k log probs for correct gradient
+                        if advantages.dim() == 3:
+                            top_k = advantages.shape[-1]
+                            # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
+                            student_top_k_ids = None
+                            if "union_top_k_ids" in model_inputs:
+                                student_top_k_ids = model_inputs["union_top_k_ids"]
+                            elif "student_top_k_ids" in model_inputs:
+                                student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                    format_mask = None
-                    if "format_mask" in model_inputs.keys():
-                        format_mask = model_inputs["format_mask"]
-            
+                            entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                                top_k=top_k, student_top_k_ids=student_top_k_ids
+                            )
+                            log_prob_for_loss = topk_log_probs
 
-                    # for fully_async_policy recipe
-                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                        old_log_prob = model_inputs["old_log_probs"]
-                    else:
-                        if on_policy:
-                            print("on_policy")
-                            # For on-policy (ppo_epochs=1), use current policy as "old"
-                            # log_prob_for_loss is already 3D for top-k case
-                            old_log_prob = log_prob_for_loss.detach()
                         else:
-                            print("off_policy")
-                            # For off-policy, use stored log probs
-                            # For 3D top-k case, use stored log probs (union or student)
-                            if advantages.dim() == 3:
-                                if "union_top_k_log_probs" in model_inputs:
-                                    old_log_prob = model_inputs["union_top_k_log_probs"]
-                                elif "student_top_k_log_probs" in model_inputs:
-                                    old_log_prob = model_inputs["student_top_k_log_probs"]
+                            _, log_prob, *_ = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                            )
+                            log_prob_for_loss = log_prob
+
+                        format_mask = None
+                        if "format_mask" in model_inputs.keys():
+                            format_mask = model_inputs["format_mask"]
+
+                        # for fully_async_policy recipe
+                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
+                            old_log_prob = model_inputs["old_log_probs"]
+                        else:
+                            if on_policy:
+                                print("on_policy")
+                                # For on-policy (ppo_epochs=1), use current policy as "old"
+                                # log_prob_for_loss is already 3D for top-k case
+                                old_log_prob = log_prob_for_loss.detach()
+                            else:
+                                print("off_policy")
+                                # For off-policy, use stored log probs
+                                # For 3D top-k case, use stored log probs (union or student)
+                                if advantages.dim() == 3:
+                                    if "union_top_k_log_probs" in model_inputs:
+                                        old_log_prob = model_inputs["union_top_k_log_probs"]
+                                    elif "student_top_k_log_probs" in model_inputs:
+                                        old_log_prob = model_inputs["student_top_k_log_probs"]
+                                    else:
+                                        old_log_prob = model_inputs["old_log_probs"]
                                 else:
                                     old_log_prob = model_inputs["old_log_probs"]
-                            else:
-                                old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
-                    # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                        # Extract pre-computed rollout correction weights if present
+                        # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-                    # are computed centrally in ray_trainer.py for consistency and efficiency.
-                    # This ensures metrics are computed uniformly across all batches at the trainer level
-                    # and avoids redundant computation across workers and micro-batches.
+                        # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                        # are computed centrally in ray_trainer.py for consistency and efficiency.
+                        # This ensures metrics are computed uniformly across all batches at the trainer level
+                        # and avoids redundant computation across workers and micro-batches.
 
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                        format_mask=format_mask,
-                    )
-                    micro_batch_metrics.update(pg_metrics)
+                        # Compute policy loss (any function is expected to return 2 values)
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
+                        )
+                        micro_batch_metrics.update(pg_metrics)
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
