@@ -24,11 +24,13 @@ export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parque
 # Competitor tokens. The OPD baseline scores the student top-k, so L-APD ranks
 # against the same set to keep the two runs comparable.
 export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-student}"
+export L_APD_USE_AS_AUXILIARY="${L_APD_USE_AS_AUXILIARY:-False}"
+export L_APD_LOSS_COEF="${L_APD_LOSS_COEF:-1.0}"
 # Off to match the baseline, which renormalizes strictly inside the top-k and
 # carries no aggregate tail term.
 export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-False}"
 # Aggregated "everything except the anchor" candidate, i.e. the anchor term
-# KL_B(q(y_t) || p(y_t)) weighted by q(y_t). Required with the tail candidate off,
+# KL_B(p(y_t) || q(y_t)) weighted by q(y_t). Required with the tail candidate off,
 # and it makes the weights normalize over the same 16 ids the baseline uses.
 export L_APD_COMPLEMENT_CANDIDATE="${L_APD_COMPLEMENT_CANDIDATE:-True}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
@@ -43,8 +45,10 @@ export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
 # actor/entropy from 0.66 to 0.04 while actor/l_apd_anchor_kl grew tenfold.
 export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-reverse_kl}"
 
-run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}" \
+run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}-aux_${L_APD_USE_AS_AUXILIARY}-coef_${L_APD_LOSS_COEF}" \
     "actor_rollout_ref.actor.l_apd.enable=True" \
+    "actor_rollout_ref.actor.l_apd.use_as_auxiliary=${L_APD_USE_AS_AUXILIARY}" \
+    "actor_rollout_ref.actor.l_apd.loss_coef=${L_APD_LOSS_COEF}" \
     "actor_rollout_ref.actor.l_apd.candidate_source=${L_APD_CANDIDATE_SOURCE}" \
     "actor_rollout_ref.actor.l_apd.tail_candidate=${L_APD_TAIL_CANDIDATE}" \
     "actor_rollout_ref.actor.l_apd.complement_candidate=${L_APD_COMPLEMENT_CANDIDATE}" \

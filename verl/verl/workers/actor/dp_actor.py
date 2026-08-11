@@ -70,15 +70,33 @@ class DataParallelPPOActor(BasePPOActor):
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_fused_kernels={self.use_fused_kernels}")
 
-        # L-APD replaces the policy-gradient surrogate by a teacher-anchored
-        # pairwise distillation loss, so it only applies to the trainable actor.
+        # L-APD either replaces the policy-gradient surrogate or augments it as
+        # an auxiliary loss, so it only applies to the trainable actor.
         self.l_apd_config = None
+        self.l_apd_use_as_auxiliary = False
+        self.l_apd_loss_coef = 1.0
         if actor_optimizer is not None:
             l_apd_config = self.config.get("l_apd", None)
             if l_apd_config is not None and l_apd_config.get("enable", False):
                 self.l_apd_config = l_apd_config
+                self.l_apd_use_as_auxiliary = l_apd_config.get("use_as_auxiliary", False)
+                self.l_apd_loss_coef = float(l_apd_config.get("loss_coef", 1.0))
+                if self.l_apd_use_as_auxiliary:
+                    if self.l_apd_loss_coef <= 0:
+                        raise ValueError("l_apd.loss_coef must be positive in auxiliary mode")
+                    if l_apd_config.get("candidate_source", "teacher") != "student":
+                        raise ValueError(
+                            "Auxiliary L-APD currently requires l_apd.candidate_source=student so the OPD and "
+                            "L-APD losses can reuse one actor forward."
+                        )
         if torch.distributed.get_rank() == 0:
-            print(f"{role} l_apd={self.l_apd_config is not None}")
+            if self.l_apd_config is None:
+                l_apd_mode = "disabled"
+            else:
+                l_apd_mode = "auxiliary" if self.l_apd_use_as_auxiliary else "replace"
+            print(
+                f"{role} l_apd={self.l_apd_config is not None} mode={l_apd_mode} coef={self.l_apd_loss_coef}"
+            )
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
@@ -754,12 +772,22 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys, topk_ids_tensor, topk_log_probs_tensor
 
-    def _compute_l_apd_loss(self, model_inputs, response_mask, temperature, calculate_entropy, loss_agg_mode):
+    def _compute_l_apd_loss(
+        self,
+        model_inputs,
+        response_mask,
+        temperature,
+        calculate_entropy,
+        loss_agg_mode,
+        student_anchor_log_probs=None,
+        student_candidate_log_probs=None,
+        entropy=None,
+    ):
         """Compute the L-APD loss for one micro batch.
 
-        The student is forwarded once on its own trajectory: the same pass yields
-        the anchor log-probs of the sampled tokens and the log-probs of the
-        teacher-selected competitors, both differentiable.
+        By default the student is forwarded once on its own trajectory. Auxiliary
+        mode can pass differentiable anchor and candidate log-probs produced by the
+        OPD policy forward so both objectives share that forward.
 
         Returns:
             entropy: ``(bs, response_length)`` or None
@@ -782,13 +810,22 @@ class DataParallelPPOActor(BasePPOActor):
         teacher_anchor_log_probs = model_inputs[teacher_anchor_key]
         responses = model_inputs["responses"]
 
-        entropy, log_prob, _, candidate_log_probs = self._forward_micro_batch(
-            model_inputs,
-            temperature=temperature,
-            calculate_entropy=calculate_entropy,
-            top_k=candidate_ids.shape[-1],
-            student_top_k_ids=candidate_ids,
-        )
+        has_anchor_log_probs = student_anchor_log_probs is not None
+        has_candidate_log_probs = student_candidate_log_probs is not None
+        if has_anchor_log_probs != has_candidate_log_probs:
+            raise ValueError("Precomputed L-APD anchor and candidate log-probs must be provided together")
+
+        if has_anchor_log_probs:
+            log_prob = student_anchor_log_probs
+            candidate_log_probs = student_candidate_log_probs
+        else:
+            entropy, log_prob, _, candidate_log_probs = self._forward_micro_batch(
+                model_inputs,
+                temperature=temperature,
+                calculate_entropy=calculate_entropy,
+                top_k=candidate_ids.shape[-1],
+                student_top_k_ids=candidate_ids,
+            )
 
         token_loss, diagnostics = compute_l_apd_token_loss(
             student_anchor_log_probs=log_prob,
@@ -825,10 +862,10 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
         ]
-        if self.l_apd_config is None:
-            # L-APD is reward-free: it never reads advantages.
+        use_policy_gradient = self.l_apd_config is None or self.l_apd_use_as_auxiliary
+        if use_policy_gradient:
             select_keys.append("advantages")
-        else:
+        if self.l_apd_config is not None:
             select_keys.extend(l_apd_batch_keys(self.l_apd_config.get("candidate_source", "teacher")))
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -840,7 +877,7 @@ class DataParallelPPOActor(BasePPOActor):
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
 
-        if self.l_apd_config is None:
+        if use_policy_gradient:
             # Include student_top_k_log_probs if present (for top-k distillation)
             if "student_top_k_log_probs" in data.batch.keys():
                 select_keys.append("student_top_k_log_probs")
@@ -854,7 +891,11 @@ class DataParallelPPOActor(BasePPOActor):
                 print("Now we are using union strategy, get union_top_k_ids")
                 select_keys.append("union_top_k_ids")
                 # now we don't need to store student_top_k_ids and student_top_k_log_probs for union strategy
-                if "student_top_k_ids" in select_keys:
+                l_apd_needs_student_ids = (
+                    self.l_apd_config is not None
+                    and self.l_apd_config.get("candidate_source", "teacher") == "student"
+                )
+                if "student_top_k_ids" in select_keys and not l_apd_needs_student_ids:
                     select_keys.remove("student_top_k_ids")
 
             if "union_top_k_log_probs" in data.batch.keys():
@@ -863,6 +904,10 @@ class DataParallelPPOActor(BasePPOActor):
                 # now we don't need to store student_top_k_log_probs for union strategy
                 if "student_top_k_log_probs" in select_keys:
                     select_keys.remove("student_top_k_log_probs")
+
+        # Some tensors (notably student_top_k_ids) are consumed by both OPD and
+        # auxiliary L-APD. DataProto.select expects each key only once.
+        select_keys = list(dict.fromkeys(select_keys))
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -910,7 +955,10 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     
-                    if self.l_apd_config is not None:
+                    l_apd_replaces_policy_loss = (
+                        self.l_apd_config is not None and not self.l_apd_use_as_auxiliary
+                    )
+                    if l_apd_replaces_policy_loss:
                         entropy, log_prob, pg_loss, pg_metrics = self._compute_l_apd_loss(
                             model_inputs=model_inputs,
                             response_mask=response_mask,
@@ -920,27 +968,64 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batch_metrics.update(pg_metrics)
                     else:
+                        if advantages is None:
+                            raise ValueError("The policy-gradient loss requires advantages")
+
+                        l_apd_candidate_log_probs = None
                         # Check if we have 3D advantages (top-k sampling case)
                         # If so, we need to recompute top-k log probs for correct gradient
                         if advantages.dim() == 3:
                             top_k = advantages.shape[-1]
                             # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
                             student_top_k_ids = None
+                            policy_candidate_key = None
                             if "union_top_k_ids" in model_inputs:
                                 student_top_k_ids = model_inputs["union_top_k_ids"]
+                                policy_candidate_key = "union_top_k_ids"
                             elif "student_top_k_ids" in model_inputs:
                                 student_top_k_ids = model_inputs["student_top_k_ids"]
+                                policy_candidate_key = "student_top_k_ids"
 
-                            entropy, _, _, topk_log_probs = self._forward_micro_batch(
-                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                                top_k=top_k, student_top_k_ids=student_top_k_ids
+                            if self.l_apd_use_as_auxiliary:
+                                l_apd_candidate_key, _, _ = l_apd_batch_keys(
+                                    self.l_apd_config.get("candidate_source", "teacher")
+                                )
+                                if policy_candidate_key != l_apd_candidate_key:
+                                    raise ValueError(
+                                        "Auxiliary L-APD requires the same candidate ids as the OPD policy loss; "
+                                        f"got OPD={policy_candidate_key} and L-APD={l_apd_candidate_key}."
+                                    )
+
+                            entropy, log_prob, _, topk_log_probs = self._forward_micro_batch(
+                                model_inputs,
+                                temperature=temperature,
+                                calculate_entropy=calculate_entropy,
+                                top_k=top_k,
+                                student_top_k_ids=student_top_k_ids,
                             )
                             log_prob_for_loss = topk_log_probs
+                            if self.l_apd_use_as_auxiliary:
+                                l_apd_candidate_log_probs = topk_log_probs
 
                         else:
-                            _, log_prob, *_ = self._forward_micro_batch(
-                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                            )
+                            if self.l_apd_use_as_auxiliary:
+                                l_apd_candidate_key, _, _ = l_apd_batch_keys(
+                                    self.l_apd_config.get("candidate_source", "teacher")
+                                )
+                                l_apd_candidate_ids = model_inputs[l_apd_candidate_key]
+                                entropy, log_prob, _, l_apd_candidate_log_probs = self._forward_micro_batch(
+                                    model_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=calculate_entropy,
+                                    top_k=l_apd_candidate_ids.shape[-1],
+                                    student_top_k_ids=l_apd_candidate_ids,
+                                )
+                            else:
+                                entropy, log_prob, *_ = self._forward_micro_batch(
+                                    model_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=calculate_entropy,
+                                )
                             log_prob_for_loss = log_prob
 
                         format_mask = None
@@ -987,7 +1072,7 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                         # Compute policy loss (any function is expected to return 2 values)
-                        pg_loss, pg_metrics = policy_loss_fn(
+                        opd_pg_loss, pg_metrics = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
                             advantages=advantages,
@@ -998,6 +1083,31 @@ class DataParallelPPOActor(BasePPOActor):
                             format_mask=format_mask,
                         )
                         micro_batch_metrics.update(pg_metrics)
+                        pg_loss = opd_pg_loss
+
+                        if self.l_apd_use_as_auxiliary:
+                            _, _, l_apd_loss, l_apd_metrics = self._compute_l_apd_loss(
+                                model_inputs=model_inputs,
+                                response_mask=response_mask,
+                                temperature=temperature,
+                                calculate_entropy=calculate_entropy,
+                                loss_agg_mode=loss_agg_mode,
+                                student_anchor_log_probs=log_prob,
+                                student_candidate_log_probs=l_apd_candidate_log_probs,
+                                entropy=entropy,
+                            )
+                            pg_loss = opd_pg_loss + self.l_apd_loss_coef * l_apd_loss
+                            micro_batch_metrics.update(l_apd_metrics)
+                            micro_batch_metrics["actor/opd_pg_loss"] = (
+                                opd_pg_loss.detach().item() * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/l_apd_aux_loss"] = (
+                                l_apd_loss.detach().item() * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/l_apd_aux_weighted_loss"] = (
+                                self.l_apd_loss_coef * l_apd_loss.detach().item() * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/l_apd_aux_coef"] = self.l_apd_loss_coef
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -1027,6 +1137,8 @@ class DataParallelPPOActor(BasePPOActor):
                     loss.backward()
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
+                    if self.l_apd_use_as_auxiliary:
+                        micro_batch_metrics["actor/total_loss"] = policy_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

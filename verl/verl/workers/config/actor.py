@@ -32,15 +32,18 @@ __all__ = ["PolicyLossConfig", "LAPDConfig", "ActorConfig", "FSDPActorConfig", "
 class LAPDConfig(BaseConfig):
     """Configuration for L-APD (anchored pairwise distillation).
 
-    When enabled, the actor loss is replaced by the teacher-anchored pairwise
-    distillation objective, which needs no reward, advantage or PPO ratio. It
-    requires a teacher (``reward_model.enable=True``) that shares the student
+    When enabled, the teacher-anchored pairwise distillation objective either
+    replaces the policy-gradient surrogate or augments it as an auxiliary loss.
+    It requires a teacher (``reward_model.enable=True``) that shares the student
     tokenizer, and ``actor_rollout_ref.rollout.log_prob_top_k > 0``.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        enable (bool): Whether to train with the L-APD loss instead of the policy-gradient surrogate.
+        enable (bool): Whether to train with the L-APD loss.
+        use_as_auxiliary (bool): Add L-APD to the normal policy-gradient surrogate instead of replacing it.
+            The single-forward implementation requires student candidates when this is enabled.
+        loss_coef (float): Multiplier for L-APD when it is used as an auxiliary loss.
         candidate_source (str): Where competitor tokens come from. 'teacher' uses the teacher top-k
             (the main method), 'student' uses the student top-k.
         tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
@@ -66,6 +69,8 @@ class LAPDConfig(BaseConfig):
     """
 
     enable: bool = False
+    use_as_auxiliary: bool = False
+    loss_coef: float = 1.0
     candidate_source: str = "teacher"
     tail_candidate: bool = True
     complement_candidate: bool = True
