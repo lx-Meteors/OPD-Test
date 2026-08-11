@@ -63,6 +63,8 @@ actor_rollout_ref:
     l_apd:
       _target_: verl.workers.config.LAPDConfig
       enable: false
+      use_as_auxiliary: false
+      loss_coef: 1.0
       candidate_source: teacher
       tail_candidate: true
       complement_candidate: true
