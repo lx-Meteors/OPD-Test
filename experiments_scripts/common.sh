@@ -69,8 +69,8 @@ cleanup_ray() {
 }
 
 setup_tracking() {
-    export WANDB_API_KEY="${WANDB_API_KEY:-}"
-    export WANDB_MODE="${WANDB_MODE:-offline}"
+    export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+    export WANDB_MODE="${WANDB_MODE:-online}"
     export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/logs/wandb}"
     export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${REPO_ROOT}/.cache/wandb}"
     export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console]}"

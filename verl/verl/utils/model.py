@@ -33,11 +33,17 @@ from transformers import (
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,
     GenerationConfig,
-    MistralForSequenceClassification,
     PretrainedConfig,
     PreTrainedModel,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+# transformers' top-level lazy import of MistralForSequenceClassification can
+# intermittently fail on some 4.5x versions; fall back to the concrete submodule.
+try:
+    from transformers import MistralForSequenceClassification
+except ImportError:
+    from transformers.models.mistral import MistralForSequenceClassification
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
