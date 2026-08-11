@@ -27,17 +27,17 @@ cd /input0/yyy/Prune-OPD
 DRY_RUN=1 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 正式启动（方法本身用 reverse_kl，见下面的提醒）
-L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
+# 正式启动，默认就是方法本身（pair_divergence=reverse_kl）
+MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
-> [!IMPORTANT]
-> **启动脚本当前的 `pair_divergence` 默认值是 `log_ratio`，它不是方法的主目标。**
-> `log_ratio` 是一个刻意保留的消融：它把每对的 KL 砍掉一半，因此不是散度、没有下界，
-> 训练预期会退化（`actor/pg_loss` 一路往负走、`actor/l_apd_student_anchor_prob` 塌向 0）。
-> 详见 [§1.4](#14-log_ratio只保留一项的消融)。方法本身是 §1 那个逆向 KL 目标，跑它请显式传
-> `L_APD_PAIR_DIVERGENCE=reverse_kl`。
+> [!WARNING]
+> **不要用 `L_APD_PAIR_DIVERGENCE=log_ratio` 跑正式实验。** 它是一个刻意保留的消融，
+> 把每对的 KL 砍掉一半，因此不是散度、没有下界，梯度里也没有 teacher。实测它的梯度与
+> `reverse_kl` 的余弦是 **−0.985**（几乎精确反向），一条 138 步的 run 把 `actor/entropy`
+> 从 0.66 打到 0.04、`actor/l_apd_anchor_kl` 反向涨了 10 倍。详见
+> [§1.4](#14-log_ratio只保留一项的消融)。
 
 ## 目录
 
@@ -109,9 +109,21 @@ $$
 | --- | --- | --- |
 | `reverse_kl` | $\mathrm{KL}(\tilde p \Vert \tilde q)$，即上式 | 有下界，$m = m_T$ 处梯度归零。**方法本身** |
 | `forward_kl` | $\mathrm{KL}(\tilde q \Vert \tilde p)$，两个参数对调 | 同一个最优点，只改大误差如何修正（§1.3）。消融 |
-| `log_ratio` | 只保留 $\log\frac{\tilde p(y_t)}{\tilde q(y_t)}$ 一项 | **不是散度**，无下界，梯度里没有 teacher（§1.4）。消融 |
+| `log_ratio` | 只保留 $\log\frac{\tilde p(y_t)}{\tilde q(y_t)}$ 一项 | **不是散度**，无下界，梯度里没有 teacher，实测退化（§1.4）。消融 |
 
-库默认值（`actor.yaml`）是 `reverse_kl`；**启动脚本当前默认 `log_ratio`**，见文首提醒。
+库默认值（`actor.yaml`）和启动脚本默认值都是 `reverse_kl`。
+
+写成对求和的形式，可以看出它和 baseline OPD 的 $\sum_z \hat p(z)\log\frac{p(z)}{q(z)}$ 是同一个模板
+——权重是第一个分布自己在该结果上的概率，每个结果配一个对数比值，没有额外的交叉熵项：
+
+$$
+\mathrm{KL}\bigl(\tilde p_{y_t,o} \Vert \tilde q_{y_t,o}\bigr)
+= \sum_{v \in \{y_t,\,o\}} \tilde p_{y_t,o}(v)\,\log\frac{\tilde p_{y_t,o}(v)}{\tilde q_{y_t,o}(v)}
+$$
+
+区别只在求和跑几项：OPD 的支撑是 top-$k$ 共 $k$ 个结果，L-APD 的一对只有 2 个结果。
+常见的 $a\log\frac{a}{b} + (1-a)\log\frac{1-a}{1-b}$ 只是上式在两点支撑上的展开，那个 $1-a$
+就是对手 $o$ 自己的那份归一化概率 $\tilde p_{y_t,o}(o)$，不是交叉熵的残留。
 
 最后一项的对手 $\perp$ 是**"除 $y_t$ 外的全体 token 打包成一个"**（`complement_candidate`）。
 这一对的两个结果概率之和本来就是 1，限制归一化是恒等的，于是
@@ -283,11 +295,28 @@ $$
 \frac{\partial \tilde L_t}{\partial m} \;=\; \frac{w_t(o)}{Z_t}\,\bigl(1 - \sigma(m)\bigr) \;>\; 0
 $$
 
-恒为正、永不归零，而且式子里根本没有 $m_T$ —— 完全看不到 teacher。目标因此单调、无下界，最小化它就是把 $p_t(y_t)$ 推向 0：
-$m_T$ 只改变 loss 的数值，不改变任何一个梯度分量。teacher 的信息只剩下**权重**和**候选集**两个入口。
-200 词表上从 $p = q$ 出发做 300 步 SGD，loss 跌到 $-405$（仍在跌）、$p(y_t)$ 归零、
-$\mathrm{KL}(p \Vert q)$ 从 0 涨到 0.75；`test_log_ratio_has_no_stationary_point` 锁住了这个行为，
+恒为正、永不归零，而且式子里根本没有 $m_T$ —— 完全看不到 teacher。$m_T$ 只改变 loss 的数值，
+不改变任何一个梯度分量，teacher 的信息只剩下**权重**和**候选集**两个入口。目标因此单调、无下界。
+
+**锚点固定时**，最小化它就是把 $p_t(y_t)$ 推向 0。200 词表上从 $p = q$ 出发做 300 步 SGD，
+loss 跌到 $-405$（仍在跌）、$p(y_t)$ 归零、$\mathrm{KL}(p \Vert q)$ 从 0 涨到 0.75；
+`test_log_ratio_has_no_stationary_point` 锁住了这个行为，
 `test_log_ratio_matches_the_two_part_bare_form` 锁住上式本身。
+
+**但训练是 on-policy 的，锚点每步都从当前策略重采样，实际动力学恰好相反。** 每步压低刚采到的
+token，会让概率质量不断从被采样处逃走、挤进一个越来越窄的集合；一旦集中，采样就总落在那个集合
+里，于是 $p_t(y_t)$ 反而变大。400 词表上从 $p = q$ 出发、每步重采样 256 个锚点做 400 步 SGD：
+
+| | $H(p)$ | $E[p(y_t)]$ | $\mathrm{KL}(p \Vert q)$ | loss |
+| --- | --- | --- | --- | --- |
+| `log_ratio` | 4.755 → **1.030** | 0.034 → **0.486** | 0 → **1.212** | 0 → **+0.32** |
+| `reverse_kl` | 4.755 → 4.755 | 0.036 → 0.036 | 0 → 0 | 0 |
+
+`reverse_kl` 从 $p = q$ 出发是精确不动点，`log_ratio` 则熵塌缩、$\mathrm{KL}$ 反向增大，而且 loss
+**在涨**而不是发散到 $-\infty$。真实训练完全复现了这一点：一条 138 步的 run 里 `actor/entropy`
+0.66 → 0.04、`actor/l_apd_student_anchor_prob` 0.71 → 0.98、`actor/l_apd_anchor_kl` 0.19 → 1.97，
+`response_length/clip_ratio` 涨到 0.73（模型进入重复不终止），5 个 benchmark 的 pass@16 在 step 60
+见顶 0.564 后掉到 0.513。所以排查时该盯的是**熵和 `anchor_kl`**，不是 `actor/pg_loss`。
 
 同一个量当 **reward** 用是成立的，那就是 OPD baseline：`dp_actor.py` 的 `only_stu` 分支算
 `rm_scores = -(S_logp - T_on_S) * w`，在 `no_grad` 下作为 $\nabla \log \pi$ 的系数，本身不被求导，
@@ -389,11 +418,11 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 cd /input0/yyy/Prune-OPD
 conda activate /openbayes/input/input0/miniconda3/envs/g-opd-verl
 
-L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
+MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
-不加 `L_APD_PAIR_DIVERGENCE` 就是脚本当前的默认 `log_ratio`，那是会退化的消融（文首提醒）。
+不传 `L_APD_PAIR_DIVERGENCE` 就是脚本默认的 `reverse_kl`，即 §1 那个方法本身。
 
 脚本会自动 `ray stop --force` → `ray start --head` → 启动训练，退出时清理 ray；
 想复用已有集群就传 `MANAGE_RAY=0`。日志同时打到终端和
@@ -464,17 +493,13 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `False` | 聚合对手取"top-k 之外"，优先级高于补集 |
 | `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `True` | 聚合对手取"`y_t` 的补集"，即目标 token 的 loss，见 §1.2 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
-| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `log_ratio` | 每对用什么散度。`reverse_kl` 是方法本身（§1.3），`forward_kl` 是方向对照，`log_ratio` 是只保留一项的裸对数比值消融、非散度且无下界（§1.4）。库默认是 `reverse_kl`，此处是脚本的默认 |
+| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `reverse_kl` | 每对用什么散度。`reverse_kl` 是方法本身（§1.3），`forward_kl` 是方向对照，`log_ratio` 是只保留一项的裸对数比值消融、非散度且实测退化（§1.4）。库默认与脚本默认一致 |
 
 > 两个聚合对手**至少要开一个**。全关掉时锚点概率不可辨识（§1.2），只用于复现那个退化情形。
 
 消融示例：
 
 ```bash
-# 方法本身：每对用完整的逆向 KL（脚本默认是 log_ratio，所以这一行必须显式加）
-L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
-bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
-
 # KL 方向换成正向：自信站错边的 token 保留满强度梯度，代价是 loss 无界
 L_APD_PAIR_DIVERGENCE=forward_kl MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
@@ -524,15 +549,17 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 
 | 指标 | 含义 |
 | --- | --- |
-| `actor/pg_loss` | L-APD 目标值（复用了原字段名）。`log_ratio` 下它无下界，会一路往负走，不能当收敛指标看 |
+| `actor/pg_loss` | L-APD 目标值（复用了原字段名），已乘上 `loss_scale_factor`，所以数值不能直接和 `pair_kl` 对齐。`log_ratio` 下它不是收敛指标——on-policy 时它会**往上涨**而不是往负走（§1.4） |
 | `actor/l_apd_pair_kl` | teacher 加权的成对 KL，含聚合对手那一项，**永远是诚实的 KL**（正向下已扣掉 teacher 熵，`log_ratio` 下另算一份逆向 KL）。逆向下它与 `actor/pg_loss` 相等；其余两种方向下它是唯一有界、$p = q$ 时归零的收敛指标 |
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 $\lvert \tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t) \rvert$，两侧成对概率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 $q(y_t)$ / $p(y_t)$，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
 | `actor/l_apd_anchor_kl` | 锚点项的 KL（方向随 `pair_divergence`），$p(y_t) = q(y_t)$ 时恰好为 0；仅 `complement_candidate` 生效时记录 |
 | `actor/l_apd_anchor_weight` | 补集对手拿到的权重 $a_t = q(y_t)/Z_t$（见 §1）；仅 `complement_candidate` 生效时记录 |
+| `actor/l_apd_anchor_saturated` | $p(y_t) > 1 - 10^{-6}$ 的位置占比，即 float32 已无法分辨 $1 - p(y_t)$、补集 margin 被封顶的那部分。梯度仍然照常回传（§9），这个指标只是让被封顶的规模可见；持续偏大说明 student 在大量位置上已经接近确定性 |
 | `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
+| `actor/l_apd_tail_saturated` | 同上，但针对 tail 对手：候选集已覆盖到 float32 分辨极限的位置占比，仅 `tail_candidate=True` 时记录 |
 | `actor/l_apd_anchor_in_candidates` | 锚点落在候选 top-k 内的比例 |
 | `actor/l_apd_candidate_count` | 参与 loss 的候选数 |
 | `actor/l_apd_candidate_weight_sum` | 候选权重和，`normalize_weights=True` 且有聚合对手时应恒等于 1 |
@@ -558,6 +585,11 @@ $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐�
 `log_ratio` 逐元素等于 §1.4 那个两段式，且它在 $p = q$ 处仍有非零梯度、50 步 SGD 就把 loss
 推到 $-10$ 以下并把 $p(y_t)$ 压到 $e^{-10}$ 以下（锁住"它不是散度"这个性质）。
 
+另有三个针对补集列数值饱和区的回归测试（对应 §9 那条）：`test_overconfident_anchor_keeps_its_gradient`
+锁住"跨过 $p(y_t) = 1 - 10^{-6}$ 时梯度不出现断崖"——修复前它会在一步之内掉 6 个数量级；
+`test_saturated_anchor_is_free_of_nan` 锁住 $p(y_t) = 1$ 时 loss 与梯度仍然有限；
+`test_anchor_saturated_reports_the_capped_share` 锁住 `anchor_saturated` 诊断的取值。
+
 ## 9. 注意事项
 
 - **必须共享词表**。teacher 与 student 的 tokenizer / vocabulary 必须一致，否则单 token
@@ -575,6 +607,13 @@ $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐�
   总质量小于 `1e-6`，下限生效、权重被压到 0、梯度丢失（实测 `candidate_weight_sum ≈ 0.94`，
   约 6% 的 token）。默认配置不受影响：补集对手让分母至少为 $q(y_t)$，tail 对手则由
   `_log1mexp` 的 clamp 兜了一个 `~1e-6` 的地板。
+- **补集 margin 在 $p(y_t) \to 1$ 处被封顶，但梯度照常回传**。`_log1mexp` 必须把输入截在
+  $-10^{-6}$ 才能让 $\log(1 - e^x)$ 在 $x = 0$ 处有限，而 float32 的 log-prob 本来也只能分辨到
+  这个量级。关键是这个截断对 autograd **透明**（straight-through）：如果让它挡住梯度，补集列会
+  在 student 最过度自信的位置——正是 on-policy 蒸馏存在的理由——被静默清零，而且是断崖式的
+  （实测跨过阈值一步之内掉 6 个数量级）。放行是安全的，因为成对的 $r(1-r)$ 因子恰好抵消
+  $1/(1-p)$ 的爆炸，合成梯度是 $w(\perp)\,p(y_t)\,(m - m_T)$，只按 $\log\frac{1}{1-p(y_t)}$ 增长；
+  封顶后它停在一个有限值而不是跌到 0。被封顶的位置占比看 `actor/l_apd_anchor_saturated`。
 - **不要打开 `TORCH_NCCL_BLOCKING_WAIT`**。它和 vLLM 的 CUDA graph capture 会死锁：8 个 rank
   全堵在 torch 的 `ProcessGroupNCCL::waitForPendingWorks()` 里，而那个等待循环没有超时，
   表现是显存占满、GPU 利用率 0%、日志停在

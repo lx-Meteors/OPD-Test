@@ -61,7 +61,8 @@ class LAPDConfig(BaseConfig):
             first order around it. 'log_ratio' keeps only the ``v = y_t`` outcome of the reverse
             sum, ``log[p~(y_t) / q~(y_t)]``, which is not a divergence: its margin gradient
             ``1 - p~(y_t)`` never vanishes and never sees the teacher, so the objective is
-            unbounded below. Ablation only.
+            unbounded below. Ablation only, and it does degenerate in practice: on-policy it
+            collapses the entropy and grows the very KL it is meant to shrink.
     """
 
     enable: bool = False
