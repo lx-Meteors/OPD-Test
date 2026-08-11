@@ -44,13 +44,15 @@ class LAPDConfig(BaseConfig):
         candidate_source (str): Where competitor tokens come from. 'teacher' uses the teacher top-k
             (the main method), 'student' uses the student top-k.
         tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
-            candidate set, so the opponents form a genuine partition of the non-anchor vocabulary.
+            candidate set, so the opponents form a genuine partition of the non-anchor vocabulary
+            and every non-anchor token takes part in exactly one pair. The default.
         complement_candidate (bool): Add one aggregated candidate standing for everything except the
             anchor, which is the anchor term -- the KL between ``(p(y_t), 1 - p(y_t))`` and
             ``(q(y_t), 1 - q(y_t))`` -- in pairwise form, weighted by ``q(y_t)`` like any other
-            candidate. Ignored when ``tail_candidate`` is set. One of the two
-            is required: token candidates alone only constrain logit differences and leave the mass
-            split between the top-k set and the truncated tail unidentified.
+            candidate. Ablation only: the complement counts the named candidates a second time and
+            takes ``q(y_t) / Z`` (~0.68 measured) of the weight. Ignored when ``tail_candidate`` is
+            set. One of the two is required: token candidates alone only constrain logit differences
+            and leave the mass split between the top-k set and the truncated tail unidentified.
         normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
             by ``1 - q(y_t)``.
         pair_divergence (str): Direction of the per-pair KL, taken between the two sides restricted to
@@ -68,7 +70,7 @@ class LAPDConfig(BaseConfig):
     enable: bool = False
     candidate_source: str = "teacher"
     tail_candidate: bool = True
-    complement_candidate: bool = True
+    complement_candidate: bool = False
     normalize_weights: bool = True
     pair_divergence: str = "reverse_kl"
 

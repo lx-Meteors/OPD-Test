@@ -52,27 +52,44 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | [§7 训练日志里的指标](#7-训练日志里的-l-apd-指标) | 每个 `actor/l_apd_*` 字段的含义 |
 | [§8 单元测试](#8-单元测试) | 怎么跑、覆盖了什么 |
 | [§9 注意事项](#9-注意事项) | 共享词表、NCCL 死锁、恢复训练等坑 |
+| [§10 更新记录](#10-更新记录) | 方法与默认配置的演进史 |
 
 ## 1. 目标函数
 
 记 $p_t$、$q_t$ 为 student / teacher 在位置 $t$ 的分布，$S$、$T$ 为对应的 logit，$\sigma$ 为
 sigmoid。
 
-每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$，其余候选是
+每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$。具名候选取 **teacher top-$K$**
+（剔除 $y_t$ 自己），没被具名的其余全部 token 打包成一个**尾部块** $\tau_t$：
 
 $$
-\mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{student top-}K \;:\; z \neq y_t \,\bigr\rbrace,
+\mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{teacher top-}K \;:\; z \neq y_t \,\bigr\rbrace,
+\qquad
+\tau_t \;=\; \mathcal{V} \setminus \bigl(\lbrace y_t\rbrace \cup \mathcal{V}_t\bigr),
 \qquad K = 16.
 $$
 
-锚点 $y_t$ 自己通常也落在 top-$K$ 里，会被剔除，所以候选数一般是 $\lvert \mathcal{V}_t \rvert = 15$
-（诊断 `actor/l_apd_candidate_count` 实测 15.03）。
-
-**权重是 teacher 概率在这 $K$ 个 token（含目标 token $y_t$）上一起归一化**得到的：
+锚点 $y_t$ 通常也落在 top-$K$ 里，会被剔除，所以具名候选数一般是 $\lvert \mathcal{V}_t \rvert = 15$
+（诊断 `actor/l_apd_candidate_count` 实测 15.0）。对手集合是**具名候选加尾部块**：
 
 $$
-Z_t \;=\; \sum_{v \in \text{top-}K} q_t(v) \;=\; q_t(y_t) + \sum_{z \in \mathcal{V}_t} q_t(z).
+\mathcal{O}_t \;=\; \mathcal{V}_t \cup \lbrace \tau_t \rbrace .
 $$
+
+它恰好是"除 $y_t$ 外整个词表"的一个**划分**——每个非锚点 token 要么被具名、要么落在尾部块里，
+**恰好出现一次**。
+
+**权重就是 teacher 在真正备选上的条件分布**：对手集合的 teacher 总质量恰好是 $1 - q_t(y_t)$，
+所以按自身和归一化后
+
+$$
+\tilde w_t(o) \;=\; \frac{q_t(o)}{\sum_{o' \in \mathcal{O}_t} q_t(o')} \;=\; \frac{q_t(o)}{1 - q_t(y_t)},
+\qquad
+q_t(\tau_t) = 1 - q_t(y_t) - \sum_{z \in \mathcal{V}_t} q_t(z).
+$$
+
+这可以读成一个对决故事：$y_t \sim p_t$ 是 student 落子，teacher 从**真正的备选**里（$z \neq y_t$，
+跟自己对决学不到东西——这是分母 $1 - q_t(y_t)$ 的来源）提出一个挑战者，loss 是每场对决代价的期望。
 
 一次成对比较只关心"$y_t$ 和 $z$ 谁赢"，所以把两侧分布**限制到 $\lbrace y_t, z\rbrace$ 上再
 归一化**，得到两个二元分布：
@@ -92,18 +109,29 @@ $$
 \log \frac{\tilde p_{y,z}(v)}{\tilde q_{y,z}(v)}.
 $$
 
-损失是这些逆向 KL 的加权和，各自的乘数就是自己那个 token 的归一化 teacher 概率：
+损失是**单独一项**——所有对决的逆向 KL 按挑战者分布加权求和：
 
 $$
 \boxed{\;
-L_t \;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
-\mathrm{KL}\bigl(\tilde p_{y_t,z} \Vert \tilde q_{y_t,z}\bigr)
-\;+\; \frac{q_t(y_t)}{Z_t}\,
-\mathrm{KL}\bigl(\tilde p_{y_t,\perp} \Vert \tilde q_{y_t,\perp}\bigr)
+L_t \;=\; \sum_{o \in \mathcal{O}_t} \tilde w_t(o)\;
+\mathrm{KL}\bigl(\tilde p_{y_t,o} \Vert \tilde q_{y_t,o}\bigr),
+\qquad
+\tilde w_t(o) = \frac{q_t(o)}{1 - q_t(y_t)}
 \;}
 $$
 
-上式是方法本身。每对用什么散度由 `l_apd.pair_divergence` 控制，一共三个取值：
+上式是方法本身。尾部块作为普通对手参与：它那一对的 margin 是
+$\log p_t(y_t) - \log p_t(\tau_t)$，实现里用 `logsumexp` + `log1mexp` 从已有的 top-$k$
+log-prob 直接算出。两个退化性质说明这个形式没有丢东西：
+
+- **$K = 0$ 时**对手只剩 $\tau_t$，此时 $\tilde p_{y_t,\tau_t}(y_t) = p_t(y_t)$，loss 精确退化为
+  目标 token 的校准项 $\mathrm{KL}\bigl((p_t(y_t), 1 - p_t(y_t)) \Vert (q_t(y_t), 1 - q_t(y_t))\bigr)$，
+  系数为 1。所以单项形式是"锚点校准 + 排序"的推广，不是删减。
+- **锚点的绝对质量被自动钉住**：对手集合覆盖除 $y_t$ 外的全部质量，所有对决打平
+  $\iff$ 所有比值 $p(y_t)/p(o)$ 与 teacher 一致 $\iff$ 在划分上 $p = q$，于是
+  $p_t(y_t) = q_t(y_t)$ 是**定理**而不是需要单独加项去逼的约束（见 §1.2）。
+
+每对用什么散度由 `l_apd.pair_divergence` 控制，一共三个取值：
 
 | 取值 | 每对的量 | 性质 |
 | --- | --- | --- |
@@ -125,29 +153,21 @@ $$
 常见的 $a\log\frac{a}{b} + (1-a)\log\frac{1-a}{1-b}$ 只是上式在两点支撑上的展开，那个 $1-a$
 就是对手 $o$ 自己的那份归一化概率 $\tilde p_{y_t,o}(o)$，不是交叉熵的残留。
 
-最后一项的对手 $\perp$ 是**"除 $y_t$ 外的全体 token 打包成一个"**（`complement_candidate`）。
-这一对的两个结果概率之和本来就是 1，限制归一化是恒等的，于是
+尾部块作为对手时形式与其它 $K$ 项完全一致——代码里就是把它作为一列追加进候选张量，归一化、
+散度、诊断全部复用同一套逻辑，**不是一个带系数的附加 loss**，没有自由超参。所有权重加起来
+恰好为 1（诊断 `actor/l_apd_candidate_weight_sum` 就是在查这一点），尾部那一列的权重
+$q_t(\tau_t)/(1 - q_t(y_t))$ 记在 `actor/l_apd_tail_weight`（实测约 $0.02\sim0.14$）。
 
-$$
-\tilde p_{y,\perp} \;=\; \bigl(p_t(y_t),\; 1 - p_t(y_t)\bigr),
-\qquad
-\tilde q_{y,\perp} \;=\; \bigl(q_t(y_t),\; 1 - q_t(y_t)\bigr),
-$$
-
-它就是**目标 token 自己的逆向 KL**。所以这一项和前面 $K-1$ 项形式完全一致，只是对手换成了
-补集；代码里也就是把它作为一列追加进候选张量，归一化、散度、诊断全部复用同一套逻辑，**不是
-一个带系数的附加 loss**，没有自由超参。
-
-所有乘数加起来恰好为 1（诊断 `actor/l_apd_candidate_weight_sum` 就是在查这一点），目标 token
-那一项的乘数记作 $a_t = q_t(y_t)/Z_t$（诊断 `actor/l_apd_anchor_weight`，实测均值约 0.65）。
-统一写成一个加权和：把 $\perp$ 当成额外对手、它的 teacher 质量取 $q_t(y_t)$，则
-
-$$
-L_t \;=\; \sum_{o \in \mathcal{V}_t \cup \lbrace \perp \rbrace} \frac{w_t(o)}{Z_t}\;
-\mathrm{KL}\bigl(\tilde p_{y_t,o} \Vert \tilde q_{y_t,o}\bigr),
-\qquad
-w_t(z) = q_t(z),\quad w_t(\perp) = q_t(y_t).
-$$
+**历史形式（现为消融 `complement_candidate`）。** 早期版本是两项式：具名候选对决加一个
+"补集对手" $\perp$（除 $y_t$ 外的**全体** token 打包，含具名候选自己），后者恰好是目标 token
+的逆向 KL $\mathrm{KL}\bigl((p(y_t), 1-p(y_t)) \Vert (q(y_t), 1-q(y_t))\bigr)$，权重
+$q_t(y_t)/Z_t$，其中 $Z_t = q_t(y_t) + \sum_{z\in\mathcal V_t} q_t(z)$ 是含锚点的归一化子。它的问题是一次精确的**重复计数**：补集里含着全部具名候选，每个候选在 loss 里
+出现两次——一次具名对决、一次藏在补集里——而藏着的那次拿走了约 $0.68$ 的权重，多数位置上
+loss 在给一个大体已满足的校准约束反复付费，排序监督被稀释。单项形式下每个非锚点 token 恰好
+出现一次，这个错误**在公式里写不出来**；而锚点校准并没有丢（见上方 $K = 0$ 退化与 §1.2）。
+真实模型测量：换成单项形式后，聚合列的梯度份额从 0.378 降到 0.024，第 3 名以后候选拿到的梯度
+份额从 0.173 升到 0.213，40 步蒸馏小验证里留出集全词表 KL 与两项式打平、熵更健康
+（0.760 vs 0.746）。
 
 **为什么求和不能省。** $\log p/q$ 只是 KL 的被积项，$\mathrm{KL}$ 是它在 $\tilde p$ 下的期望；
 只留 $\log\frac{\tilde p(y)}{\tilde q(y)}$ 那一项、丢掉 $v = z$ 那一项，得到的东西就不是散度，
@@ -156,7 +176,7 @@ $$
 **reward**（在 `no_grad` 下算，梯度由 policy gradient 从 $\log\pi$ 那边来），不是可微 loss。
 成对比较的结果空间只有两个元素，所以这里的期望求和展开**恰好只有两项**，这就是上式的全部内容。
 
-- 权重 $w_t/Z_t$ 与 teacher 侧的 $\tilde q$ 均为 stop-gradient，只有 student 接收梯度；
+- 权重 $\tilde w_t$ 与 teacher 侧的 $\tilde q$ 均为 stop-gradient，只有 student 接收梯度；
 - 序列级损失是对有效 response token 求平均（`loss_agg_mode`，默认 `token-mean`）。
 
 **实现上的两个要点**：
@@ -170,13 +190,16 @@ $$
    也不需要额外的 teacher forward**。每次更新仍然只有一次 student forward，显存与吞吐和 OPD
    baseline 完全一致。
 
-### 1.1 候选集与归一化范围
+### 1.1 候选来源
 
-为了和 OPD baseline 可比，默认候选取 **student top-$k$**（baseline 的
-`top_k_strategy=only_stu` 打分的就是这一组），权重来源是 teacher 在这些 id 上的概率
-$q(z)$ 而非 baseline 的 student 概率 —— 这是权重 $w_t(z) \propto q_t(z)$ 的定义决定的，改掉
-就不是 L-APD 了。归一化范围是**含锚点的这 16 个 id**（见下），和 baseline 在 $K$ 维上做一次
-softmax 的范围逐一对应。
+默认候选取 **teacher top-$k$**（`candidate_source=teacher`）。用 student 自己的 top-$k$
+（baseline 的 `top_k_strategy=only_stu` 打分的那一组，`candidate_source=student` 可切回做对照）
+有一个结构性盲区：锚点 99.4% 落在 student top-$k$ 内，于是每个对手都是 student 本来就排得
+靠前的 token，loss 只能在 student 已偏好的集合内重排，**永远看不到 teacher 想要、但被 student
+排出 top-$k$ 之外的 token**——一条 run 里 `pairwise_agreement` 从 step 140 起停在 0.95 不再
+上升就是这个原因。teacher top-$k$ 携带着约 1.5% 落在 student top-$k$ 之外的 teacher 质量，
+正是双方仍有分歧的地方。权重来源永远是 teacher 概率 $q(o)$——这是 $\tilde w_t$ 的定义决定的，
+改掉就不是 L-APD 了。
 
 ### 1.2 为什么必须有一个聚合对手
 
@@ -203,36 +226,32 @@ $1.15\%$），top-$k$ 内每个 token 都被统一压低 18%，而 loss 已经�
 $p(y)/p(c) = q(y)/q(c)$ 对每一块 $c$ 成立、两边求和且都归一到 1，立刻得到
 $p(y_t) = q(y_t)$。有两种选法：
 
-| | 聚合对手 $\perp$ | 该项的含义 | 权重（自动定标） |
+| | 聚合对手 | 该项的含义 | 权重（自动定标） |
 | --- | --- | --- | --- |
-| `complement_candidate=True`（默认） | $y_t$ 的补集，即"除 $y_t$ 外的全体" | $\mathrm{KL}(p(y_t) \Vert q(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65$ |
-| `tail_candidate=True` | top-$k$ 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | $q_{\text{tail}}/Z_t$，此时 $Z_t = 1 - q(y_t)$，实测约 $0.10$ |
+| `tail_candidate=True`（**默认，方法本身**） | 尾部块 $\tau_t$：top-$k$ 之外的十几万个 token，用 `logsumexp` + `log1mexp` 打包 | 锚点相对整个尾部应排多高 | $q(\tau_t)/(1 - q(y_t))$，实测约 $0.02\sim0.14$ |
+| `complement_candidate=True`（消融） | $y_t$ 的补集 $\perp$，即"除 $y_t$ 外的全体"，**含具名候选自己** | $\mathrm{KL}(p(y_t) \Vert q(y_t))$，即目标 token 的 loss | $a_t = q(y_t)/Z_t$，实测约 $0.65\sim0.68$ |
 
 两者都是**同一个成对构造**在一个聚合对手上的特例，权重都由 teacher 质量自动决定，
-所以都没有自由系数。`tail_candidate` 优先级更高；它开启时对手集合
-$\lbrace z_1, \dots, z_k, \text{tail} \rbrace$ 构成"非 $y_t$"的真正**划分**，补集对手则与 $z_j$ 有重叠，
-是一个让总权重恰好为 1 的启发式。
+所以都没有自由系数。区别在对手集合的结构：尾部块让对手集合
+$\lbrace z_1, \dots, z_k, \tau_t \rbrace$ 构成"非 $y_t$"的真正**划分**，每个非锚点 token 恰好
+出现一次；补集则与具名候选 $z_j$ **重叠**——候选们在 loss 里被数了两次，且藏在补集里的那次
+拿走约 0.68 的权重。
 
-默认选补集，理由有三条：
+选划分（tail）而不选补集，就是 §1 讲过的重复计数问题的解。补集形式曾是默认，它当时的三条
+理由现在都有了更好的答案：
 
-1. **归一化范围与 baseline 对齐**。此时
-   $Z_t = q(y_t) + \sum_{z \in \mathcal{V}_t} q(z)$ 是 teacher 在
-   $\lbrace y_t \rbrace \cup \text{top-}16$ 上的总质量，**含锚点**，所以权重是在 baseline 用的那 16 个 id
-   上归一化的；`tail_candidate` 会引入 baseline 没有的第 17 个虚拟对手。展开就是 §1 那个凸
-   组合，每个 token 的总权重恒为 1。
-2. **顺带修掉了权重归一化的 eps 下限问题**。归一化分母现在至少是 $q(y_t)$，不会塌陷。
-   此前 teacher 在采样 token 上几乎确定（$q(y_t) > 1 - 10^{-6}$）的位置会撞上 $10^{-6}$ 下限、
-   权重被压到 0、梯度丢失，实测 `candidate_weight_sum` $\approx 0.94$，约 6% 的 token 受影响。
-   现在这些位置 $a_t \to 1$，锚点项接管全部权重。
-3. **目标在两种模式间自动切换**。$q(y_t) \to 0$（teacher 认为采样 token 很差）时
-   $a_t \to 0$，几乎全是排序信号；$q(y_t) \to 1$ 时 $a_t \to 1$，竞争者概率都趋于 0、本来
-   无序可排，信号转为锚点水平。
+1. *"归一化范围与 baseline 的 16 个 id 对齐"*——对齐的代价是重复计数；单项形式的归一化分母
+   $1 - q(y_t)$ 是"挑战者必须是真备选"这个定义自动给出的，不是设计选择。
+2. *"补集修掉了权重归一化的 eps 下限"*——尾部块同样修掉：`_log1mexp` 给分母兜了 $\sim 10^{-6}$
+   的地板，且梯度直通（§9）。
+3. *"目标在排序/校准两种模式间自动切换"*——单项形式同样自动切换且不付重复计数的代价：
+   $q(y_t) \to 1$ 时具名候选权重趋 0、尾部对决（此时就是锚点校准，见 $K=0$ 退化）接管；
+   $q(y_t) \to 0$ 时几乎全是排序信号。
 
-已知代价：$a_t$ 均值约 $0.65$，意味着**多数 token 上锚点项占主导**，排序监督相应被稀释。
-一个两位置的数值实验里，$q(y)=0.95$ 那个位置的 $p_{\text{tail}}$ 收到
-$8.67\times10^{-3}$（真值 $2.37\times10^{-3}$，偏高 3.7 倍），因为成对项只剩 $0.05$ 的权重、
-竞争者之间的相对水平收敛很慢；$p(y_t)$ 本身是准的。这是收敛速度而非渐近性质的问题，
-但 203 步训练里速度就是结果，所以 `tail_candidate=True` 值得作为对照跑一次。
+真实模型上换成划分后：聚合列梯度份额 0.378 → 0.024，第 3 名以后候选的梯度份额
+0.173 → 0.213，grad_norm 0.95x（无需任何补偿系数），40 步蒸馏小验证里留出集全词表 KL 与
+补集形式打平、熵更健康。约 29% 的位置候选集覆盖质量撞 float32 分辨极限
+（`actor/l_apd_tail_saturated`），直通估计保证这些位置梯度照常回传、无 NaN（§9）。
 
 顺带一提，框架里没有其它项在约束这个方向：`USE_KL` 默认 `False`，而且 ref-KL 那段代码在
 `update_policy` 的非 L-APD 分支里；`entropy_coeff` 也是 0。
@@ -246,14 +265,14 @@ $8.67\times10^{-3}$（真值 $2.37\times10^{-3}$，偏高 3.7 倍），因为成
 
 $$
 \frac{\partial L_t}{\partial m}
-\;=\; \frac{w_t(o)}{Z_t}\,\sigma'(m)\,\bigl(m - m_T\bigr)
+\;=\; \tilde w_t(o)\,\sigma'(m)\,\bigl(m - m_T\bigr)
 $$
 
 正向（`forward_kl`）：
 
 $$
 \frac{\partial L_t}{\partial m}
-\;=\; \frac{w_t(o)}{Z_t}\,\bigl(\tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t)\bigr)
+\;=\; \tilde w_t(o)\,\bigl(\tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t)\bigr)
 $$
 
 逆向就是**直接对齐 margin**：梯度正比于 $m$ 与 $m_T$ 之差，由 $\sigma'(m)$ 门控。两者都在
@@ -267,10 +286,11 @@ $\sigma'(m_T)\delta$，相对差 $10^{-3}$），所以这个选择**只影响大
 | 30 | **4.018** | 29.37 | **3.2e-12** | 0.982 |
 
 逆向 loss 封顶在 $-\log \tilde q_{y_t,o}(y_t)$，自信站错边的代价有界、梯度按 $\sigma'(m)$ 指数衰减；正向无界，
-梯度饱和到 $\pm 1$ 但不消失。这也是唯一需要注意的取舍：代入 $o = \perp$ 时正向的锚点梯度是
-$a_t\bigl(p_t(y_t) - q_t(y_t)\bigr)$，逆向多了一个 $p_t(y_t)\bigl(1 - p_t(y_t)\bigr)$ 因子，
-在 $p_t(y_t) \to 1$ 时消失 —— 即逆向下 §1.2 的可辨识性在理论上仍成立（最优点唯一），但对
-**已经过度自信**的锚点没有拉回力。`L_APD_PAIR_DIVERGENCE=forward_kl` 可以切回正向做对照。
+梯度饱和到 $\pm 1$ 但不消失。这也是唯一需要注意的取舍：$\sigma'(m)$ 因子意味着已分出胜负的
+对决（不管方向对错）梯度都很小——这是成对 Bernoulli 几何的内在性质，对**已经过度自信**的
+锚点（$p_t(y_t) \to 1$ 时尾部对决的 margin 很大）没有拉回力，虽然 §1.2 的可辨识性在理论上
+仍成立（最优点唯一）。若训练中低概率候选出现梯度饥饿，`L_APD_PAIR_DIVERGENCE=forward_kl`
+是同一形式下的现成退路（还是 Bernoulli KL，不引入新参数）。
 `test_reverse_kl_is_bounded_where_forward_diverges` 锁住了上表的定性行为。
 
 ### 1.4 `log_ratio`：只保留一项的消融
@@ -280,19 +300,18 @@ $a_t\bigl(p_t(y_t) - q_t(y_t)\bigr)$，逆向多了一个 $p_t(y_t)\bigl(1 - p_t
 
 $$
 \tilde L_t
-\;=\; \sum_{z \in \mathcal{V}_t} \frac{q_t(z)}{Z_t}\,
-\log \frac{r_S(y_t,z)}{r_T(y_t,z)}
-\;+\; \frac{q_t(y_t)}{Z_t}\,
-\log \frac{p_t(y_t)}{q_t(y_t)},
-\qquad r_S = \tilde p_{y_t,z}(y_t),\; r_T = \tilde q_{y_t,z}(y_t)
+\;=\; \sum_{o \in \mathcal{O}_t} \tilde w_t(o)\,
+\log \frac{r_S(y_t,o)}{r_T(y_t,o)},
+\qquad r_S = \tilde p_{y_t,o}(y_t),\; r_T = \tilde q_{y_t,o}(y_t)
 $$
 
-补集对手那一列会自动退化成锚点的裸对数比值，因为它的 margin 让两个受限概率恰好是
-$p_t(y_t)$ 和 $q_t(y_t)$。**这不是散度**，只能作为消融跑：teacher 侧是 stop-gradient 的加性常数，
-所以它对每个成对 margin 的梯度是
+（历史上出问题的那条 run 用的是补集消融的两项式写法，补集那一列自动退化成锚点的裸对数比值
+$\log\frac{p_t(y_t)}{q_t(y_t)}$，因为它的 margin 让两个受限概率恰好是 $p_t(y_t)$ 和 $q_t(y_t)$。）
+**这不是散度**，只能作为消融跑：teacher 侧是 stop-gradient 的加性常数，所以它对每个成对
+margin 的梯度是
 
 $$
-\frac{\partial \tilde L_t}{\partial m} \;=\; \frac{w_t(o)}{Z_t}\,\bigl(1 - \sigma(m)\bigr) \;>\; 0
+\frac{\partial \tilde L_t}{\partial m} \;=\; \tilde w_t(o)\,\bigl(1 - \sigma(m)\bigr) \;>\; 0
 $$
 
 恒为正、永不归零，而且式子里根本没有 $m_T$ —— 完全看不到 teacher。$m_T$ 只改变 loss 的数值，
@@ -489,10 +508,10 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | 环境变量 | Hydra key | 默认 | 含义 |
 | --- | --- | --- | --- |
 | — | `actor_rollout_ref.actor.l_apd.enable` | 脚本内置 `True` | 用 L-APD 替换 policy-gradient 目标 |
-| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `student` | 候选来源：student top-k（与 baseline 对齐）或 teacher top-k |
-| `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `False` | 聚合对手取"top-k 之外"，优先级高于补集 |
-| `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `True` | 聚合对手取"`y_t` 的补集"，即目标 token 的 loss，见 §1.2 |
-| `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化，而不是除以 `1 − q(y_t)` |
+| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `teacher` | 候选来源：teacher top-k（方法本身，§1.1）或 student top-k（对照） |
+| `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `True` | 聚合对手取尾部块"top-k 之外"，对手集合成为真划分（方法本身，§1.2），优先级高于补集 |
+| `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `False` | 聚合对手取"`y_t` 的补集"（历史两项式，重复计数，消融），见 §1.2 |
+| `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化；tail 模式下与除以 `1 − q(y_t)` 浮点等价 |
 | `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `reverse_kl` | 每对用什么散度。`reverse_kl` 是方法本身（§1.3），`forward_kl` 是方向对照，`log_ratio` 是只保留一项的裸对数比值消融、非散度且实测退化（§1.4）。库默认与脚本默认一致 |
 
 > 两个聚合对手**至少要开一个**。全关掉时锚点概率不可辨识（§1.2），只用于复现那个退化情形。
@@ -504,12 +523,12 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 L_APD_PAIR_DIVERGENCE=forward_kl MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 聚合对手换成 tail：对手集合成为"非 y_t"的真正划分，锚点项不再需要
-L_APD_TAIL_CANDIDATE=True MODEL_ROOT=/input0/models \
+# 历史两项式：聚合对手换回补集（重复计数，锚点列吃 ~0.68 权重）
+L_APD_TAIL_CANDIDATE=False L_APD_COMPLEMENT_CANDIDATE=True MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 候选改用 teacher top-16
-L_APD_CANDIDATE_SOURCE=teacher MODEL_ROOT=/input0/models \
+# 候选改用 student top-16（锚点 99.4% 在内，看不到被 student 丢掉的 token）
+L_APD_CANDIDATE_SOURCE=student MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
 # 退化对照：只有真实 token 对手，锚点概率不可辨识
@@ -554,12 +573,12 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 $\lvert \tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t) \rvert$，两侧成对概率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 $q(y_t)$ / $p(y_t)$，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
-| `actor/l_apd_anchor_kl` | 锚点项的 KL（方向随 `pair_divergence`），$p(y_t) = q(y_t)$ 时恰好为 0；仅 `complement_candidate` 生效时记录 |
-| `actor/l_apd_anchor_weight` | 补集对手拿到的权重 $a_t = q(y_t)/Z_t$（见 §1）；仅 `complement_candidate` 生效时记录 |
-| `actor/l_apd_anchor_saturated` | $p(y_t) > 1 - 10^{-6}$ 的位置占比，即 float32 已无法分辨 $1 - p(y_t)$、补集 margin 被封顶的那部分。梯度仍然照常回传（§9），这个指标只是让被封顶的规模可见；持续偏大说明 student 在大量位置上已经接近确定性 |
-| `actor/l_apd_tail_weight` | tail 候选拿到的权重，仅 `tail_candidate=True` 时记录 |
-| `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量，仅 `tail_candidate=True` 时记录 |
-| `actor/l_apd_tail_saturated` | 同上，但针对 tail 对手：候选集已覆盖到 float32 分辨极限的位置占比，仅 `tail_candidate=True` 时记录 |
+| `actor/l_apd_tail_weight` | 尾部块拿到的权重 $q(\tau_t)/(1-q(y_t))$（默认配置下记录，实测约 $0.02\sim0.14$） |
+| `actor/l_apd_teacher_tail_prob` / `..._student_tail_prob` | 候选集之外的尾部质量（默认配置下记录） |
+| `actor/l_apd_tail_saturated` | 候选集覆盖质量已到 float32 分辨极限、尾部 margin 被封顶的位置占比（实测约 0.29）。梯度仍照常回传（§9），这个指标只是让被封顶的规模可见 |
+| `actor/l_apd_anchor_kl` | 锚点项的 KL（方向随 `pair_divergence`），$p(y_t) = q(y_t)$ 时恰好为 0；仅补集消融（`complement_candidate` 生效）时记录 |
+| `actor/l_apd_anchor_weight` | 补集对手拿到的权重 $a_t = q(y_t)/Z_t$；仅补集消融时记录 |
+| `actor/l_apd_anchor_saturated` | $p(y_t) > 1 - 10^{-6}$ 的位置占比，即 float32 已无法分辨 $1 - p(y_t)$、补集 margin 被封顶的那部分；仅补集消融时记录 |
 | `actor/l_apd_anchor_in_candidates` | 锚点落在候选 top-k 内的比例 |
 | `actor/l_apd_candidate_count` | 参与 loss 的候选数 |
 | `actor/l_apd_candidate_weight_sum` | 候选权重和，`normalize_weights=True` 且有聚合对手时应恒等于 1 |
@@ -607,13 +626,14 @@ $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐�
   总质量小于 `1e-6`，下限生效、权重被压到 0、梯度丢失（实测 `candidate_weight_sum ≈ 0.94`，
   约 6% 的 token）。默认配置不受影响：补集对手让分母至少为 $q(y_t)$，tail 对手则由
   `_log1mexp` 的 clamp 兜了一个 `~1e-6` 的地板。
-- **补集 margin 在 $p(y_t) \to 1$ 处被封顶，但梯度照常回传**。`_log1mexp` 必须把输入截在
+- **聚合对手的 margin 在覆盖质量趋 1 处被封顶，但梯度照常回传**。`_log1mexp` 必须把输入截在
   $-10^{-6}$ 才能让 $\log(1 - e^x)$ 在 $x = 0$ 处有限，而 float32 的 log-prob 本来也只能分辨到
-  这个量级。关键是这个截断对 autograd **透明**（straight-through）：如果让它挡住梯度，补集列会
+  这个量级。默认配置下这发生在候选集几乎覆盖全部 student 质量的位置（实测约 29%，看
+  `actor/l_apd_tail_saturated`；补集消融下对应 $p(y_t) \to 1$，看 `anchor_saturated`）。
+  关键是这个截断对 autograd **透明**（straight-through）：如果让它挡住梯度，聚合列会
   在 student 最过度自信的位置——正是 on-policy 蒸馏存在的理由——被静默清零，而且是断崖式的
   （实测跨过阈值一步之内掉 6 个数量级）。放行是安全的，因为成对的 $r(1-r)$ 因子恰好抵消
-  $1/(1-p)$ 的爆炸，合成梯度是 $w(\perp)\,p(y_t)\,(m - m_T)$，只按 $\log\frac{1}{1-p(y_t)}$ 增长；
-  封顶后它停在一个有限值而不是跌到 0。被封顶的位置占比看 `actor/l_apd_anchor_saturated`。
+  $1/(1-p)$ 的爆炸，合成梯度只按 $\log\frac{1}{1-p}$ 增长；封顶后它停在一个有限值而不是跌到 0。
 - **不要打开 `TORCH_NCCL_BLOCKING_WAIT`**。它和 vLLM 的 CUDA graph capture 会死锁：8 个 rank
   全堵在 torch 的 `ProcessGroupNCCL::waitForPendingWorks()` 里，而那个等待循环没有超时，
   表现是显存占满、GPU 利用率 0%、日志停在
@@ -623,3 +643,30 @@ $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐�
 - **恢复训练**：experiment name 带时间戳，所以每次启动都是新目录。要接着上次跑，需显式指定
   `trainer.default_local_dir=<旧 checkpoint 目录> trainer.resume_mode=auto`。
 - 单节点默认 8 卡（`trainer.n_gpus_per_node=8`），卡数不同时请追加 override。
+
+## 10. 更新记录
+
+### 2026-08-11：单项形式成为方法本身
+
+- **loss 从两项式改为单项式**（`tail_candidate=True` 成为默认，`complement_candidate` 降级为
+  消融）。旧两项式的补集对手把具名候选重复计数了一次，且重复的那份拿走约 0.68 的权重，多数
+  位置上 loss 在给已满足的锚点校准反复付费。单项式把对手集合改成"具名候选 + 尾部块"的真划分，
+  每个非锚点 token 恰好出现一次，权重就是 teacher 在真备选上的条件分布 $q(o)/(1-q(y_t))$，
+  零个新超参；$K=0$ 时精确退化回原锚点项，锚点校准由可辨识性定理自动保证（§1、§1.2）。
+  真实模型测量：聚合列梯度份额 0.378 → 0.024，第 3 名以后候选的梯度份额 0.173 → 0.213；
+  40 步蒸馏小验证中留出集全词表 KL 与两项式打平、熵更健康（0.760 vs 0.746），两者都快于
+  OPD 式策略梯度（KL 0.105/0.104 vs 0.119）。
+- **候选来源默认 `student` → `teacher`**（§1.1）。student top-k 里 99.4% 含锚点，loss 只能
+  在 student 已偏好的集合内重排，看不到被 student 丢出 top-k 的 teacher 高分 token；一条 run
+  的 `pairwise_agreement` 从 step 140 起停在 0.95 不再上升即此原因。
+- **修复 `_log1mexp` 截断阻断梯度**：截断改为对 autograd 透明（straight-through），聚合对手
+  列在 student 过度自信的位置不再被断崖式清零（修复前跨过阈值一步掉 6 个数量级），§9 有
+  安全性论证，三个回归测试锁定。
+- **`pair_divergence` 默认回到 `reverse_kl`**，`log_ratio` 定性为消融并写明退化机制（§1.4）：
+  它不是散度、梯度里没有 teacher，on-policy 下熵塌缩（实测 0.66 → 0.04）、要缩小的 KL 反而
+  涨了 4 倍。
+
+### 2026-08-10：初版
+
+- L-APD 初版实现：锚点式成对蒸馏，reverse Bernoulli KL，两项式（具名候选 + 补集对手），
+  权重按 teacher 概率在含锚点的 top-16 上归一化。CPU 单元测试、启动脚本、W&B 跟踪。

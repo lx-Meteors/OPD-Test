@@ -21,16 +21,23 @@ export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
 export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parquet\",\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/HMMT24/test.parquet\",\"${DATA_ROOT}/test_data/HMMT25/test.parquet\"]}"
 
-# Competitor tokens. The OPD baseline scores the student top-k, so L-APD ranks
-# against the same set to keep the two runs comparable.
-export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-student}"
-# Off to match the baseline, which renormalizes strictly inside the top-k and
-# carries no aggregate tail term.
-export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-False}"
-# Aggregated "everything except the anchor" candidate, i.e. the anchor term
-# KL_B(q(y_t) || p(y_t)) weighted by q(y_t). Required with the tail candidate off,
-# and it makes the weights normalize over the same 16 ids the baseline uses.
-export L_APD_COMPLEMENT_CANDIDATE="${L_APD_COMPLEMENT_CANDIDATE:-True}"
+# Competitor tokens. Scoring against the student's own top-k puts the anchor
+# inside the candidate set 99.4% of the time, so every competitor is a token the
+# student already ranks highly: the loss can only reorder the set the student
+# already prefers, and never sees a token the teacher wants but the student has
+# dropped past rank k. Pairwise agreement stalled at 0.95 from step 140 that way.
+# The teacher top-k instead carries the ~1.5% of teacher mass sitting outside the
+# student top-k, which is where the teacher still disagrees.
+export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-teacher}"
+# Aggregate opponent. The tail block turns the opponents into a true partition of
+# the non-anchor vocabulary: every non-anchor token appears in the loss exactly
+# once, either as a named candidate or inside the tail, and the weights normalize
+# to teacher mass over genuine alternatives, q(o) / (1 - q(y_t)). The complement
+# opponent (the old default) contains the named candidates a second time and took
+# q(y_t)/Z ~ 0.68 of the weight for re-checking a mostly satisfied constraint;
+# it is kept as an ablation only.
+export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-True}"
+export L_APD_COMPLEMENT_CANDIDATE="${L_APD_COMPLEMENT_CANDIDATE:-False}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
 # Per-pair discrepancy. reverse_kl sums both outcomes of each pair,
 # sum_v r_S(v) log[r_S(v) / r_T(v)], so it is a genuine divergence: bounded below by 0

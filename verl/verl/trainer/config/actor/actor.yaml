@@ -78,14 +78,17 @@ l_apd:
   # Source of the competitor tokens: teacher (main method) or student
   candidate_source: teacher
 
-  # Add one aggregated candidate carrying the probability mass outside the candidate set
+  # Add one aggregated candidate carrying the probability mass outside the candidate set, making
+  # the opponents a true partition of the non-anchor vocabulary: every non-anchor token appears in
+  # exactly one pair, weighted by the teacher's distribution over genuine alternatives
   tail_candidate: true
 
   # Add one aggregated candidate standing for everything except the anchor, i.e. the anchor term
-  # KL(q(y_t) || p(y_t)) in pairwise form, weighted by q(y_t). Ignored when tail_candidate=true.
-  # One of the two is required: token candidates alone leave the mass split between the top-k set
-  # and the truncated tail unidentified
-  complement_candidate: true
+  # KL(p(y_t) || q(y_t)) in pairwise form, weighted by q(y_t). Ablation only: the complement counts
+  # the named candidates a second time and takes ~0.68 of the weight. Ignored when
+  # tail_candidate=true. One of the two is required: token candidates alone leave the mass split
+  # between the top-k set and the truncated tail unidentified
+  complement_candidate: false
 
   # Normalize teacher candidate weights by their own sum instead of by 1 - q(y_t)
   normalize_weights: true

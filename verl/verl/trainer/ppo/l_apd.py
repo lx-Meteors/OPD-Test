@@ -45,10 +45,18 @@ because the gradient comes from the policy-gradient term instead.
 Because the candidate set is a truncated top-k, the token candidates alone do not
 cover the vocabulary, and an objective built only from them cannot identify
 ``p_t(y_t)``: it is invariant to moving mass between ``{y_t} + candidates`` and the
-truncated tail. One aggregated candidate restores coverage, and there are two
-choices for it (see ``tail_candidate`` / ``complement_candidate``). Both enter as
-ordinary candidates, weighted by their own teacher mass, so neither introduces a
-free coefficient.
+truncated tail. The tail block (``tail_candidate``, the default) restores coverage
+as one more ordinary opponent carrying the probability mass outside the candidate
+set, which makes the opponents a true partition of the non-anchor vocabulary: every
+non-anchor token takes part in exactly one pair, and the weights are the teacher's
+distribution over genuine alternatives, ``q(o) / (1 - q(y_t))``. With zero token
+candidates the loss reduces exactly to the anchor calibration term
+``KL((p(y), 1-p(y)) || (q(y), 1-q(y)))``. The complement opponent
+(``complement_candidate``) is the historical variant that aggregated *everything*
+except the anchor instead; it counts the named candidates a second time inside the
+aggregate and hands that column ``q(y_t) / Z`` of the weight, and is kept as an
+ablation. Both enter as ordinary candidates, weighted by their own teacher mass,
+so neither introduces a free coefficient.
 
 Because a softmax normalizer cancels inside a logit difference, every restricted
 pair probability is just ``p~(y) = sigmoid(log p(y) - log p(z))``, so all pairs
@@ -143,7 +151,7 @@ def compute_l_apd_token_loss(
     candidate_mask: torch.Tensor,
     response_mask: torch.Tensor,
     tail_candidate: bool = True,
-    complement_candidate: bool = True,
+    complement_candidate: bool = False,
     normalize_weights: bool = True,
     pair_divergence: str = "reverse_kl",
     eps: float = 1.0e-6,
@@ -162,13 +170,19 @@ def compute_l_apd_token_loss(
             that take part in the loss, i.e. ``z != y_t`` at valid positions.
         response_mask: ``(bs, response_length)`` mask of valid response tokens.
         tail_candidate: append one aggregated candidate carrying the probability mass
-            outside the candidate set. Its opponents then form a genuine partition of
-            the non-anchor vocabulary, so the tail is supervised too.
+            outside the candidate set (the default). The opponents then form a genuine
+            partition of the non-anchor vocabulary -- every non-anchor token appears in
+            exactly one pair -- and with ``normalize_weights`` the weights are exactly
+            the teacher's distribution over genuine alternatives, ``q(o) / (1 - q(y_t))``.
+            With zero token candidates the loss reduces to the anchor term
+            ``KL((p(y), 1 - p(y)) || (q(y), 1 - q(y)))``.
         complement_candidate: append one aggregated candidate standing for everything
             except the anchor, i.e. the anchor term -- the KL between the two-outcome
             distributions ``(p(y), 1 - p(y))`` and ``(q(y), 1 - q(y))`` -- written in
-            the same pairwise form as every other candidate. Ignored when
-            ``tail_candidate`` is set, which already covers the vocabulary.
+            the same pairwise form as every other candidate. Ablation only: the
+            complement contains the named candidates a second time, so they are counted
+            twice, and this column takes ``q(y_t) / Z`` (~0.68 measured) of the weight.
+            Ignored when ``tail_candidate`` is set, which already covers the vocabulary.
 
             One of the two is required. Token candidates alone constrain the student
             only through the logit differences ``S(y) - S(z)``, which leaves one
