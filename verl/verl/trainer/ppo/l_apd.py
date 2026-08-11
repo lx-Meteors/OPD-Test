@@ -93,12 +93,23 @@ def l_apd_batch_keys(candidate_source: str = "teacher") -> tuple[str, ...]:
 _PROB_EPS = 1.0e-7
 # ``log(1 - exp(x))`` is only meaningful for x < 0; this bounds the aggregate
 # tail probability from below by roughly 1e-6.
+# float32 log-probs stop resolving ``1 - exp(x)`` just below this, so the forward
+# value is capped here to keep ``log(1 - exp(x))`` finite at x = 0.
 _LOG1MEXP_MAX = -1.0e-6
 
 
 def _log1mexp(x: torch.Tensor) -> torch.Tensor:
-    """Numerically stable ``log(1 - exp(x))`` for ``x <= 0``."""
-    x = x.clamp(max=_LOG1MEXP_MAX)
+    """Numerically stable ``log(1 - exp(x))`` for ``x <= 0``.
+
+    The cap is transparent to autograd. Letting it block the gradient would zero out
+    the aggregate-opponent column exactly where the student is most overconfident --
+    the case on-policy distillation exists to correct -- and it would do so as a
+    cliff rather than a decay. Passing the gradient through is safe because the pair
+    ``r (1 - r)`` factor cancels the ``1 / (1 - exp(x))`` blow-up, leaving a
+    composite gradient that only grows like ``log[1 / (1 - exp(x))]``.
+    """
+    capped = x.clamp(max=_LOG1MEXP_MAX)
+    x = capped.detach() + (x - x.detach())
     # Both branches stay finite everywhere on x <= _LOG1MEXP_MAX, which keeps
     # ``torch.where`` from propagating NaNs into the backward pass.
     return torch.where(x > -0.6931471805599453, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
@@ -186,8 +197,12 @@ def compute_l_apd_token_loss(
             ``log_ratio`` keeps only the ``v = y_t`` outcome of the reverse sum, i.e.
             ``log[p~(y) / q~(y)]``, which on the complement column is
             ``log[p(y) / q(y)]``. Ablation only: its margin gradient is ``1 - p~(y)``,
-            positive whatever the teacher says, so it has no stationary point, is
-            unbounded below, and drives ``p(y_t)`` to zero.
+            positive whatever the teacher says, so it has no stationary point and is
+            unbounded below. At a fixed anchor it drives ``p(y_t)`` to zero, but under
+            on-policy resampling the dynamics invert -- pushing down whatever was just
+            sampled makes the mass flee into an ever narrower set, so entropy collapses
+            and ``p(y_t)`` rises instead. A run of it took ``actor/entropy`` from 0.66
+            to 0.04 while the honest ``pair_kl`` grew fourfold.
         eps: floor for the weight normalizer.
 
     Returns:
@@ -219,7 +234,8 @@ def compute_l_apd_token_loss(
         covered_teacher = torch.cat(
             [teacher_anchor.unsqueeze(-1), teacher_candidates.masked_fill(~valid, neg_inf)], dim=-1
         )
-        student_tail = _log1mexp(torch.logsumexp(covered_student, dim=-1))
+        covered_student_mass = torch.logsumexp(covered_student, dim=-1)
+        student_tail = _log1mexp(covered_student_mass)
         teacher_tail = _log1mexp(torch.logsumexp(covered_teacher, dim=-1))
 
         pair_logits = torch.cat([pair_logits, (student_anchor - student_tail).unsqueeze(-1)], dim=-1)
@@ -291,8 +307,12 @@ def compute_l_apd_token_loss(
             diagnostics["tail_weight"] = weights[..., -1]
             diagnostics["teacher_tail_prob"] = torch.exp(teacher_tail)
             diagnostics["student_tail_prob"] = torch.exp(student_tail)
+            # Share of positions where float32 can no longer resolve the tail mass, so
+            # the aggregate-opponent margin is capped instead of exact.
+            diagnostics["tail_saturated"] = (covered_student_mass > _LOG1MEXP_MAX).float()
         elif complement_candidate:
             diagnostics["anchor_weight"] = weights[..., -1]
+            diagnostics["anchor_saturated"] = (student_anchor > _LOG1MEXP_MAX).float()
             # KL between (p(y), 1 - p(y)) and (q(y), 1 - q(y)), so it reaches 0 exactly
             # when p(y) == q(y) whichever direction the pairs are scored with.
             diagnostics["anchor_kl"] = pair_kl[..., -1]

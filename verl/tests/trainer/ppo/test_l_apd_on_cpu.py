@@ -13,6 +13,8 @@
 # limitations under the License.
 """Unit tests for the L-APD objective."""
 
+import math
+
 import torch
 
 from verl.trainer.ppo.l_apd import compute_l_apd_token_loss
@@ -628,6 +630,69 @@ def test_log_ratio_has_no_stationary_point():
     anchor_log_probs = student_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1)
     assert loss.sum().item() < -10.0
     assert anchor_log_probs[response_mask.bool()].max().item() < -10.0
+
+
+def _overconfident_anchor(student_anchor_prob, teacher_anchor_prob=0.5):
+    """One position with a single competitor, so the complement pair is exact.
+
+    The competitor absorbs the whole remaining student mass, which makes
+    ``r_S(y_t, competitor)`` equal to ``p(y_t)`` just like the complement column and
+    keeps the log-probs self-consistent as ``p(y_t)`` approaches 1.
+    """
+    remainder = max(1.0 - student_anchor_prob, torch.finfo(torch.float64).tiny)
+    anchor = torch.tensor([[math.log(student_anchor_prob)]], dtype=torch.float64, requires_grad=True)
+    loss, diagnostics = compute_l_apd_token_loss(
+        student_anchor_log_probs=anchor,
+        student_candidate_log_probs=torch.tensor([[[math.log(remainder)]]], dtype=torch.float64),
+        teacher_anchor_log_probs=torch.tensor([[math.log(teacher_anchor_prob)]], dtype=torch.float64),
+        teacher_candidate_log_probs=torch.tensor([[[math.log(1.0 - teacher_anchor_prob)]]], dtype=torch.float64),
+        candidate_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+        response_mask=torch.ones(1, 1),
+        tail_candidate=False,
+        complement_candidate=True,
+        pair_divergence="reverse_kl",
+    )
+    loss.sum().backward()
+    return loss.item(), anchor.grad.item(), diagnostics
+
+
+def test_overconfident_anchor_keeps_its_gradient():
+    """No gradient cliff where float32 stops resolving ``1 - p(y_t)``.
+
+    ``_log1mexp`` has to cap its input so that ``log(1 - exp(x))`` stays finite at
+    ``x = 0``, and that cap lands exactly where the student is most overconfident --
+    the case on-policy distillation exists to correct. Blocking the gradient there
+    used to drop it by six orders of magnitude in one step, so the cap has to stay
+    transparent to autograd.
+
+    The plateau is legitimate rather than a second truncation: the composite gradient
+    is ``w(perp) p(y_t) (m - m_T)``, because the pair's ``r (1 - r)`` factor cancels
+    the ``1 / (1 - p(y_t))`` blow-up, so it only grows like ``log[1 / (1 - p(y_t))]``.
+    """
+    resolved = _overconfident_anchor(1.0 - 1e-6)
+    just_capped = _overconfident_anchor(1.0 - 1e-7)
+    deeply_capped = _overconfident_anchor(1.0 - 1e-12)
+
+    # The teacher is far less confident, so descent has to push p(y_t) back down.
+    assert resolved[1] > 1.0
+    torch.testing.assert_close(just_capped[1], resolved[1], atol=0.0, rtol=1e-6)
+    torch.testing.assert_close(deeply_capped[1], resolved[1], atol=0.0, rtol=1e-6)
+
+
+def test_saturated_anchor_is_free_of_nan():
+    """``p(y_t) == 1`` is reachable in float32 and must not poison the backward pass."""
+    loss, gradient, _ = _overconfident_anchor(1.0)
+    assert math.isfinite(loss)
+    assert math.isfinite(gradient)
+    assert gradient > 1.0
+
+
+def test_anchor_saturated_reports_the_capped_share():
+    """The diagnostic makes the capped region visible instead of silently absorbed."""
+    _, _, resolved = _overconfident_anchor(0.9)
+    _, _, capped = _overconfident_anchor(1.0 - 1e-9)
+    assert resolved["anchor_saturated"].item() == 0.0
+    assert capped["anchor_saturated"].item() == 1.0
 
 
 def test_unknown_pair_divergence_is_rejected():
