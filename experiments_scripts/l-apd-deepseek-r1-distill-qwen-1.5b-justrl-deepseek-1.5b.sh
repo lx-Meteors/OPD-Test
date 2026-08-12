@@ -45,7 +45,7 @@ export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
 # actor/entropy from 0.66 to 0.04 while actor/l_apd_anchor_kl grew tenfold.
 export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-reverse_kl}"
 
-run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}-aux_${L_APD_USE_AS_AUXILIARY}-coef_${L_APD_LOSS_COEF}" \
+run_opd "l-apd-r1" \
     "actor_rollout_ref.actor.l_apd.enable=True" \
     "actor_rollout_ref.actor.l_apd.use_as_auxiliary=${L_APD_USE_AS_AUXILIARY}" \
     "actor_rollout_ref.actor.l_apd.loss_coef=${L_APD_LOSS_COEF}" \

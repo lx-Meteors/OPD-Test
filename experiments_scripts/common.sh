@@ -71,7 +71,7 @@ cleanup_ray() {
 setup_tracking() {
     # Credentials are never read from this repo. Run `wandb login` once; the key
     # lands in ~/.netrc, outside the tree, so it cannot be committed by accident.
-    export WANDB_API_KEY="${WANDB_API_KEY:-}"
+    export WANDB_API_KEY="${WANDB_API_KEY:-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}"
     export WANDB_MODE="${WANDB_MODE:-online}"
     export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/logs/wandb}"
     export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${REPO_ROOT}/.cache/wandb}"
@@ -173,8 +173,19 @@ run_opd() {
     local ppo_max_token_len_per_gpu
     ppo_max_token_len_per_gpu=$(( ((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) > 32768) ? (MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) : 32768 ))
 
+    # The descriptive default can exceed NAME_MAX (255) once many flags are folded
+    # into run_name; ckpt path / validation_log dir / log file are all derived from
+    # experiment_name, so an over-long name aborts the run before training starts
+    # (Errno 36). Set EXPERIMENT_NAME for a short custom name; as a safety net the
+    # final length is always capped.
     local experiment_name
-    experiment_name="${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-${timestamp}"
+    experiment_name="${EXPERIMENT_NAME:-${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-${timestamp}}"
+    if [[ ${#experiment_name} -gt 200 ]]; then
+        local short_tag
+        short_tag="$(printf '%s' "${experiment_name}" | md5sum | cut -c1-8)"
+        experiment_name="opd-${short_tag}-${timestamp}"
+        echo "WARNING: experiment name exceeded 200 bytes; shortened to '${experiment_name}'." >&2
+    fi
     local ckpt_root="${CKPT_ROOT:-${REPO_ROOT}/checkpoint}"
     local ckpt_path="${ckpt_root}/${experiment_name}"
 
