@@ -798,8 +798,9 @@ class DataParallelPPOActor(BasePPOActor):
             candidate_mask=candidate_ids != responses.unsqueeze(-1),
             response_mask=response_mask,
             tail_candidate=self.l_apd_config.get("tail_candidate", True),
-            complement_candidate=self.l_apd_config.get("complement_candidate", True),
+            complement_candidate=self.l_apd_config.get("complement_candidate", False),
             normalize_weights=self.l_apd_config.get("normalize_weights", True),
+            weight_source=self.l_apd_config.get("weight_source", "student"),
             pair_divergence=self.l_apd_config.get("pair_divergence", "reverse_kl"),
         )
         loss = agg_loss(loss_mat=token_loss, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

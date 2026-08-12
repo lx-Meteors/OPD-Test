@@ -31,14 +31,23 @@ export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parque
 export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-teacher}"
 # Aggregate opponent. The tail block turns the opponents into a true partition of
 # the non-anchor vocabulary: every non-anchor token appears in the loss exactly
-# once, either as a named candidate or inside the tail, and the weights normalize
-# to teacher mass over genuine alternatives, q(o) / (1 - q(y_t)). The complement
-# opponent (the old default) contains the named candidates a second time and took
+# once, either as a named candidate or inside the tail. The complement opponent
+# (the old default) contains the named candidates a second time and took
 # q(y_t)/Z ~ 0.68 of the weight for re-checking a mostly satisfied constraint;
 # it is kept as an ablation only.
 export L_APD_TAIL_CANDIDATE="${L_APD_TAIL_CANDIDATE:-True}"
 export L_APD_COMPLEMENT_CANDIDATE="${L_APD_COMPLEMENT_CANDIDATE:-False}"
 export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
+# Whose probabilities set the per-pair mixture weights. student (default) weights every
+# duel by the student's own conditional mass sg[p(o) / (1 - p(y_t))]: closed-loop, so a
+# bloated tail or a wrongly favoured alternative automatically raises the weight of its
+# own column until drained, and direction-consistent with the reverse per-pair KL (the
+# chain rule of KL(p || q) weights conditional cells by student mass). teacher is the
+# historical open-loop weighting q(o) / (1 - q(y_t)), kept as an ablation: it spends
+# budget by teacher preference regardless of where the student's error is, which let
+# transient mass pile up in the 4-11%-weight tail column (3x teacher tail mass at peak,
+# entropy overshoot to 1.0, and the worst@16 val gap that followed).
+export L_APD_WEIGHT_SOURCE="${L_APD_WEIGHT_SOURCE:-student}"
 # Per-pair discrepancy. reverse_kl sums both outcomes of each pair,
 # sum_v r_S(v) log[r_S(v) / r_T(v)], so it is a genuine divergence: bounded below by 0
 # and stationary exactly at m = m_T. forward_kl swaps the arguments.
@@ -50,11 +59,12 @@ export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
 # actor/entropy from 0.66 to 0.04 while actor/l_apd_anchor_kl grew tenfold.
 export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-reverse_kl}"
 
-run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}" \
+run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-w_${L_APD_WEIGHT_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}" \
     "actor_rollout_ref.actor.l_apd.enable=True" \
     "actor_rollout_ref.actor.l_apd.candidate_source=${L_APD_CANDIDATE_SOURCE}" \
     "actor_rollout_ref.actor.l_apd.tail_candidate=${L_APD_TAIL_CANDIDATE}" \
     "actor_rollout_ref.actor.l_apd.complement_candidate=${L_APD_COMPLEMENT_CANDIDATE}" \
     "actor_rollout_ref.actor.l_apd.normalize_weights=${L_APD_NORMALIZE_WEIGHTS}" \
+    "actor_rollout_ref.actor.l_apd.weight_source=${L_APD_WEIGHT_SOURCE}" \
     "actor_rollout_ref.actor.l_apd.pair_divergence=${L_APD_PAIR_DIVERGENCE}" \
     "$@"

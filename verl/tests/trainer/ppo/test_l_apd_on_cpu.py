@@ -66,8 +66,10 @@ def _candidates_from_teacher(teacher_logits, k):
 
 def _call_loss(student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs):
     # The closed forms most tests below compare against are written for the forward
-    # direction, so ask for it explicitly rather than riding on the library default.
+    # direction and the historical teacher weighting, so ask for those explicitly
+    # rather than riding on the library defaults.
     kwargs.setdefault("pair_divergence", "forward_kl")
+    kwargs.setdefault("weight_source", "teacher")
     student_log_probs = torch.log_softmax(student_logits, dim=-1)
     teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
     return compute_l_apd_token_loss(
@@ -384,7 +386,13 @@ def test_reverse_kl_is_the_default_direction():
     candidate_ids = _candidates_from_teacher(teacher_logits, k)
 
     explicit, _ = _call_loss(
-        student_logits, teacher_logits, anchors, response_mask, candidate_ids, pair_divergence="reverse_kl"
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        pair_divergence="reverse_kl",
+        weight_source="student",
     )
     student_log_probs = torch.log_softmax(student_logits, dim=-1)
     teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
@@ -531,6 +539,9 @@ def test_reverse_kl_is_bounded_where_forward_diverges():
                 response_mask=torch.ones(1, 1),
                 tail_candidate=False,
                 complement_candidate=False,
+                # Teacher weighting: these toy log-probs are unnormalized, and the
+                # student side would put the lone pair below the eps weight floor.
+                weight_source="teacher",
                 pair_divergence=direction,
             )
             token_loss.sum().backward()
@@ -650,6 +661,7 @@ def _overconfident_anchor(student_anchor_prob, teacher_anchor_prob=0.5):
         response_mask=torch.ones(1, 1),
         tail_candidate=False,
         complement_candidate=True,
+        weight_source="teacher",
         pair_divergence="reverse_kl",
     )
     loss.sum().backward()
@@ -693,6 +705,160 @@ def test_anchor_saturated_reports_the_capped_share():
     _, _, capped = _overconfident_anchor(1.0 - 1e-9)
     assert resolved["anchor_saturated"].item() == 0.0
     assert capped["anchor_saturated"].item() == 1.0
+
+
+def test_student_weighting_is_the_default():
+    """The library default weights every duel by the student's conditional mass."""
+    vocab, k = 32, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=61)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    default, _ = compute_l_apd_token_loss(
+        student_anchor_log_probs=student_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1),
+        student_candidate_log_probs=student_log_probs.gather(-1, candidate_ids),
+        teacher_anchor_log_probs=teacher_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1),
+        teacher_candidate_log_probs=teacher_log_probs.gather(-1, candidate_ids),
+        candidate_mask=candidate_ids != anchors.unsqueeze(-1),
+        response_mask=response_mask,
+    )
+    explicit, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        pair_divergence="reverse_kl",
+        weight_source="student",
+    )
+    teacher_weighted, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        pair_divergence="reverse_kl",
+        weight_source="teacher",
+    )
+
+    torch.testing.assert_close(default, explicit)
+    assert (default - teacher_weighted).abs().max() > 1e-4
+
+
+def test_student_weights_equal_student_conditional_mass():
+    """Weights are ``sg[p(o) / (1 - p(y_t))]``; the tail column follows the student tail."""
+    vocab, k = 32, 8
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=67)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+    valid_positions = response_mask.bool()
+
+    _, diagnostics = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        weight_source="student",
+    )
+
+    p = torch.log_softmax(student_logits, dim=-1)
+    p_anchor = p.gather(-1, anchors.unsqueeze(-1)).squeeze(-1).exp()
+    kept = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+    p_named = (p.gather(-1, candidate_ids).exp() * kept).sum(-1)
+    expected_tail_weight = (1.0 - p_anchor - p_named) / (1.0 - p_anchor)
+
+    torch.testing.assert_close(
+        diagnostics["tail_weight"][valid_positions].double(),
+        expected_tail_weight[valid_positions],
+        atol=1e-5,
+        rtol=1e-4,
+    )
+    torch.testing.assert_close(
+        diagnostics["candidate_weight_sum"][valid_positions],
+        torch.ones(int(response_mask.sum())),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_student_weights_are_stop_gradient():
+    """The student weights scale each duel but never open a second gradient path.
+
+    The analytical margin gradient below treats the weights as constants; if the
+    weights leaked gradient, the ``p``-dependent normalizer alone would break it.
+    """
+    vocab = 12
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=71)
+    student_logits = student_logits.float().requires_grad_(True)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k=4)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits.float(),
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=False,
+        complement_candidate=False,
+        weight_source="student",
+    )
+    token_loss.sum().backward()
+
+    p = torch.log_softmax(student_logits.detach(), dim=-1)
+    q = torch.log_softmax(teacher_logits.float(), dim=-1)
+    valid = (candidate_ids != anchors.unsqueeze(-1)) & response_mask.unsqueeze(-1).bool()
+    weights = p.gather(-1, candidate_ids).exp() * valid
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    student_win = torch.sigmoid(p.gather(-1, anchors.unsqueeze(-1)) - p.gather(-1, candidate_ids))
+    teacher_win = torch.sigmoid(q.gather(-1, anchors.unsqueeze(-1)) - q.gather(-1, candidate_ids))
+    margin_grad = weights * (student_win - teacher_win)
+
+    expected = torch.zeros_like(student_logits)
+    expected.scatter_add_(-1, candidate_ids, -margin_grad)
+    expected.scatter_add_(-1, anchors.unsqueeze(-1), margin_grad.sum(dim=-1, keepdim=True))
+
+    torch.testing.assert_close(student_logits.grad, expected, atol=1e-5, rtol=1e-3)
+
+
+def test_k0_reduces_to_anchor_bernoulli_kl_under_both_weightings():
+    """With zero token candidates the tail duel is the anchor calibration term."""
+    bs, seq_len = 2, 3
+    generator = torch.Generator().manual_seed(73)
+    student_anchor = torch.log(torch.rand(bs, seq_len, generator=generator) * 0.8 + 0.1)
+    teacher_anchor = torch.log(torch.rand(bs, seq_len, generator=generator) * 0.8 + 0.1)
+    response_mask = torch.ones(bs, seq_len)
+
+    p, q = student_anchor.exp(), teacher_anchor.exp()
+    bernoulli = p * (p / q).log() + (1 - p) * ((1 - p) / (1 - q)).log()
+
+    for weight_source in ("student", "teacher"):
+        token_loss, _ = compute_l_apd_token_loss(
+            student_anchor_log_probs=student_anchor,
+            student_candidate_log_probs=torch.zeros(bs, seq_len, 0),
+            teacher_anchor_log_probs=teacher_anchor,
+            teacher_candidate_log_probs=torch.zeros(bs, seq_len, 0),
+            candidate_mask=torch.zeros(bs, seq_len, 0, dtype=torch.bool),
+            response_mask=response_mask,
+            weight_source=weight_source,
+        )
+        torch.testing.assert_close(token_loss, bernoulli, atol=1e-5, rtol=1e-4)
+
+
+def test_unknown_weight_source_is_rejected():
+    vocab, k = 16, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=43)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    try:
+        _call_loss(
+            student_logits, teacher_logits, anchors, response_mask, candidate_ids, weight_source="mixed"
+        )
+    except ValueError as error:
+        assert "weight_source" in str(error)
+    else:
+        raise AssertionError("an unknown weight_source should raise")
 
 
 def test_unknown_pair_divergence_is_rejected():

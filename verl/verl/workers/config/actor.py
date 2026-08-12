@@ -53,8 +53,15 @@ class LAPDConfig(BaseConfig):
             takes ``q(y_t) / Z`` (~0.68 measured) of the weight. Ignored when ``tail_candidate`` is
             set. One of the two is required: token candidates alone only constrain logit differences
             and leave the mass split between the top-k set and the truncated tail unidentified.
-        normalize_weights (bool): Normalize the teacher candidate weights by their own sum instead of
-            by ``1 - q(y_t)``.
+        normalize_weights (bool): Normalize the candidate weights by their own sum instead of by the
+            weighting side's ``1 - anchor mass``.
+        weight_source (str): Whose probabilities set the per-pair mixture weights. 'student' (the
+            default) uses the detached student conditional mass ``sg[p(o) / (1 - p(y_t))]``:
+            closed-loop (surplus student mass raises the weight of its own column until drained) and
+            direction-consistent with the reverse per-pair KL, whose chain rule weights conditional
+            cells by student mass. 'teacher' keeps the historical open-loop ``q(o) / (1 - q(y_t))``
+            as an ablation; it allocates budget by teacher preference even where the student already
+            agrees, which measurably let transient mass pile up in the weakly weighted tail column.
         pair_divergence (str): Direction of the per-pair KL, taken between the two sides restricted to
             ``{y_t, z}`` and renormalized there. 'reverse_kl' scores each pair with ``KL(p~ || q~)``,
             whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins directly but decays on
@@ -72,6 +79,7 @@ class LAPDConfig(BaseConfig):
     tail_candidate: bool = True
     complement_candidate: bool = False
     normalize_weights: bool = True
+    weight_source: str = "student"
     pair_divergence: str = "reverse_kl"
 
 

@@ -31,8 +31,17 @@ reverse KL between those two-outcome distributions, i.e. the usual
 outcome would leave a bare log-ratio, which is not a divergence and is unbounded
 below.
 
-Teacher weights ``w_t(v) = q_t(v) / Z_t`` are renormalized over the whole
-candidate axis, the anchor included: ``Z_t = q_t(y_t) + sum_z q_t(z)``.
+The mixture weights over the opponents default to the *student's* conditional
+mass, ``w_t(o) = sg[p_t(o) / (1 - p_t(y_t))]``, evaluated on the same candidate
+ids and detached: weights decide how loudly each duel is scored, never where
+gradients flow. Student weighting is the direction-consistent companion of the
+reverse per-pair KL -- the chain rule of ``KL(p || q)`` over a partition weights
+the conditional cells by the student's conditional mass -- and it is
+closed-loop: surplus student mass (a bloated tail, a wrongly favoured
+alternative) raises the weight of exactly that column until it is drained.
+``weight_source="teacher"`` keeps the historical open-loop weighting
+``q_t(o) / (1 - q_t(y_t))`` as an ablation; it allocates budget by the
+teacher's preference regardless of where the student's error actually is.
 
 ``pair_divergence`` picks the direction and defaults to the reverse one above.
 ``log_ratio`` additionally offers the ablation that keeps only the ``v = y_t``
@@ -48,23 +57,23 @@ cover the vocabulary, and an objective built only from them cannot identify
 truncated tail. The tail block (``tail_candidate``, the default) restores coverage
 as one more ordinary opponent carrying the probability mass outside the candidate
 set, which makes the opponents a true partition of the non-anchor vocabulary: every
-non-anchor token takes part in exactly one pair, and the weights are the teacher's
-distribution over genuine alternatives, ``q(o) / (1 - q(y_t))``. With zero token
-candidates the loss reduces exactly to the anchor calibration term
+non-anchor token takes part in exactly one pair, and the weights are the weighting
+side's distribution over genuine alternatives (the student's, by default). With
+zero token candidates the loss reduces exactly to the anchor calibration term
 ``KL((p(y), 1-p(y)) || (q(y), 1-q(y)))``. The complement opponent
 (``complement_candidate``) is the historical variant that aggregated *everything*
 except the anchor instead; it counts the named candidates a second time inside the
-aggregate and hands that column ``q(y_t) / Z`` of the weight, and is kept as an
-ablation. Both enter as ordinary candidates, weighted by their own teacher mass,
-so neither introduces a free coefficient.
+aggregate, and is kept as an ablation. Both enter as ordinary candidates, weighted
+by their own mass on the weighting side, so neither introduces a free coefficient.
 
 Because a softmax normalizer cancels inside a logit difference, every restricted
 pair probability is just ``p~(y) = sigmoid(log p(y) - log p(z))``, so all pairs
 can be scored from log-probabilities alone and no raw logits have to be
 materialized or communicated.
 
-Only the student receives gradients: teacher candidate weights and the teacher
-side of every pair enter as constants.
+Only the student's pair margins receive gradients: the mixture weights
+(whichever side supplies them) and the teacher side of every pair enter as
+constants.
 
 This module deliberately depends on ``torch`` only, so the objective can be
 tested in isolation from the training stack.
@@ -76,6 +85,9 @@ import torch.nn.functional as F
 __all__ = ["compute_l_apd_token_loss", "l_apd_batch_keys"]
 
 _PAIR_DIVERGENCES = ("reverse_kl", "forward_kl", "log_ratio")
+
+# Whose probabilities set the per-pair mixture weights.
+_WEIGHT_SOURCES = ("student", "teacher")
 
 # Candidate ids together with the teacher log-probs evaluated on them.
 _CANDIDATE_SOURCES = {
@@ -153,6 +165,7 @@ def compute_l_apd_token_loss(
     tail_candidate: bool = True,
     complement_candidate: bool = False,
     normalize_weights: bool = True,
+    weight_source: str = "student",
     pair_divergence: str = "reverse_kl",
     eps: float = 1.0e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -192,9 +205,19 @@ def compute_l_apd_token_loss(
             ratio on a set of cells that covers the whole vocabulary forces
             ``p(y) = q(y)`` once both sides are normalized.
         normalize_weights: divide the candidate weights by their own sum instead
-            of by ``1 - q(y_t)``. Only meaningful together with an aggregated
-            candidate; with ``tail_candidate=True`` the two are equivalent up to
-            floating point error.
+            of by the weighting side's ``1 - anchor mass``. Only meaningful
+            together with an aggregated candidate; with ``tail_candidate=True``
+            the two are equivalent up to floating point error.
+        weight_source: whose probabilities set the mixture weights. ``student``
+            (the default) uses the detached student conditional mass
+            ``sg[p(o) / (1 - p(y_t))]``: closed-loop, because surplus student
+            mass raises the weight of its own column until it is drained, and
+            direction-consistent with the reverse per-pair KL, whose chain rule
+            weights conditional cells by student mass. ``teacher`` keeps the
+            historical ``q(o) / (1 - q(y_t))`` as an ablation: open-loop, its
+            budget follows the teacher's preference even where the student
+            already agrees, which measurably lets transient mass pile up in the
+            weakly weighted tail column (3x the teacher's tail mass at peak).
         pair_divergence: which direction each pair is scored with. Both vanish
             exactly at ``p~ == q~`` and agree to first order around it, so this only
             changes how large disagreements are treated.
@@ -227,6 +250,10 @@ def compute_l_apd_token_loss(
         raise ValueError(
             f"Unknown l_apd.pair_divergence: {pair_divergence}. Expected one of {list(_PAIR_DIVERGENCES)}."
         )
+    if weight_source not in _WEIGHT_SOURCES:
+        raise ValueError(
+            f"Unknown l_apd.weight_source: {weight_source}. Expected one of {list(_WEIGHT_SOURCES)}."
+        )
 
     student_anchor = student_anchor_log_probs.float()
     student_candidates = student_candidate_log_probs.float()
@@ -235,10 +262,20 @@ def compute_l_apd_token_loss(
 
     valid = candidate_mask.bool() & response_mask.unsqueeze(-1).bool()
 
+    # The weighting side. Student log-probs are detached here so the weights are
+    # per-step constants: they set how loudly each duel is scored, never a second
+    # gradient path.
+    if weight_source == "student":
+        weight_anchor = student_anchor.detach()
+        weight_candidates = student_candidates.detach()
+    else:
+        weight_anchor = teacher_anchor
+        weight_candidates = teacher_candidates
+
     # Star-shaped pairwise problem centered on the anchor token.
     pair_logits = student_anchor.unsqueeze(-1) - student_candidates
     teacher_margins = teacher_anchor.unsqueeze(-1) - teacher_candidates
-    raw_weights = torch.exp(teacher_candidates) * valid
+    raw_weights = torch.exp(weight_candidates) * valid
 
     if tail_candidate:
         neg_inf = torch.finfo(torch.float32).min
@@ -252,17 +289,19 @@ def compute_l_apd_token_loss(
         student_tail = _log1mexp(covered_student_mass)
         teacher_tail = _log1mexp(torch.logsumexp(covered_teacher, dim=-1))
 
+        weight_tail = student_tail.detach() if weight_source == "student" else teacher_tail
+
         pair_logits = torch.cat([pair_logits, (student_anchor - student_tail).unsqueeze(-1)], dim=-1)
         teacher_margins = torch.cat([teacher_margins, (teacher_anchor - teacher_tail).unsqueeze(-1)], dim=-1)
         raw_weights = torch.cat(
-            [raw_weights, torch.exp(teacher_tail).unsqueeze(-1) * response_mask.unsqueeze(-1)], dim=-1
+            [raw_weights, torch.exp(weight_tail).unsqueeze(-1) * response_mask.unsqueeze(-1)], dim=-1
         )
     elif complement_candidate:
         # The coarsest opponent: everything except the anchor, aggregated. Its margin
         # log(p(y) / (1 - p(y))) makes the restricted pair probabilities exactly p(y) and
         # q(y), so this pair is the anchor term -- KL between (p(y), 1 - p(y)) and
         # (q(y), 1 - q(y)) -- in the same form as every other candidate, and weighted by
-        # q(y) like every other candidate.
+        # the weighting side's anchor mass like every other candidate.
         student_complement = _log1mexp(student_anchor)
         teacher_complement = _log1mexp(teacher_anchor)
 
@@ -271,7 +310,7 @@ def compute_l_apd_token_loss(
             [teacher_margins, (teacher_anchor - teacher_complement).unsqueeze(-1)], dim=-1
         )
         raw_weights = torch.cat(
-            [raw_weights, torch.exp(teacher_anchor).unsqueeze(-1) * response_mask.unsqueeze(-1)], dim=-1
+            [raw_weights, torch.exp(weight_anchor).unsqueeze(-1) * response_mask.unsqueeze(-1)], dim=-1
         )
 
     teacher_pair_prob = torch.sigmoid(teacher_margins)
@@ -279,7 +318,7 @@ def compute_l_apd_token_loss(
     if normalize_weights:
         normalizer = raw_weights.sum(dim=-1, keepdim=True)
     else:
-        normalizer = (1.0 - torch.exp(teacher_anchor)).unsqueeze(-1)
+        normalizer = (1.0 - torch.exp(weight_anchor)).unsqueeze(-1)
     weights = (raw_weights / normalizer.clamp(min=eps)).detach()
 
     if pair_divergence == "reverse_kl":
@@ -314,7 +353,7 @@ def compute_l_apd_token_loss(
             "student_anchor_prob": torch.exp(student_anchor),
             "anchor_in_candidates": 1.0 - candidate_mask.float().prod(dim=-1),
             "candidate_count": valid.float().sum(dim=-1),
-            # Teacher mass covered by the candidate set: 1 when the tail is modelled.
+            # Weighting-side mass covered by the candidate set: 1 when normalized.
             "candidate_weight_sum": weights.sum(dim=-1),
         }
         if tail_candidate:
