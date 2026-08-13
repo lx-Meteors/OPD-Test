@@ -64,7 +64,7 @@ export L_APD_WEIGHT_SOURCE="${L_APD_WEIGHT_SOURCE:-student}"
 # actor/entropy from 0.66 to 0.04 while actor/l_apd_anchor_kl grew tenfold.
 export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-jeffreys}"
 
-run_opd "l-apd-r1-1p5b-justrl-1p5b-src_" \
+run_opd "l-apd-r1-1p5b-justrl-1p5b-src_${L_APD_CANDIDATE_SOURCE}-w_${L_APD_WEIGHT_SOURCE}-tail_${L_APD_TAIL_CANDIDATE}-cmpl_${L_APD_COMPLEMENT_CANDIDATE}-div_${L_APD_PAIR_DIVERGENCE}" \
     "actor_rollout_ref.actor.l_apd.enable=True" \
     "actor_rollout_ref.actor.l_apd.candidate_source=${L_APD_CANDIDATE_SOURCE}" \
     "actor_rollout_ref.actor.l_apd.tail_candidate=${L_APD_TAIL_CANDIDATE}" \
