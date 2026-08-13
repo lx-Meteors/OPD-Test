@@ -27,6 +27,10 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
+from verl.trainer.ppo.attention_distill import (
+    compute_full_attention_rkl_token_loss,
+    forward_with_last_attention_qk,
+)
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
@@ -72,6 +76,13 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
+        self.attention_distill_config = self.config.get("attention_distill", {})
+        self.use_attention_distill = self.attention_distill_config.get("enable", False)
+        if self.use_attention_distill and self.use_ulysses_sp:
+            raise ValueError("Full attention distillation currently requires ulysses_sequence_parallel_size=1")
+        if torch.distributed.get_rank() == 0:
+            print(f"{role} attention_distill={self.use_attention_distill}")
+
         if self.config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
         else:
@@ -85,8 +96,14 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        top_k=0,
+        student_top_k_ids=None,
+        return_attention_qk=False,
+    ):
         """
         Returns:
             entropy: # (bs, response_len)
@@ -109,6 +126,7 @@ class DataParallelPPOActor(BasePPOActor):
             entropy = None
             topk_ids = None
             topk_log_probs = None
+            attention_qk = None
             
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -173,14 +191,18 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
+                forward_kwargs = {
+                    "input_ids": input_ids_rmpad,
+                    "attention_mask": None,
+                    "position_ids": position_ids_rmpad,
                     **multi_modal_inputs,
-                    use_cache=False,
+                    "use_cache": False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                }
+                if return_attention_qk:
+                    output, attention_qk = forward_with_last_attention_qk(self.actor_module, **forward_kwargs)
+                else:
+                    output = self.actor_module(**forward_kwargs)
                 
                 need_logits = top_k > 0
 
@@ -344,14 +366,18 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
                     **multi_modal_inputs,
-                    use_cache=False,
+                    "use_cache": False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                }
+                if return_attention_qk:
+                    output, attention_qk = forward_with_last_attention_qk(self.actor_module, **forward_kwargs)
+                else:
+                    output = self.actor_module(**forward_kwargs)
                 
                 need_logits = top_k > 0
                 if self.use_fused_kernels and not need_logits:
@@ -393,7 +419,51 @@ class DataParallelPPOActor(BasePPOActor):
                         # Use pre-computed log_probs_all (always available when need_topk=True)
                         topk_log_probs = log_probs_all.gather(dim=-1, index=topk_ids)
 
-            return entropy, log_probs, topk_ids, topk_log_probs
+            result = (entropy, log_probs, topk_ids, topk_log_probs)
+            if return_attention_qk:
+                return (*result, attention_qk)
+            return result
+
+    def _forward_teacher_attention_qk(self, micro_batch, teacher_module, teacher_use_remove_padding):
+        """Capture teacher last-layer Q/K using the actor micro-batch tokenization."""
+
+        if "multi_modal_inputs" in micro_batch:
+            raise NotImplementedError("Attention distillation currently supports text-only Qwen2 models")
+
+        input_ids = micro_batch["input_ids"]
+        attention_mask = micro_batch["attention_mask"]
+        position_ids = micro_batch["position_ids"]
+        if position_ids.dim() != 2:
+            raise NotImplementedError("Attention distillation currently supports one-dimensional position IDs only")
+
+        with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            if teacher_use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                ).transpose(0, 1)
+                forward_kwargs = {
+                    "input_ids": input_ids_rmpad,
+                    "attention_mask": None,
+                    "position_ids": position_ids_rmpad,
+                    "use_cache": False,
+                    "logits_to_keep": 1,
+                }
+            else:
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "use_cache": False,
+                    "logits_to_keep": 1,
+                }
+
+            output, attention_qk = forward_with_last_attention_qk(
+                teacher_module, detach=True, **forward_kwargs
+            )
+            del output
+        return attention_qk
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_probs_for_ids(self, data: DataProto) -> torch.Tensor:
@@ -744,9 +814,17 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys, topk_ids_tensor, topk_log_probs_tensor
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy(self, data: DataProto):
+    def update_policy(
+        self,
+        data: DataProto,
+        attention_teacher_module: nn.Module | None = None,
+        attention_teacher_use_remove_padding: bool = False,
+    ):
         # make sure we are in training mode
         self.actor_module.train()
+
+        if self.use_attention_distill and attention_teacher_module is None:
+            raise ValueError("attention_distill.enable=True requires a colocated teacher module")
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
@@ -825,6 +903,15 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
+                    teacher_attention_qk = None
+                    if self.use_attention_distill:
+                        attention_teacher_module.eval()
+                        teacher_attention_qk = self._forward_teacher_attention_qk(
+                            model_inputs,
+                            teacher_module=attention_teacher_module,
+                            teacher_use_remove_padding=attention_teacher_use_remove_padding,
+                        )
+
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
@@ -849,17 +936,25 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        forward_result = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                            top_k=top_k, student_top_k_ids=student_top_k_ids
+                            top_k=top_k, student_top_k_ids=student_top_k_ids,
+                            return_attention_qk=self.use_attention_distill,
                         )
+                        entropy, _, _, topk_log_probs = forward_result[:4]
                         log_prob_for_loss = topk_log_probs
                         
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        forward_result = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            return_attention_qk=self.use_attention_distill,
                         )
+                        entropy, log_prob, *_ = forward_result[:4]
                         log_prob_for_loss = log_prob
+
+                    student_attention_qk = forward_result[4] if self.use_attention_distill else None
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
@@ -917,6 +1012,34 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    opd_pg_loss = pg_loss
+                    if self.use_attention_distill:
+                        attention_loss_mat = compute_full_attention_rkl_token_loss(
+                            student=student_attention_qk,
+                            teacher=teacher_attention_qk,
+                            attention_mask=model_inputs["attention_mask"],
+                            response_mask=response_mask,
+                            query_chunk_size=self.attention_distill_config["query_chunk_size"],
+                        )
+                        attention_distill_loss = agg_loss(
+                            loss_mat=attention_loss_mat,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        attention_distill_coef = self.attention_distill_config["loss_coef"]
+                        pg_loss = opd_pg_loss + attention_distill_coef * attention_distill_loss
+                        micro_batch_metrics["actor/opd_pg_loss"] = (
+                            opd_pg_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/attention_distill_loss"] = (
+                            attention_distill_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/attention_distill_weighted_loss"] = (
+                            attention_distill_coef * attention_distill_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/attention_distill_coef"] = attention_distill_coef
+                        micro_batch_metrics["actor/attention_distill_query_count"] = response_mask.sum().item()
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

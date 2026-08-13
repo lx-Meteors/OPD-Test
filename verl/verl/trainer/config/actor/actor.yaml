@@ -65,6 +65,24 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+# Full last-layer attention distillation configuration
+attention_distill:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.AttentionDistillConfig
+
+  # Whether to add full attention reverse-KL to the actor objective
+  enable: false
+
+  # Multiplier applied to the attention distillation loss
+  loss_coef: 0.05
+
+  # Number of response queries evaluated together; all response queries are still used
+  query_chunk_size: 32
+
+  # Direction of KL: KL(student attention || teacher attention)
+  divergence: reverse_kl
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

@@ -25,7 +25,7 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "AttentionDistillConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
 
 
 @dataclass
@@ -49,6 +49,29 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+
+
+@dataclass
+class AttentionDistillConfig(BaseConfig):
+    """Configuration for full last-layer attention distillation.
+
+    The loss compares the head-averaged student and teacher attention distributions
+    with reverse KL. Only valid response tokens are used as queries; prompt tokens
+    remain available as keys.
+    """
+
+    enable: bool = False
+    loss_coef: float = 0.05
+    query_chunk_size: int = 32
+    divergence: str = "reverse_kl"
+
+    def __post_init__(self):
+        if self.loss_coef < 0:
+            raise ValueError("attention_distill.loss_coef must be non-negative")
+        if self.query_chunk_size <= 0:
+            raise ValueError("attention_distill.query_chunk_size must be positive")
+        if self.divergence != "reverse_kl":
+            raise ValueError("attention_distill currently supports only divergence='reverse_kl'")
 
 
 @dataclass
@@ -103,6 +126,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    attention_distill: AttentionDistillConfig = field(default_factory=AttentionDistillConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0

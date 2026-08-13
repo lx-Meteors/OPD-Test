@@ -780,6 +780,11 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
                         *init_args_dict[key].get("args", ()), **init_args_dict[key].get("kwargs", {})
                     )
 
+            # Match FusedWorker behavior: allow an inner worker to access another
+            # colocated worker (for example, actor-side teacher feature distillation).
+            for worker in self.worker_dict.values():
+                setattr(worker, Worker.fused_worker_attr_name, self.worker_dict)
+
     # now monkey-patch the methods from inner class to WorkerDict
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
