@@ -27,7 +27,7 @@ cd /input0/yyy/Prune-OPD
 DRY_RUN=1 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 正式启动，默认就是方法本身（jeffreys 对称成对 KL + student 加权 + 尾部块）
+# 正式启动，默认就是方法本身（jeffreys 对称成对 KL + student 候选/加权 + 尾部块）
 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
@@ -59,11 +59,12 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 记 $p_t$、$q_t$ 为 student / teacher 在位置 $t$ 的分布，$S$、$T$ 为对应的 logit，$\sigma$ 为
 sigmoid。
 
-每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$。具名候选取 **teacher top-$K$**
-（剔除 $y_t$ 自己），没被具名的其余全部 token 打包成一个**尾部块** $\tau_t$：
+每个 response 位置 $t$，锚点是 student 自己采样出的 token $y_t$。具名候选取 **student top-$K$**
+（剔除 $y_t$ 自己；与 baseline OPD 的 `only_stu` 打分共用同一组 token，见 §1.1），没被具名的
+其余全部 token 打包成一个**尾部块** $\tau_t$：
 
 $$
-\mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{teacher top-}K \;:\; z \neq y_t \,\bigr\rbrace,
+\mathcal{V}_t \;=\; \bigl\lbrace\, z \in \text{student top-}K \;:\; z \neq y_t \,\bigr\rbrace,
 \qquad
 \tau_t \;=\; \mathcal{V} \setminus \bigl(\lbrace y_t\rbrace \cup \mathcal{V}_t\bigr),
 \qquad K = 16.
@@ -213,20 +214,25 @@ loss 在给一个大体已满足的校准约束反复付费，排序监督被稀
 
 这是两个独立的开关，分工明确：**id 决定谁有名字，权重决定谁有音量**。
 
-默认候选取 **teacher top-$k$**（`candidate_source=teacher`）。用 student 自己的 top-$k$
-（baseline 的 `top_k_strategy=only_stu` 打分的那一组，`candidate_source=student` 可切回做对照）
-有一个结构性盲区：锚点 99.4% 落在 student top-$k$ 内，于是每个对手都是 student 本来就排得
-靠前的 token，loss 只能在 student 已偏好的集合内重排，**永远看不到 teacher 想要、但被 student
-排出 top-$k$ 之外的 token**——一条 run 里 `pairwise_agreement` 从 step 140 起停在 0.95 不再
-上升就是这个原因。teacher top-$k$ 携带着约 1.5% 落在 student top-$k$ 之外的 teacher 质量，
-正是双方仍有分歧的地方。
+默认候选取 **student top-$k$**（`candidate_source=student`）——与 baseline OPD 的
+`top_k_strategy=only_stu` 打分**共用同一组 token**，于是两条 run 的信息入口完全一致，
+对比只剩 loss 形式本身这一个差别。teacher top-$k$ 保留为消融（`candidate_source=teacher`），
+它会额外具名约 0.4% 落在 student top-$k$ 之外的 teacher 独有质量。
 
-权重则取 **student 条件质量**（`weight_source=student`，§1 的定义）。两个来源搭配后，两类
-关键 token 都被正确处理：student 的坏爱好（$p$ 大 $q\approx 0$，不在 teacher top-$k$ 里）落进
-student 视角质量很大的尾部块，权重自动放大、被 teacher margin 重锤；teacher 的心头好（$q$ 大
-$p\approx 0$）有自己的具名列，指名道姓地拉升——起步权重小，但 $p(o)$ 一涨权重自动跟上。
-把 id 也换成 student 会毁掉后者（好 token 被聚合进尾部、信息销毁），把权重换回 teacher
-则是开环消融（§1、§10）。
+曾经担心的"结构性盲区"（teacher 想要、但被 student 排出 top-$k$ 的 token 得不到具名对决）
+经离线复核**并不成立**，两个机制补上了它：其一，softmax 耦合——压下被具名的错爱 token、
+修锚点时，归一化子自动把质量还给包括被丢弃 token 在内的所有人；其二，候选集**每次 rollout
+自适应刷新**——被丢弃 token 一旦被尾部对决和耦合抬回 top-$k$，立刻获得具名对决。真实轨迹
+上的两项离线测量：step-0 梯度场与 teacher 候选几乎逐位置相同（对金标准余弦中位数 0.983 vs
+0.984），150 步 logit 空间梯度流两者全指标差距在 1% 量级（student 候选在真 KL 与救援恢复上
+还略优）。历史上归罪于 student 候选的那次 agreement 卡 0.95，实测发生在已退役的两项式
+补集形式下，与候选来源混杂，不能作数。
+
+权重则取 **student 条件质量**（`weight_source=student`，§1 的定义）。候选与权重同源后，
+对决故事完全闭环：挑战者从 student 自己此刻愿意给质量的备选里抽出，音量也按 student 的
+质量分配——student 的坏爱好（$p$ 大 $q\approx 0$）拿到具名对决和大权重、被 teacher margin
+重锤；teacher 的心头好（$q$ 大 $p\approx 0$）先由尾部块整体拉升、进入 top-$k$ 后自动获得
+具名对决。把权重换回 teacher 是开环消融（§1、§10）。
 
 ### 1.2 为什么必须有一个聚合对手
 
@@ -543,7 +549,7 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | 环境变量 | Hydra key | 默认 | 含义 |
 | --- | --- | --- | --- |
 | — | `actor_rollout_ref.actor.l_apd.enable` | 脚本内置 `True` | 用 L-APD 替换 policy-gradient 目标 |
-| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `teacher` | 候选来源：teacher top-k（方法本身，§1.1）或 student top-k（对照） |
+| `L_APD_CANDIDATE_SOURCE` | `...l_apd.candidate_source` | `student` | 候选来源：student top-k（方法本身，与 baseline `only_stu` 同信息入口，§1.1）或 teacher top-k（消融，额外具名 ~0.4% teacher 独有质量） |
 | `L_APD_TAIL_CANDIDATE` | `...l_apd.tail_candidate` | `True` | 聚合对手取尾部块"top-k 之外"，对手集合成为真划分（方法本身，§1.2），优先级高于补集 |
 | `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `False` | 聚合对手取"`y_t` 的补集"（历史两项式，重复计数，消融），见 §1.2 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化；tail 模式下与除以加权侧的 `1 − 锚点质量` 浮点等价 |
@@ -567,8 +573,8 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 L_APD_TAIL_CANDIDATE=False L_APD_COMPLEMENT_CANDIDATE=True MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 候选改用 student top-16（锚点 99.4% 在内，看不到被 student 丢掉的 token）
-L_APD_CANDIDATE_SOURCE=student MODEL_ROOT=/input0/models \
+# 候选改用 teacher top-16（消融：直接具名 ~0.4% 的 teacher 独有质量，信息入口多于 baseline）
+L_APD_CANDIDATE_SOURCE=teacher MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
 # 权重换回 teacher 条件质量（开环消融：预算按 teacher 偏好定死，不看 student 的错在哪）
@@ -666,10 +672,11 @@ student 加权确实是库默认、权重逐元素等于 $\mathrm{sg}[p(o)/(1-p(
   否则蒸馏到的只是措辞偏好。`VAL_BEFORE_TRAIN=True` 会给出 student 的 step 0 基线。
 - **L-APD 不读 reward**。框架仍会计算 rm_scores / advantage 用于诊断与对照，但 L-APD 的
   梯度完全不经过它们（`update_policy` 在 L-APD 分支下根本不会取 `advantages`）。
-- **`TOP_K_STRATEGY` 不影响 L-APD 的候选集**。teacher top-k 的 id 与 log-prob 在任何
-  strategy 下都会被计算并传下来，L-APD 直接读 `teacher_top_k_ids` / `teacher_top_k_log_probs`
-  与锚点上的 `teacher_log_probs`；该变量只影响 OPD 侧的 reward 构造。候选数由
-  `LOG_PROB_TOP_K` 决定。
+- **`TOP_K_STRATEGY` 不影响 L-APD 的候选集**。L-APD 按 `candidate_source` 取数：`student`
+  （默认）读 `student_top_k_ids` / `teacher_on_student_log_probs`——与 `only_stu` reward
+  用的同一组张量；`teacher`（消融）读 `teacher_top_k_ids` / `teacher_top_k_log_probs`。
+  两组张量加锚点上的 `teacher_log_probs` 在默认管线（`only_stu`）下都会被计算并传下来；
+  `TOP_K_STRATEGY` 本身只影响 OPD 侧的 reward 构造。候选数由 `LOG_PROB_TOP_K` 决定。
 - **两个聚合对手全关掉时权重归一化会撞 eps 下限**。权重按 `raw / max(Σ raw, 1e-6)` 归一化，
   只有真实 token 对手时，加权侧在采样 token 上几乎确定（锚点质量 $> 1 - 10^{-6}$）的位置竞争者
   总质量小于 `1e-6`，下限生效、权重被压到 0、梯度丢失（teacher 加权下实测
@@ -718,6 +725,13 @@ student 加权确实是库默认、权重逐元素等于 $\mathrm{sg}[p(o)/(1-p(
   下结论排序一致。
 - 单元测试 41/41，新增：`jeffreys` 逐元素等于双向 Bernoulli KL 之和、$p=q$ 零点零梯度、
   丢弃 token 去门控 >10 倍、是库默认；$K=0$ 退化测试同时锁对称与单向两个形式。
+- **候选来源默认 `teacher` → `student`**（§1.1）：与 baseline OPD 的 `only_stu` 打分共用
+  同一组 token，信息入口对齐后对比只剩 loss 形式一个差别。离线复核显示旧的"结构性盲区"
+  论证不成立——softmax 耦合会把质量还给未具名 token、候选集逐 rollout 自适应刷新会把
+  抬起来的 token 及时具名：step-0 梯度场两来源对金标准余弦逐位置几乎相同，150 步 logit
+  空间梯度流全指标差距 1% 量级（student 候选在真 KL 与救援恢复上略优）。历史上归罪于
+  student 候选的 agreement 停滞实测发生在已退役的两项式补集形式下，证据混杂。teacher
+  候选保留为消融。
 
 ### 2026-08-12：权重来源改为 student 条件质量
 

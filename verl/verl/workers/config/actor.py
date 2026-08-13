@@ -41,8 +41,13 @@ class LAPDConfig(BaseConfig):
 
     Args:
         enable (bool): Whether to train with the L-APD loss instead of the policy-gradient surrogate.
-        candidate_source (str): Where competitor tokens come from. 'teacher' uses the teacher top-k
-            (the main method), 'student' uses the student top-k.
+        candidate_source (str): Where competitor tokens come from. 'student' (default) duels the
+            student's own top-k -- the same information entry as the OPD baseline's only_stu
+            scoring, so the two runs differ purely in the loss form. Offline replay measured the
+            two sources within ~1% of each other on true-KL descent and rescue rate: the softmax
+            normalizer moves un-named tokens too, and the per-rollout refresh names a dropped
+            token as soon as the tail duel raises it. 'teacher' names ~0.4% extra teacher-only
+            mass directly, kept as an ablation.
         tail_candidate (bool): Add one aggregated candidate for the probability mass outside the
             candidate set, so the opponents form a genuine partition of the non-anchor vocabulary
             and every non-anchor token takes part in exactly one pair. The default.
@@ -78,7 +83,7 @@ class LAPDConfig(BaseConfig):
     """
 
     enable: bool = False
-    candidate_source: str = "teacher"
+    candidate_source: str = "student"
     tail_candidate: bool = True
     complement_candidate: bool = False
     normalize_weights: bool = True

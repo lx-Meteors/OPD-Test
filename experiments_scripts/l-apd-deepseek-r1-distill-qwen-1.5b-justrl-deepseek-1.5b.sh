@@ -21,14 +21,17 @@ export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
 export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parquet\",\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/HMMT24/test.parquet\",\"${DATA_ROOT}/test_data/HMMT25/test.parquet\"]}"
 
-# Competitor tokens. Scoring against the student's own top-k puts the anchor
-# inside the candidate set 99.4% of the time, so every competitor is a token the
-# student already ranks highly: the loss can only reorder the set the student
-# already prefers, and never sees a token the teacher wants but the student has
-# dropped past rank k. Pairwise agreement stalled at 0.95 from step 140 that way.
-# The teacher top-k instead carries the ~1.5% of teacher mass sitting outside the
-# student top-k, which is where the teacher still disagrees.
-export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-teacher}"
+# Competitor tokens. student (default) duels the student's own top-k -- the same
+# information entry as the OPD baseline's only_stu scoring, so the two runs differ
+# purely in the loss form. Offline replay (real trajectories, logit-space descent
+# with exact softmax coupling) put the two sources within ~1% of each other on
+# true-KL descent and rescue rate: un-named tokens still move through the softmax
+# normalizer, and the per-rollout refresh names a dropped token as soon as the
+# tail duel raises it into the top-k. teacher names ~0.4% extra teacher-only mass
+# directly and is kept as an ablation. (The old stall attributed to student
+# sourcing was measured under the retired two-part complement form and is
+# confounded with it.)
+export L_APD_CANDIDATE_SOURCE="${L_APD_CANDIDATE_SOURCE:-student}"
 # Aggregate opponent. The tail block turns the opponents into a true partition of
 # the non-anchor vocabulary: every non-anchor token appears in the loss exactly
 # once, either as a named candidate or inside the tail. The complement opponent

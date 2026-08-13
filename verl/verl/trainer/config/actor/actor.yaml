@@ -75,8 +75,12 @@ l_apd:
   # Needs a teacher (reward_model.enable=True) sharing the student vocabulary and rollout.log_prob_top_k > 0
   enable: false
 
-  # Source of the competitor tokens: teacher (main method) or student
-  candidate_source: teacher
+  # Source of the competitor tokens. student (default) duels the student's own top-k -- the same
+  # information entry as the OPD baseline's only_stu scoring, so the comparison differs purely in
+  # the loss form; offline replay put the two sources within ~1% of each other (the softmax
+  # normalizer moves un-named tokens, and per-rollout refresh names a dropped token as soon as the
+  # tail duel raises it). teacher names ~0.4% extra teacher-only mass directly, kept as an ablation
+  candidate_source: student
 
   # Add one aggregated candidate carrying the probability mass outside the candidate set, making
   # the opponents a true partition of the non-anchor vocabulary: every non-anchor token appears in
