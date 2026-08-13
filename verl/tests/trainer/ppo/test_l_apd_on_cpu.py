@@ -380,7 +380,7 @@ def test_weights_including_the_complement_sum_to_one():
     )
 
 
-def test_reverse_kl_is_the_default_direction():
+def test_jeffreys_is_the_default_divergence():
     vocab, k = 32, 8
     student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=23)
     candidate_ids = _candidates_from_teacher(teacher_logits, k)
@@ -391,7 +391,7 @@ def test_reverse_kl_is_the_default_direction():
         anchors,
         response_mask,
         candidate_ids,
-        pair_divergence="reverse_kl",
+        pair_divergence="jeffreys",
         weight_source="student",
     )
     student_log_probs = torch.log_softmax(student_logits, dim=-1)
@@ -729,7 +729,7 @@ def test_student_weighting_is_the_default():
         anchors,
         response_mask,
         candidate_ids,
-        pair_divergence="reverse_kl",
+        pair_divergence="jeffreys",
         weight_source="student",
     )
     teacher_weighted, _ = _call_loss(
@@ -738,7 +738,7 @@ def test_student_weighting_is_the_default():
         anchors,
         response_mask,
         candidate_ids,
-        pair_divergence="reverse_kl",
+        pair_divergence="jeffreys",
         weight_source="teacher",
     )
 
@@ -823,7 +823,12 @@ def test_student_weights_are_stop_gradient():
 
 
 def test_k0_reduces_to_anchor_bernoulli_kl_under_both_weightings():
-    """With zero token candidates the tail duel is the anchor calibration term."""
+    """With zero token candidates the tail duel is the anchor calibration term.
+
+    Under the default (jeffreys) that term is the symmetrized anchor Bernoulli KL,
+    whose closed form is (p - q) times the logit gap; pinning reverse_kl recovers
+    the one-direction anchor KL.
+    """
     bs, seq_len = 2, 3
     generator = torch.Generator().manual_seed(73)
     student_anchor = torch.log(torch.rand(bs, seq_len, generator=generator) * 0.8 + 0.1)
@@ -831,9 +836,10 @@ def test_k0_reduces_to_anchor_bernoulli_kl_under_both_weightings():
     response_mask = torch.ones(bs, seq_len)
 
     p, q = student_anchor.exp(), teacher_anchor.exp()
-    bernoulli = p * (p / q).log() + (1 - p) * ((1 - p) / (1 - q)).log()
+    reverse_bernoulli = p * (p / q).log() + (1 - p) * ((1 - p) / (1 - q)).log()
+    jeffreys_bernoulli = (p - q) * ((p / (1 - p)).log() - (q / (1 - q)).log())
 
-    for weight_source in ("student", "teacher"):
+    def k0_loss(**kwargs):
         token_loss, _ = compute_l_apd_token_loss(
             student_anchor_log_probs=student_anchor,
             student_candidate_log_probs=torch.zeros(bs, seq_len, 0),
@@ -841,9 +847,20 @@ def test_k0_reduces_to_anchor_bernoulli_kl_under_both_weightings():
             teacher_candidate_log_probs=torch.zeros(bs, seq_len, 0),
             candidate_mask=torch.zeros(bs, seq_len, 0, dtype=torch.bool),
             response_mask=response_mask,
-            weight_source=weight_source,
+            **kwargs,
         )
-        torch.testing.assert_close(token_loss, bernoulli, atol=1e-5, rtol=1e-4)
+        return token_loss
+
+    for weight_source in ("student", "teacher"):
+        torch.testing.assert_close(
+            k0_loss(weight_source=weight_source), jeffreys_bernoulli, atol=1e-5, rtol=1e-4
+        )
+        torch.testing.assert_close(
+            k0_loss(weight_source=weight_source, pair_divergence="reverse_kl"),
+            reverse_bernoulli,
+            atol=1e-5,
+            rtol=1e-4,
+        )
 
 
 def test_unknown_weight_source_is_rejected():
@@ -874,6 +891,565 @@ def test_unknown_pair_divergence_is_rejected():
         assert "pair_divergence" in str(error)
     else:
         raise AssertionError("an unknown pair_divergence should raise")
+
+
+def _reference_partition_kl(student_logits, teacher_logits, anchors, candidate_ids, response_mask):
+    """Brute-force coarse KL over the partition {anchor} + valid candidates + tail."""
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    bs, seq_len, _ = student_logits.shape
+
+    token_loss = torch.zeros(bs, seq_len, dtype=torch.float64)
+    for b in range(bs):
+        for t in range(seq_len):
+            if response_mask[b, t] == 0:
+                continue
+            y = int(anchors[b, t])
+            named = {int(z) for z in candidate_ids[b, t] if int(z) != y}
+            p_cells = [student_log_probs[b, t, y].exp()]
+            q_cells = [teacher_log_probs[b, t, y].exp()]
+            for z in sorted(named):
+                p_cells.append(student_log_probs[b, t, z].exp())
+                q_cells.append(teacher_log_probs[b, t, z].exp())
+            p_cells.append(1.0 - sum(p_cells))
+            q_cells.append(1.0 - sum(q_cells))
+            total = 0.0
+            for p_c, q_c in zip(p_cells, q_cells):
+                total = total + p_c * (torch.log(p_c) - torch.log(q_c))
+            token_loss[b, t] = total
+    return token_loss
+
+
+def test_partition_kl_matches_coarse_kl_definition():
+    """partition_kl is the categorical KL between the two coarsened distributions."""
+    vocab, k = 12, 5
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=11)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, diagnostics = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="partition_kl",
+        weight_source="student",
+    )
+    expected = _reference_partition_kl(student_logits, teacher_logits, anchors, candidate_ids, response_mask)
+
+    torch.testing.assert_close(token_loss.double(), expected, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(diagnostics["partition_kl"].double(), expected, atol=1e-5, rtol=1e-4)
+
+
+def test_partition_kl_gradient_is_cell_delta_minus_loss():
+    """Autograd matches the analytic gradient p(v) * (Delta_cell(v) - L_t) per logit."""
+    vocab, k = 10, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=17)
+    student_logits = student_logits.clone().requires_grad_(True)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="partition_kl",
+    )
+    token_loss.sum().backward()
+
+    student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    bs, seq_len, _ = student_logits.shape
+    for b in range(bs):
+        for t in range(seq_len):
+            if response_mask[b, t] == 0:
+                torch.testing.assert_close(
+                    student_logits.grad[b, t], torch.zeros(vocab, dtype=torch.float64)
+                )
+                continue
+            y = int(anchors[b, t])
+            named = {int(z) for z in candidate_ids[b, t] if int(z) != y}
+            tail = [v for v in range(vocab) if v != y and v not in named]
+            p_tail = student_log_probs[b, t, tail].exp().sum()
+            q_tail = teacher_log_probs[b, t, tail].exp().sum()
+            delta_tail = p_tail.log() - q_tail.log()
+
+            loss_t = float(token_loss[b, t])
+            for v in range(vocab):
+                p_v = student_log_probs[b, t, v].exp()
+                if v == y or v in named:
+                    delta = student_log_probs[b, t, v] - teacher_log_probs[b, t, v]
+                else:
+                    delta = delta_tail
+                expected = p_v * (delta - loss_t)
+                torch.testing.assert_close(
+                    student_logits.grad[b, t, v].double(), expected.double(), atol=1e-4, rtol=1e-3
+                )
+
+
+def test_partition_kl_k0_reduces_to_anchor_bernoulli_kl():
+    """With zero token candidates the partition is {y, tail}: the anchor Bernoulli KL."""
+    bs, seq_len = 2, 3
+    generator = torch.Generator().manual_seed(29)
+    student_anchor = torch.log(torch.rand(bs, seq_len, generator=generator) * 0.8 + 0.1)
+    teacher_anchor = torch.log(torch.rand(bs, seq_len, generator=generator) * 0.8 + 0.1)
+    response_mask = torch.ones(bs, seq_len)
+
+    p, q = student_anchor.exp(), teacher_anchor.exp()
+    bernoulli = p * (p / q).log() + (1 - p) * ((1 - p) / (1 - q)).log()
+
+    token_loss, _ = compute_l_apd_token_loss(
+        student_anchor_log_probs=student_anchor,
+        student_candidate_log_probs=torch.zeros(bs, seq_len, 0),
+        teacher_anchor_log_probs=teacher_anchor,
+        teacher_candidate_log_probs=torch.zeros(bs, seq_len, 0),
+        candidate_mask=torch.zeros(bs, seq_len, 0, dtype=torch.bool),
+        response_mask=response_mask,
+        pair_divergence="partition_kl",
+    )
+    torch.testing.assert_close(token_loss, bernoulli, atol=1e-5, rtol=1e-4)
+
+
+def test_partition_kl_is_zero_with_zero_gradient_at_p_equals_q():
+    """The fixed point is p = q: loss and gradient both vanish there."""
+    vocab, k = 12, 5
+    student_logits, _, anchors, response_mask = _make_batch(vocab=vocab, seed=31)
+    student_logits = student_logits.clone().requires_grad_(True)
+    teacher_logits = student_logits.detach().clone()
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="partition_kl",
+    )
+    assert token_loss.abs().max() < 1e-6
+    token_loss.sum().backward()
+    assert student_logits.grad.abs().max() < 1e-5
+
+
+def test_partition_kl_ungates_the_dropped_teacher_token():
+    """The teacher-wanted token the student dropped escapes the pairwise double gate.
+
+    Scenario: student holds p(y) ~ 0.7 on its anchor and has demoted the token the
+    teacher actually wants to p ~ 0.002. In the pairwise form that duel receives
+    weight p(o) AND the sigmoid'(m) gate, so its gradient is exponentially dead.
+    The partition form keeps a single mass factor p(o), which is ~two orders of
+    magnitude more. The anchor's own corrective gradient also grows, but only
+    moderately: the p(1-p) mass factor is intrinsic to the reverse direction and
+    stays in both forms.
+    """
+    vocab = 8
+    bs, seq_len = 1, 1
+    # Log-prob-shaped logits: p = (0.7, 0.002, 0.0497 x 6), q = (0.1, 0.5, 0.0667 x 6).
+    student_logits = torch.full((bs, seq_len, vocab), math.log(0.0497), dtype=torch.float64)
+    student_logits[0, 0, 0] = math.log(0.7)
+    student_logits[0, 0, 1] = math.log(0.002)
+    teacher_logits = torch.full((bs, seq_len, vocab), math.log(0.0667), dtype=torch.float64)
+    teacher_logits[0, 0, 0] = math.log(0.1)
+    teacher_logits[0, 0, 1] = math.log(0.5)
+    anchors = torch.zeros(bs, seq_len, dtype=torch.long)
+    response_mask = torch.ones(bs, seq_len)
+    # Teacher top-4 contains the anchor (q(y) = 0.1 is rank 2), exercising dedup.
+    candidate_ids = _candidates_from_teacher(teacher_logits, 4)
+
+    grads = {}
+    for divergence in ("partition_kl", "reverse_kl"):
+        logits = student_logits.clone().requires_grad_(True)
+        token_loss, _ = _call_loss(
+            logits,
+            teacher_logits,
+            anchors,
+            response_mask,
+            candidate_ids,
+            tail_candidate=True,
+            pair_divergence=divergence,
+            weight_source="student",
+        )
+        token_loss.sum().backward()
+        grads[divergence] = logits.grad[0, 0].clone()
+
+    dropped_partition = float(grads["partition_kl"][1])
+    dropped_pairwise = float(grads["reverse_kl"][1])
+    # Both want to raise the dropped token (negative gradient) ...
+    assert dropped_partition < 0 and dropped_pairwise < 0, grads
+    # ... but the pairwise double gate suppresses it by ~two orders of magnitude.
+    assert abs(dropped_partition) > 20.0 * abs(dropped_pairwise), (dropped_partition, dropped_pairwise)
+
+    anchor_partition = float(grads["partition_kl"][0])
+    anchor_pairwise = float(grads["reverse_kl"][0])
+    # Both push the wrongly confident anchor down; partition moderately harder.
+    assert anchor_partition > 0 and anchor_pairwise > 0, grads
+    assert anchor_partition > 1.2 * anchor_pairwise, (anchor_partition, anchor_pairwise)
+
+
+def test_partition_kl_requires_tail_candidate():
+    vocab, k = 12, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=37)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    try:
+        _call_loss(
+            student_logits,
+            teacher_logits,
+            anchors,
+            response_mask,
+            candidate_ids,
+            tail_candidate=False,
+            complement_candidate=False,
+            pair_divergence="partition_kl",
+        )
+    except ValueError as error:
+        assert "partition_kl" in str(error)
+    else:
+        raise AssertionError("partition_kl without tail_candidate should raise")
+
+
+def _reference_odds_kl(student_logits, teacher_logits, anchors, candidate_ids, response_mask):
+    """Brute-force sg[p(y)] * sum over duels of GKL(rho || rho_T), tail duel included."""
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    bs, seq_len, _ = student_logits.shape
+
+    token_loss = torch.zeros(bs, seq_len, dtype=torch.float64)
+    for b in range(bs):
+        for t in range(seq_len):
+            if response_mask[b, t] == 0:
+                continue
+            y = int(anchors[b, t])
+            named = {int(z) for z in candidate_ids[b, t] if int(z) != y}
+            p_y = student_log_probs[b, t, y].exp()
+            q_y = teacher_log_probs[b, t, y].exp()
+            duels = []
+            for z in sorted(named):
+                duels.append(
+                    (student_log_probs[b, t, z].exp() / p_y, teacher_log_probs[b, t, z].exp() / q_y)
+                )
+            p_named = sum(student_log_probs[b, t, z].exp() for z in named)
+            q_named = sum(teacher_log_probs[b, t, z].exp() for z in named)
+            duels.append(((1.0 - p_y - p_named) / p_y, (1.0 - q_y - q_named) / q_y))
+            total = 0.0
+            for rho, rho_t in duels:
+                total = total + rho * (torch.log(rho) - torch.log(rho_t)) - rho + rho_t
+            token_loss[b, t] = p_y * total
+    return token_loss
+
+
+def test_odds_kl_matches_duel_definition():
+    """odds_kl is sg[p(y)] times the summed generalized KL between anchored odds."""
+    vocab, k = 12, 5
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=41)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, diagnostics = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="odds_kl",
+        weight_source="student",
+    )
+    expected = _reference_odds_kl(student_logits, teacher_logits, anchors, candidate_ids, response_mask)
+
+    torch.testing.assert_close(token_loss.double(), expected, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(diagnostics["odds_kl"].double(), expected, atol=1e-5, rtol=1e-4)
+    # Every duel is a divergence and sg[p(y)] >= 0, so the loss is nonnegative.
+    assert (token_loss >= -1e-9).all()
+
+
+def test_odds_kl_gradient_is_mass_times_gap():
+    """Logit gradients: anchor sums the duel votes, every other token gets -p(v) * u(duel of v).
+
+    u_c = m_c - m_c^T is the duel gap; named candidates carry their own duel, tail
+    tokens share the tail duel's gap. The input-gradients sum to zero, so the
+    softmax normalizer contributes nothing and the logit gradient equals the
+    log-prob gradient.
+    """
+    vocab, k = 10, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=43)
+    student_logits = student_logits.clone().requires_grad_(True)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="odds_kl",
+    )
+    token_loss.sum().backward()
+
+    student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    bs, seq_len, _ = student_logits.shape
+    for b in range(bs):
+        for t in range(seq_len):
+            if response_mask[b, t] == 0:
+                torch.testing.assert_close(
+                    student_logits.grad[b, t], torch.zeros(vocab, dtype=torch.float64)
+                )
+                continue
+            y = int(anchors[b, t])
+            named = {int(z) for z in candidate_ids[b, t] if int(z) != y}
+            tail = [v for v in range(vocab) if v != y and v not in named]
+            delta = student_log_probs[b, t] - teacher_log_probs[b, t]
+            p_tail = student_log_probs[b, t, tail].exp().sum()
+            q_tail = teacher_log_probs[b, t, tail].exp().sum()
+            delta_tail = p_tail.log() - q_tail.log()
+
+            expected = torch.zeros(vocab, dtype=torch.float64)
+            anchor_grad = 0.0
+            for z in named:
+                u = delta[y] - delta[z]
+                p_z = student_log_probs[b, t, z].exp()
+                expected[z] = -p_z * u
+                anchor_grad = anchor_grad + p_z * u
+            u_tail = delta[y] - delta_tail
+            for v in tail:
+                expected[v] = -student_log_probs[b, t, v].exp() * u_tail
+            anchor_grad = anchor_grad + p_tail * u_tail
+            expected[y] = anchor_grad
+
+            torch.testing.assert_close(student_logits.grad[b, t], expected, atol=1e-6, rtol=1e-5)
+
+
+def test_odds_kl_is_zero_with_zero_gradient_at_p_equals_q():
+    vocab, k = 9, 4
+    student_logits, _, anchors, response_mask = _make_batch(vocab=vocab, seed=47)
+    student_logits = student_logits.clone().requires_grad_(True)
+    teacher_logits = student_logits.detach().clone()
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="odds_kl",
+    )
+    token_loss.sum().backward()
+
+    torch.testing.assert_close(token_loss, torch.zeros_like(token_loss), atol=1e-8, rtol=0)
+    torch.testing.assert_close(
+        student_logits.grad, torch.zeros_like(student_logits.grad), atol=1e-7, rtol=0
+    )
+
+
+def test_odds_kl_ungates_the_dropped_teacher_token():
+    """Same scenario as the partition test: the dropped teacher-wanted token escapes
+    the pairwise double gate with a single mass factor (~100x), and the anchor's
+    corrective gradient grows through the duel votes."""
+    vocab = 8
+    bs, seq_len = 1, 1
+    student_logits = torch.full((bs, seq_len, vocab), math.log(0.0497), dtype=torch.float64)
+    student_logits[0, 0, 0] = math.log(0.7)
+    student_logits[0, 0, 1] = math.log(0.002)
+    teacher_logits = torch.full((bs, seq_len, vocab), math.log(0.0667), dtype=torch.float64)
+    teacher_logits[0, 0, 0] = math.log(0.1)
+    teacher_logits[0, 0, 1] = math.log(0.5)
+    anchors = torch.zeros(bs, seq_len, dtype=torch.long)
+    response_mask = torch.ones(bs, seq_len)
+    candidate_ids = _candidates_from_teacher(teacher_logits, 4)
+
+    grads = {}
+    for divergence in ("odds_kl", "reverse_kl"):
+        logits = student_logits.clone().requires_grad_(True)
+        token_loss, _ = _call_loss(
+            logits,
+            teacher_logits,
+            anchors,
+            response_mask,
+            candidate_ids,
+            tail_candidate=True,
+            pair_divergence=divergence,
+            weight_source="student",
+        )
+        token_loss.sum().backward()
+        grads[divergence] = logits.grad[0, 0].clone()
+
+    dropped_odds = float(grads["odds_kl"][1])
+    dropped_pairwise = float(grads["reverse_kl"][1])
+    assert dropped_odds < 0 and dropped_pairwise < 0, grads
+    assert abs(dropped_odds) > 20.0 * abs(dropped_pairwise), (dropped_odds, dropped_pairwise)
+
+    anchor_odds = float(grads["odds_kl"][0])
+    anchor_pairwise = float(grads["reverse_kl"][0])
+    assert anchor_odds > 0 and anchor_pairwise > 0, grads
+    assert anchor_odds > 1.5 * anchor_pairwise, (anchor_odds, anchor_pairwise)
+
+
+def test_odds_kl_upper_bounds_partition_kl():
+    """sg[p(y)] * sum GKL(rho || rho_T) >= coarse KL(p_bar || q_bar) (log x <= x - 1)."""
+    vocab, k = 12, 5
+    for seed in (53, 59, 61):
+        student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=seed)
+        candidate_ids = _candidates_from_teacher(teacher_logits, k)
+        common = dict(tail_candidate=True, weight_source="student")
+        odds, _ = _call_loss(
+            student_logits, teacher_logits, anchors, response_mask, candidate_ids,
+            pair_divergence="odds_kl", **common,
+        )
+        partition, _ = _call_loss(
+            student_logits, teacher_logits, anchors, response_mask, candidate_ids,
+            pair_divergence="partition_kl", **common,
+        )
+        assert (odds - partition >= -1e-7).all(), (odds - partition).min()
+
+
+def test_odds_kl_k0_reduces_to_anchor_odds_gkl():
+    """With no named candidates the loss is one tail duel:
+    sg[p(y)] * GKL((1-p(y))/p(y) || (1-q(y))/q(y))."""
+    vocab = 10
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=67)
+    candidate_ids = anchors.unsqueeze(-1)  # every column deduplicates against the anchor
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="odds_kl",
+    )
+
+    p_y = torch.log_softmax(student_logits, dim=-1).gather(-1, anchors.unsqueeze(-1)).squeeze(-1).exp()
+    q_y = torch.log_softmax(teacher_logits, dim=-1).gather(-1, anchors.unsqueeze(-1)).squeeze(-1).exp()
+    rho = (1.0 - p_y) / p_y
+    rho_t = (1.0 - q_y) / q_y
+    expected = p_y.detach() * (rho * (rho.log() - rho_t.log()) - rho + rho_t) * response_mask
+
+    torch.testing.assert_close(token_loss.double(), expected.double(), atol=1e-6, rtol=1e-5)
+
+
+def _reference_jeffreys(student_logits, teacher_logits, anchors, candidate_ids, response_mask):
+    """Brute-force sum of both Bernoulli KL directions per duel, student-mass weighted."""
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    bs, seq_len, _ = student_logits.shape
+
+    def bernoulli_kl(p, q):
+        return p * (torch.log(p) - torch.log(q)) + (1 - p) * (torch.log(1 - p) - torch.log(1 - q))
+
+    token_loss = torch.zeros(bs, seq_len, dtype=torch.float64)
+    for b in range(bs):
+        for t in range(seq_len):
+            if response_mask[b, t] == 0:
+                continue
+            y = int(anchors[b, t])
+            named = {int(z) for z in candidate_ids[b, t] if int(z) != y}
+            p_y = student_log_probs[b, t, y].exp()
+            q_y = teacher_log_probs[b, t, y].exp()
+            p_named = sum(student_log_probs[b, t, z].exp() for z in named)
+            q_named = sum(teacher_log_probs[b, t, z].exp() for z in named)
+            opponents = [(student_log_probs[b, t, z].exp(), teacher_log_probs[b, t, z].exp()) for z in sorted(named)]
+            opponents.append((1.0 - p_y - p_named, 1.0 - q_y - q_named))
+            weights = torch.tensor([p_o for p_o, _ in opponents], dtype=torch.float64)
+            weights = weights / weights.sum()
+            total = 0.0
+            for w, (p_o, q_o) in zip(weights, opponents):
+                r_s = p_y / (p_y + p_o)
+                r_t = q_y / (q_y + q_o)
+                total = total + w * (bernoulli_kl(r_s, r_t) + bernoulli_kl(r_t, r_s))
+            token_loss[b, t] = total
+    return token_loss
+
+
+def test_jeffreys_matches_sum_of_both_kl_directions():
+    """(sigma(m) - sigma(m_T)) * (m - m_T) is exactly KL(p||q) + KL(q||p) per duel."""
+    vocab, k = 12, 5
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=71)
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="jeffreys",
+        weight_source="student",
+    )
+    expected = _reference_jeffreys(student_logits, teacher_logits, anchors, candidate_ids, response_mask)
+
+    torch.testing.assert_close(token_loss.double(), expected, atol=1e-5, rtol=1e-4)
+    # Both factors share sign, so every duel term and hence the loss is nonnegative.
+    assert (token_loss >= -1e-9).all()
+
+
+def test_jeffreys_is_zero_with_zero_gradient_at_p_equals_q():
+    vocab, k = 9, 4
+    student_logits, _, anchors, response_mask = _make_batch(vocab=vocab, seed=73)
+    student_logits = student_logits.clone().requires_grad_(True)
+    teacher_logits = student_logits.detach().clone()
+    candidate_ids = _candidates_from_teacher(teacher_logits, k)
+
+    token_loss, _ = _call_loss(
+        student_logits,
+        teacher_logits,
+        anchors,
+        response_mask,
+        candidate_ids,
+        tail_candidate=True,
+        pair_divergence="jeffreys",
+        weight_source="student",
+    )
+    token_loss.sum().backward()
+
+    torch.testing.assert_close(token_loss, torch.zeros_like(token_loss), atol=1e-8, rtol=0)
+    torch.testing.assert_close(
+        student_logits.grad, torch.zeros_like(student_logits.grad), atol=1e-7, rtol=0
+    )
+
+
+def test_jeffreys_ungates_the_dropped_teacher_token():
+    """The forward half of the Jeffreys gradient survives where sigma' is dead."""
+    vocab = 8
+    bs, seq_len = 1, 1
+    student_logits = torch.full((bs, seq_len, vocab), math.log(0.0497), dtype=torch.float64)
+    student_logits[0, 0, 0] = math.log(0.7)
+    student_logits[0, 0, 1] = math.log(0.002)
+    teacher_logits = torch.full((bs, seq_len, vocab), math.log(0.0667), dtype=torch.float64)
+    teacher_logits[0, 0, 0] = math.log(0.1)
+    teacher_logits[0, 0, 1] = math.log(0.5)
+    anchors = torch.zeros(bs, seq_len, dtype=torch.long)
+    response_mask = torch.ones(bs, seq_len)
+    candidate_ids = _candidates_from_teacher(teacher_logits, 4)
+
+    grads = {}
+    for divergence in ("jeffreys", "reverse_kl"):
+        logits = student_logits.clone().requires_grad_(True)
+        token_loss, _ = _call_loss(
+            logits,
+            teacher_logits,
+            anchors,
+            response_mask,
+            candidate_ids,
+            tail_candidate=True,
+            pair_divergence=divergence,
+            weight_source="student",
+        )
+        token_loss.sum().backward()
+        grads[divergence] = logits.grad[0, 0].clone()
+
+    dropped_jeffreys = float(grads["jeffreys"][1])
+    dropped_pairwise = float(grads["reverse_kl"][1])
+    assert dropped_jeffreys < 0 and dropped_pairwise < 0, grads
+    assert abs(dropped_jeffreys) > 10.0 * abs(dropped_pairwise), (dropped_jeffreys, dropped_pairwise)
 
 
 if __name__ == "__main__":

@@ -62,12 +62,15 @@ class LAPDConfig(BaseConfig):
             cells by student mass. 'teacher' keeps the historical open-loop ``q(o) / (1 - q(y_t))``
             as an ablation; it allocates budget by teacher preference even where the student already
             agrees, which measurably let transient mass pile up in the weakly weighted tail column.
-        pair_divergence (str): Direction of the per-pair KL, taken between the two sides restricted to
-            ``{y_t, z}`` and renormalized there. 'reverse_kl' scores each pair with ``KL(p~ || q~)``,
-            whose margin gradient ``sigmoid'(m) (m - m_T)`` matches margins directly but decays on
-            confidently misranked pairs; 'forward_kl' uses ``KL(q~ || p~)``, whose margin gradient
-            ``p~(y_t) - q~(y_t)`` keeps full pull there. Both share the same optimum and agree to
-            first order around it. 'log_ratio' keeps only the ``v = y_t`` outcome of the reverse
+        pair_divergence (str): Per-pair divergence, taken between the two sides restricted to
+            ``{y_t, z}`` and renormalized there. 'jeffreys' (default) scores each pair with the
+            symmetrized KL, whose two-point closed form is the win-probability gap times the margin
+            gap ``(sigma(m) - sigma(m_T)) (m - m_T)``: nonnegative per pair, zero exactly at
+            ``m = m_T``, and its margin gradient ``sigmoid'(m)(m - m_T) + sigma(m) - sigma(m_T)``
+            keeps a never-vanishing pull on confidently misranked pairs (the reverse-only sigmoid'
+            gate measurably stalled late training). 'reverse_kl' keeps only ``KL(p~ || q~)`` (the
+            historical default, now a one-direction ablation); 'forward_kl' keeps only
+            ``KL(q~ || p~)``. All three share the same optimum and agree to first order around it. 'log_ratio' keeps only the ``v = y_t`` outcome of the reverse
             sum, ``log[p~(y_t) / q~(y_t)]``, which is not a divergence: its margin gradient
             ``1 - p~(y_t)`` never vanishes and never sees the teacher, so the objective is
             unbounded below. Ablation only, and it does degenerate in practice: on-policy it
@@ -80,7 +83,7 @@ class LAPDConfig(BaseConfig):
     complement_candidate: bool = False
     normalize_weights: bool = True
     weight_source: str = "student"
-    pair_divergence: str = "reverse_kl"
+    pair_divergence: str = "jeffreys"
 
 
 @dataclass

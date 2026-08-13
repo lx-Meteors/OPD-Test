@@ -48,16 +48,21 @@ export L_APD_NORMALIZE_WEIGHTS="${L_APD_NORMALIZE_WEIGHTS:-True}"
 # transient mass pile up in the 4-11%-weight tail column (3x teacher tail mass at peak,
 # entropy overshoot to 1.0, and the worst@16 val gap that followed).
 export L_APD_WEIGHT_SOURCE="${L_APD_WEIGHT_SOURCE:-student}"
-# Per-pair discrepancy. reverse_kl sums both outcomes of each pair,
-# sum_v r_S(v) log[r_S(v) / r_T(v)], so it is a genuine divergence: bounded below by 0
-# and stationary exactly at m = m_T. forward_kl swaps the arguments.
+# Per-pair discrepancy. jeffreys (default) is the symmetrized Bernoulli KL, whose
+# two-point closed form is the win-probability gap times the margin gap,
+# (sigma(m) - sigma(m_T)) * (m - m_T): nonnegative per duel, zero exactly at m = m_T,
+# and the forward half of its gradient never vanishes on confidently misranked pairs.
+# The reverse-only sigmoid'(m) gate measurably stalled late training (200-step run:
+# agreement flat at 0.955 from step 140, pair_kl floored then rebounding on data waves,
+# grad_norm at half the baseline's, endpoint mean@16 -1.8pp) -- reverse_kl is kept as
+# the one-direction ablation, forward_kl as the other direction.
 #
 # log_ratio keeps only the v = y_t outcome and is kept for ablation only. It is not a
 # divergence -- the teacher side becomes an additive stop-gradient constant, leaving a
 # margin gradient of 1 - r_S that is always positive and never sees the teacher. It was
 # measured at cosine -0.985 against the reverse_kl gradient, and a run of it collapsed
 # actor/entropy from 0.66 to 0.04 while actor/l_apd_anchor_kl grew tenfold.
-export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-reverse_kl}"
+export L_APD_PAIR_DIVERGENCE="${L_APD_PAIR_DIVERGENCE:-jeffreys}"
 
 run_opd "l-apd-r1-1p5b-justrl-1p5b-src_" \
     "actor_rollout_ref.actor.l_apd.enable=True" \

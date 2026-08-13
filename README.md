@@ -27,7 +27,7 @@ cd /input0/yyy/Prune-OPD
 DRY_RUN=1 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 正式启动，默认就是方法本身（reverse_kl + student 加权 + 尾部块）
+# 正式启动，默认就是方法本身（jeffreys 对称成对 KL + student 加权 + 尾部块）
 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
@@ -43,7 +43,7 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 
 | 节 | 内容 |
 | --- | --- |
-| [§1 目标函数](#1-目标函数) | 完整损失、候选与权重的两个来源、聚合对手、三种 `pair_divergence` |
+| [§1 目标函数](#1-目标函数) | 完整损失、候选与权重的两个来源、聚合对手、`pair_divergence` 各取值 |
 | [§2 代码位置](#2-代码位置) | 改动涉及的文件 |
 | [§3 实验配置](#3-实验配置与-table-1-对齐) | student / teacher / 数据 / 超参 |
 | [§4 准备](#4-准备) | 环境、数据、模型 |
@@ -109,20 +109,24 @@ $$
 \qquad v \in \lbrace y, z\rbrace.
 $$
 
-这一对上的散度就是标准的**逆向 KL**（student 在前），按定义展开就是 $\log p/q$ 的求和：
+这一对上的散度是**双向 KL 之和**（Jeffreys 散度，两个方向各记一次）。记
+$m = S(y_t) - S(o)$、$m_T = T(y_t) - T(o)$，则 $\tilde p_{y,o}(y_t) = \sigma(m)$、
+$\tilde q_{y,o}(y_t) = \sigma(m_T)$，而两点分布上的 Jeffreys 散度有一个经典闭式——
+**胜率差乘 margin 差**：
 
 $$
-\mathrm{KL}\bigl(\tilde p_{y,z} \,\Vert\, \tilde q_{y,z}\bigr)
-\;=\; \sum_{v \in \lbrace y, z\rbrace} \tilde p_{y,z}(v)\,
-\log \frac{\tilde p_{y,z}(v)}{\tilde q_{y,z}(v)}.
+J\bigl(\tilde p_{y,o},\, \tilde q_{y,o}\bigr)
+\;=\; \mathrm{KL}\bigl(\tilde p \Vert \tilde q\bigr) + \mathrm{KL}\bigl(\tilde q \Vert \tilde p\bigr)
+\;=\; \bigl(\sigma(m) - \sigma(m_T)\bigr)\cdot\bigl(m - m_T\bigr).
 $$
 
-损失是**单独一项**——所有对决的逆向 KL 按挑战者分布加权求和：
+两个因子同号，所以每场对决非负、且仅在 $m = m_T$ 处为零——零点与单向 KL 逐字相同。
+损失是**单独一项**——所有对决的 Jeffreys 散度按挑战者分布加权求和：
 
 $$
 \boxed{\;
 L_t \;=\; \sum_{o \in \mathcal{O}_t} \tilde w_t(o)\;
-\mathrm{KL}\bigl(\tilde p_{y_t,o} \Vert \tilde q_{y_t,o}\bigr),
+\bigl(\sigma(m_o) - \sigma(m_{T,o})\bigr)\bigl(m_o - m_{T,o}\bigr),
 \qquad
 \tilde w_t(o) = \mathrm{sg}\!\left[\frac{p_t(o)}{1 - p_t(y_t)}\right]
 \;}
@@ -133,24 +137,26 @@ $\log p_t(y_t) - \log p_t(\tau_t)$，实现里用 `logsumexp` + `log1mexp` 从�
 log-prob 直接算出。两个退化性质说明这个形式没有丢东西：
 
 - **$K = 0$ 时**对手只剩 $\tau_t$，此时 $\tilde p_{y_t,\tau_t}(y_t) = p_t(y_t)$，loss 精确退化为
-  目标 token 的校准项 $\mathrm{KL}\bigl((p_t(y_t), 1 - p_t(y_t)) \Vert (q_t(y_t), 1 - q_t(y_t))\bigr)$，
-  系数为 1。所以单项形式是"锚点校准 + 排序"的推广，不是删减。
+  目标 token 的校准项——两点分布 $(p_t(y_t), 1 - p_t(y_t))$ 与 $(q_t(y_t), 1 - q_t(y_t))$ 之间
+  的对称 KL，系数为 1（pin 回 `reverse_kl` 即单向锚点 Bernoulli KL）。所以单项形式是
+  "锚点校准 + 排序"的推广，不是删减。
 - **锚点的绝对质量被自动钉住**：对手集合覆盖除 $y_t$ 外的全部质量，所有对决打平
   $\iff$ 所有比值 $p(y_t)/p(o)$ 与 teacher 一致 $\iff$ 在划分上 $p = q$，于是
   $p_t(y_t) = q_t(y_t)$ 是**定理**而不是需要单独加项去逼的约束（见 §1.2）。
 
-每对用什么散度由 `l_apd.pair_divergence` 控制，一共三个取值：
+每对用什么散度由 `l_apd.pair_divergence` 控制，主要取值：
 
 | 取值 | 每对的量 | 性质 |
 | --- | --- | --- |
-| `reverse_kl` | $\mathrm{KL}(\tilde p \Vert \tilde q)$，即上式 | 有下界，$m = m_T$ 处梯度归零。**方法本身** |
-| `forward_kl` | $\mathrm{KL}(\tilde q \Vert \tilde p)$，两个参数对调 | 同一个最优点，只改大误差如何修正（§1.3）。消融 |
+| `jeffreys` | $(\sigma(m)-\sigma(m_T))(m-m_T)$，即双向 KL 之和 | 有下界，$m = m_T$ 处为零，梯度在已分胜负的错序对决上**不消失**（§1.3）。**方法本身** |
+| `reverse_kl` | $\mathrm{KL}(\tilde p \Vert \tilde q)$，仅逆向一半 | 历史默认。$\sigma'(m)$ 门让已分胜负的对决梯度指数归零，200 步实测晚期停滞（§1.3）。单向消融 |
+| `forward_kl` | $\mathrm{KL}(\tilde q \Vert \tilde p)$，仅正向一半 | 同一个最优点，只改大误差如何修正（§1.3）。方向消融 |
 | `log_ratio` | 只保留 $\log\frac{\tilde p(y_t)}{\tilde q(y_t)}$ 一项 | **不是散度**，无下界，梯度里没有 teacher，实测退化（§1.4）。消融 |
 
-库默认值（`actor.yaml`）和启动脚本默认值都是 `reverse_kl`。
+库默认值（`actor.yaml`）和启动脚本默认值都是 `jeffreys`。
 
-写成对求和的形式，可以看出它和 baseline OPD 的 $\sum_z \hat p(z)\log\frac{p(z)}{q(z)}$ 是同一个模板
-——权重是第一个分布自己在该结果上的概率，每个结果配一个对数比值，没有额外的交叉熵项：
+把它的**逆向一半**写成对求和的形式，可以看出与 baseline OPD 的 $\sum_z \hat p(z)\log\frac{p(z)}{q(z)}$
+是同一个模板——权重是第一个分布自己在该结果上的概率，每个结果配一个对数比值，没有额外的交叉熵项：
 
 $$
 \mathrm{KL}\bigl(\tilde p_{y_t,o} \Vert \tilde q_{y_t,o}\bigr)
@@ -193,10 +199,11 @@ loss 在给一个大体已满足的校准约束反复付费，排序监督被稀
 
 **实现上的两个要点**：
 
-1. 逆向下 student 持有熵项，所以 loss **本身就是 KL**，`actor/l_apd_loss` 会收敛到 0，和
-   `actor/l_apd_pair_kl` 相等。正向下代码用 `binary_cross_entropy_with_logits`，算的是交叉熵，
-   比 KL 多一个 teacher 侧熵（student 无关的常数，梯度相同），此时只有 `actor/l_apd_pair_kl`
-   是纯 KL。两个方向的 $\mathrm{KL}$ 都用 log-sigmoid 写成，任意实数 margin 下都有限。
+1. 默认（`jeffreys`）下 loss 是胜率差与 margin 差的乘积和——**式子里没有任何小数的对数**，
+   任意实数 margin 下有限，是全部取值里数值上最稳的；`actor/l_apd_pair_kl` 此时另算一份
+   逆向纯 KL 作为跨 run 连续的收敛诊断。`reverse_kl` 下 student 持有熵项、loss 本身就是 KL，
+   与 `pair_kl` 相等；`forward_kl` 下代码用 `binary_cross_entropy_with_logits`，比 KL 多一个
+   teacher 侧熵常数（梯度相同）。两个单向 KL 都用 log-sigmoid 写成，margin 任意实数下有限。
 2. softmax 归一化项在 logit 差里会抵消，即 $T(y) - T(z) = \log q(y) - \log q(z)$。因此所有
    成对 margin 都能直接从框架已有的 top-$k$ log-prob 读出，**不需要传输或重算原始 logits，
    也不需要额外的 teacher forward**。每次更新仍然只有一次 student forward，显存与吞吐和 OPD
@@ -306,12 +313,20 @@ $\sigma'(m_T)\delta$，相对差 $10^{-3}$），所以这个选择**只影响大
 | 30 | **4.018** | 29.37 | **3.2e-12** | 0.982 |
 
 逆向 loss 封顶在 $-\log \tilde q_{y_t,o}(y_t)$，自信站错边的代价有界、梯度按 $\sigma'(m)$ 指数衰减；正向无界，
-梯度饱和到 $\pm 1$ 但不消失。这也是唯一需要注意的取舍：$\sigma'(m)$ 因子意味着已分出胜负的
-对决（不管方向对错）梯度都很小——这是成对 Bernoulli 几何的内在性质，对**已经过度自信**的
-锚点（$p_t(y_t) \to 1$ 时尾部对决的 margin 很大）没有拉回力，虽然 §1.2 的可辨识性在理论上
-仍成立（最优点唯一）。若训练中低概率候选出现梯度饥饿，`L_APD_PAIR_DIVERGENCE=forward_kl`
-是同一形式下的现成退路（还是 Bernoulli KL，不引入新参数）。
+梯度饱和到 $\pm 1$ 但不消失。
 `test_reverse_kl_is_bounded_where_forward_diverges` 锁住了上表的定性行为。
+
+**方法本身取两个方向之和（`jeffreys`），依据有三条。** 其一，上面的分析本身说明方向在成对项上
+**没有原则性偏好**：两个方向最优点相同、近优处一阶一致，全分布下支持逆向的 mode-seeking 论证
+在只有一个自由参数的成对项上不适用——单选任何一向才是任意决定。其二，逆向单向的 $\sigma'(m)$
+门在 200 步完整 run 里实测造成晚期停滞：agreement 从 step 140 起卡在 0.955、剩余 4.5% 错序
+对决排不动，`pair_kl` 触底 0.0118 后随数据浪反弹到 0.0220，`grad_norm` 只剩 baseline 的一半，
+终点 mean@16 落后 1.8pp。对称化后梯度多出永不消失的 $\sigma(m)-\sigma(m_T)$ 项，恰好补在
+这批对决上（被丢弃 token 的对决梯度提升约 40 倍），而近优几何与逆向一致。其三，闭式
+$(\sigma(m)-\sigma(m_T))(m-m_T)$ 是指数族对偶的标准恒等式（均值坐标缺口乘自然坐标缺口），
+不引入新函数、新参数。离线复核（8 条真实轨迹的 65,565 场对决做 margin 动力学）：从逆向
+卡死态分叉后，`jeffreys` 的错序排空速度约为逆向的 4 倍、真成对 KL 低 3.3 倍，且两个方向
+单独都不如二者之和；过锐侧指标不升反降，无熵塌信号。
 
 ### 1.4 `log_ratio`：只保留一项的消融
 
@@ -461,7 +476,7 @@ MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
 
-不传 `L_APD_PAIR_DIVERGENCE` 就是脚本默认的 `reverse_kl`，即 §1 那个方法本身。
+不传 `L_APD_PAIR_DIVERGENCE` 就是脚本默认的 `jeffreys`，即 §1 那个方法本身。
 
 脚本会自动 `ray stop --force` → `ray start --head` → 启动训练，退出时清理 ray；
 想复用已有集群就传 `MANAGE_RAY=0`。日志同时打到终端和
@@ -533,14 +548,18 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `False` | 聚合对手取"`y_t` 的补集"（历史两项式，重复计数，消融），见 §1.2 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化；tail 模式下与除以加权侧的 `1 − 锚点质量` 浮点等价 |
 | `L_APD_WEIGHT_SOURCE` | `...l_apd.weight_source` | `student` | 权重用谁的质量：`student` 是方法本身（闭环、与逆向成对 KL 方向一致，§1/§1.1），`teacher` 是历史开环加权，保留为消融 |
-| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `reverse_kl` | 每对用什么散度。`reverse_kl` 是方法本身（§1.3），`forward_kl` 是方向对照，`log_ratio` 是只保留一项的裸对数比值消融、非散度且实测退化（§1.4）。库默认与脚本默认一致 |
+| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `jeffreys` | 每对用什么散度。`jeffreys`（双向 KL 之和，胜率差 × margin 差）是方法本身（§1.3）；`reverse_kl` 是历史默认、现为单向消融（σ′ 门实测晚期停滞）；`forward_kl` 是另一个单向；`log_ratio` 是只保留一项的裸对数比值消融、非散度且实测退化（§1.4）。库默认与脚本默认一致 |
 
 > 两个聚合对手**至少要开一个**。全关掉时锚点概率不可辨识（§1.2），只用于复现那个退化情形。
 
 消融示例：
 
 ```bash
-# KL 方向换成正向：自信站错边的 token 保留满强度梯度，代价是 loss 无界
+# 单向消融：退回历史默认的逆向 KL（sigma' 门，200 步实测晚期停滞）
+L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
+bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
+# 单向消融：只保留正向一半
 L_APD_PAIR_DIVERGENCE=forward_kl MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
@@ -594,7 +613,7 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | 指标 | 含义 |
 | --- | --- |
 | `actor/pg_loss` | L-APD 目标值（复用了原字段名），已乘上 `loss_scale_factor`，所以数值不能直接和 `pair_kl` 对齐。`log_ratio` 下它不是收敛指标——on-policy 时它会**往上涨**而不是往负走（§1.4） |
-| `actor/l_apd_pair_kl` | teacher 加权的成对 KL，含聚合对手那一项，**永远是诚实的 KL**（正向下已扣掉 teacher 熵，`log_ratio` 下另算一份逆向 KL）。逆向下它与 `actor/pg_loss` 相等；其余两种方向下它是唯一有界、$p = q$ 时归零的收敛指标 |
+| `actor/l_apd_pair_kl` | 加权的成对**逆向 KL** 诊断，含聚合对手那一项，**永远是诚实的 KL**、跨 `pair_divergence` 可比（`jeffreys` 与 `log_ratio` 下另算一份逆向 KL；正向下已扣掉 teacher 熵）。`reverse_kl` 下它与 loss 相等；其余取值下它是有界、$p = q$ 时归零的收敛指标 |
 | `actor/l_apd_pairwise_agreement` | student 与 teacher 排序方向一致的加权比例 |
 | `actor/l_apd_pairwise_gap` | 加权的 $\lvert \tilde p_{y_t,o}(y_t) - \tilde q_{y_t,o}(y_t) \rvert$，两侧成对概率的差距 |
 | `actor/l_apd_teacher_anchor_prob` / `..._student_anchor_prob` | 锚点 token 上的 $q(y_t)$ / $p(y_t)$，两者是否收敛到一起是判断锚点项是否起效的主要观测量 |
@@ -619,16 +638,18 @@ PYTHONPATH=$(pwd) python tests/trainer/ppo/test_l_apd_on_cpu.py
 PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
 ```
 
-覆盖：两个方向的 autograd 梯度分别等于 §1.3 的两个解析式；逆向 loss 逐元素等于加权的
+覆盖：`jeffreys` 逐元素等于双向 Bernoulli KL 之和（暴力参考实现）、$p=q$ 处零损失零梯度、
+被丢弃的 teacher 想要 token 相对单向逆向拿到 >10 倍梯度（去门控）、且确实是库的默认散度；
+$K=0$ 时默认散度精确退化为对称锚点 KL、pin 回 `reverse_kl` 则为单向锚点 KL（两种加权都锁）；
+两个单向的 autograd 梯度分别等于 §1.3 的两个解析式；逆向 loss 逐元素等于加权的
 $\mathrm{KL}(\tilde p \Vert \tilde q)$ 且与 `pair_kl` 诊断相等；逆向 loss 在自信站错边处有界而
-正向发散（锁住 §1.3 那张表的定性行为）；`reverse_kl` 确实是库的默认方向；未知方向名会报错；
+正向发散（锁住 §1.3 那张表的定性行为）；未知方向名会报错；
 $p = q$ 时两个方向梯度都为 0；正向下全词表候选与定义式逐元素相等、tail 候选只含一个 token 时
 与全词表 loss 精确相等；padding 位置无 loss、无 NaN；候选权重的归一化性质；§1.2 的可辨识性
 （只有真实 token 对手时 loss 对"质量在 top-$k$ 与尾部之间如何分配"完全不变，而两种聚合对手
 都能破掉这个不变性）；补集对手那一项的权重逐元素等于 $q(y_t)/Z_t$、且含它的权重和恒为 1；
 student 加权确实是库默认、权重逐元素等于 $\mathrm{sg}[p(o)/(1-p(y_t))]$、且是 stop-gradient
-（autograd 梯度与"权重视为常数"的解析式逐元素相等）；$K=0$ 时两种加权下 loss 都精确退化为
-锚点 Bernoulli KL；未知 `weight_source` 会报错；
+（autograd 梯度与"权重视为常数"的解析式逐元素相等）；未知 `weight_source` 会报错；
 `log_ratio` 逐元素等于 §1.4 那个两段式，且它在 $p = q$ 处仍有非零梯度、50 步 SGD 就把 loss
 推到 $-10$ 以下并把 $p(y_t)$ 压到 $e^{-10}$ 以下（锁住"它不是散度"这个性质）。
 
@@ -674,6 +695,29 @@ student 加权确实是库默认、权重逐元素等于 $\mathrm{sg}[p(o)/(1-p(
 - 单节点默认 8 卡（`trainer.n_gpus_per_node=8`），卡数不同时请追加 override。
 
 ## 10. 更新记录
+
+### 2026-08-13：每对散度对称化为 Jeffreys（胜率差 × margin 差）
+
+- **每对散度从单向逆向 KL 改为双向 KL 之和**（`pair_divergence=jeffreys` 成为默认，公式见
+  §1：每对 $(\sigma(m)-\sigma(m_T))(m-m_T)$，即 Jeffreys 散度在两点分布上的闭式。只换每对
+  的散度，权重、候选集、尾部块、锚定结构一字未动；`reverse_kl` 降级为单向消融）。
+- **动机是 200 步完整 run 的实测诊断**（student 加权单项式 vs baseline OPD，同网格）：
+  `pairwise_agreement` 从 step 140 起卡在 0.955，剩余 4.5% 错序对决排不动；`pair_kl` 触底
+  0.0118 后随 step 180 的数据浪反弹到 0.0220——loss 看得见新错误但行动不了；`grad_norm`
+  只剩 baseline 的 1/2 到 1/3；锚点与尾部质量早已贴住 teacher，残余误差全部集中在排序结构上。
+  终点 mean@16 0.3894 vs baseline 0.4077（-1.8pp）。机制：逆向梯度 $\sigma'(m)(m-m_T)$ 的
+  $\sigma'$ 门在已分胜负的对决上指数关门、不问对错。
+- **修复原理**：对称化后 margin 梯度多出 $\sigma(m)-\sigma(m_T)$ 项——已分胜负且站错边的
+  对决保留接近满幅的拉力（被丢弃 token 的对决梯度提升约 40 倍），近优几何与逆向一阶一致；
+  方向选择本无原则依据（§1.3：两方向最优点相同、mode-seeking 论证在成对项上不适用），对称
+  是唯一不引入任意性的选择；闭式为指数族对偶恒等式，零新超参、零新函数，且式中无小数对数、
+  数值上最稳。
+- **离线验证**（8 条真实轨迹的 65,565 场对决，margin 空间动力学，SGD 保持逐对决预算分配）：
+  复现逆向卡死（从卡死态继续逆向 400 步仅排空幸存错序的 2.5%）；同起点 `jeffreys` 排空 9.7%
+  （4 倍）、真成对 KL 低 3.3 倍、且优于任何单向；过锐指标不升反降，无熵塌信号。两个学习率
+  下结论排序一致。
+- 单元测试 41/41，新增：`jeffreys` 逐元素等于双向 Bernoulli KL 之和、$p=q$ 零点零梯度、
+  丢弃 token 去门控 >10 倍、是库默认；$K=0$ 退化测试同时锁对称与单向两个形式。
 
 ### 2026-08-12：权重来源改为 student 条件质量
 

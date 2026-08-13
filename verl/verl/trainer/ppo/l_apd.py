@@ -84,7 +84,7 @@ import torch.nn.functional as F
 
 __all__ = ["compute_l_apd_token_loss", "l_apd_batch_keys"]
 
-_PAIR_DIVERGENCES = ("reverse_kl", "forward_kl", "log_ratio")
+_PAIR_DIVERGENCES = ("reverse_kl", "forward_kl", "log_ratio", "partition_kl", "odds_kl", "jeffreys")
 
 # Whose probabilities set the per-pair mixture weights.
 _WEIGHT_SOURCES = ("student", "teacher")
@@ -166,7 +166,7 @@ def compute_l_apd_token_loss(
     complement_candidate: bool = False,
     normalize_weights: bool = True,
     weight_source: str = "student",
-    pair_divergence: str = "reverse_kl",
+    pair_divergence: str = "jeffreys",
     eps: float = 1.0e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the per-token L-APD loss.
@@ -240,6 +240,45 @@ def compute_l_apd_token_loss(
             sampled makes the mass flee into an ever narrower set, so entropy collapses
             and ``p(y_t)`` rises instead. A run of it took ``actor/entropy`` from 0.66
             to 0.04 while the honest ``pair_kl`` grew fourfold.
+
+            ``partition_kl`` drops the pairwise wrapper altogether: one categorical
+            reverse KL between the two distributions coarsened onto the partition
+            ``{y_t} + valid candidates + tail`` (requires ``tail_candidate``; the
+            cells cover the vocabulary, so both coarsened distributions sum to one
+            exactly). Explicit weights and the sigmoid geometry disappear from the
+            loss: the per-cell gradient is ``p(c) * (Delta_c - E_p[Delta])`` with
+            ``Delta = log[p(c) / q(c)]`` -- the student-mass weighting emerges from
+            the KL itself (exactly, no stop-gradient approximation), and there is no
+            ``sigmoid'(m)`` gate, so confidently wrong anchors keep a full-strength
+            corrective gradient (the pairwise forms gate exactly those to ~zero).
+            ``weight_source`` and ``normalize_weights`` do not affect this loss;
+            weights are still computed for diagnostics continuity.
+
+            ``odds_kl`` keeps one term per duel but drops the within-duel
+            normalization (the sigmoid) entirely: each duel compares the two
+            models' *odds* ``rho = p(c) / p(y_t)`` with the generalized KL
+            ``rho log(rho / rho_T) - rho + rho_T``, which folds to
+            ``rho * phi(u)`` with ``phi(u) = e^u - u - 1`` and duel gap
+            ``u = m - m_T`` (also the exact KL between Poisson laws with these
+            intensities). The token loss is ``sg[p(y_t)]`` times the sum over
+            duels, so the margin gradient is exactly ``p(c) * (m - m_T)``: a
+            single mass factor, no ``sigmoid'`` gate, bounded by ``|m - m_T|``.
+            Explicit weights and ``normalize_weights`` do not affect this loss
+            either; ``sg[p(y_t)] * sum_c GKL`` upper-bounds the partition KL
+            (tight at ``p(y_t) = q(y_t)``).
+
+            ``jeffreys`` symmetrizes the per-duel Bernoulli KL: for two-point
+            distributions the sum of both directions folds to the closed form
+            ``(sigma(m) - sigma(m_T)) * (m - m_T)`` -- win-probability gap times
+            margin gap, both factors sharing sign, so each duel is a genuine
+            divergence with the same zero as ``reverse_kl``. Its margin gradient
+            ``sigmoid'(m) (m - m_T) + (sigma(m) - sigma(m_T))`` keeps the reverse
+            geometry near the optimum but adds the never-vanishing forward pull,
+            so duels the student has confidently decided the wrong way (where
+            ``sigmoid'`` alone is exponentially dead -- the measured late-phase
+            stall: agreement flat at 0.955, pair_kl floored and rebounding on
+            data waves, grad_norm 2x under baseline) retain up to full-strength
+            gradient. Weights apply as in ``reverse_kl``.
         eps: floor for the weight normalizer.
 
     Returns:
@@ -253,6 +292,11 @@ def compute_l_apd_token_loss(
     if weight_source not in _WEIGHT_SOURCES:
         raise ValueError(
             f"Unknown l_apd.weight_source: {weight_source}. Expected one of {list(_WEIGHT_SOURCES)}."
+        )
+    if pair_divergence == "partition_kl" and not tail_candidate:
+        raise ValueError(
+            "l_apd.pair_divergence='partition_kl' requires tail_candidate=True: the categorical KL "
+            "is defined on the partition {anchor} + candidates + tail, which must cover the vocabulary."
         )
 
     student_anchor = student_anchor_log_probs.float()
@@ -325,10 +369,47 @@ def compute_l_apd_token_loss(
         pair_loss = _reverse_pair_kl(pair_logits, teacher_margins)
         # The student owns the entropy term here, so the loss already is the KL.
         pair_kl = pair_loss
+    elif pair_divergence == "jeffreys":
+        # Symmetrized Bernoulli KL in its two-point closed form: win-probability
+        # gap times margin gap. No logs of small numbers, and the forward half of
+        # the gradient never vanishes on decided-but-wrong duels.
+        pair_loss = (torch.sigmoid(pair_logits) - teacher_pair_prob) * (pair_logits - teacher_margins)
+        pair_kl = _reverse_pair_kl(pair_logits.detach(), teacher_margins)
     elif pair_divergence == "forward_kl":
         pair_loss = F.binary_cross_entropy_with_logits(pair_logits, teacher_pair_prob, reduction="none")
         # Cross-entropy; the teacher-side entropy is a stop-gradient constant.
         pair_kl = pair_loss - _pair_entropy(teacher_pair_prob)
+    elif pair_divergence == "partition_kl":
+        # One categorical reverse KL over the partition cells. Every cell's term is
+        # p(c) * (log p(c) - log q(c)); the cells sum to one on both sides by
+        # construction (tail = 1 - covered mass), so this is the exact coarse-grained
+        # KL(p || q) -- no explicit weights, no sigmoid geometry. The pairwise
+        # Bernoulli KL is still reported through ``pair_kl`` for monitoring
+        # continuity with the pairwise runs.
+        candidate_terms = torch.exp(student_candidates) * (student_candidates - teacher_candidates)
+        candidate_terms = torch.where(valid, candidate_terms, torch.zeros_like(candidate_terms))
+        partition_kl = (
+            torch.exp(student_anchor) * (student_anchor - teacher_anchor)
+            + candidate_terms.sum(dim=-1)
+            + torch.exp(student_tail) * (student_tail - teacher_tail)
+        )
+        pair_loss = None
+        pair_kl = _reverse_pair_kl(pair_logits.detach(), teacher_margins)
+    elif pair_divergence == "odds_kl":
+        # One sigma-free generalized KL per duel on the anchored odds. Fused stable
+        # evaluation of rho * phi(u) = e^{-m_T} - e^{-m} (u + 1) with u = m - m_T
+        # (phi(u) = e^u - u - 1 alone can overflow; this form never exponentiates u).
+        # Each duel's term is >= 0 with equality iff m == m_T. The sg[p(y_t)]
+        # prefactor converts odds to mass units: the margin gradient becomes
+        # exactly p(c) * (m - m_T).
+        duel_gap = pair_logits - teacher_margins
+        duel_terms = torch.exp(-teacher_margins) - torch.exp(-pair_logits) * (duel_gap + 1.0)
+        duel_mask = valid.float()
+        if tail_candidate or complement_candidate:
+            duel_mask = torch.cat([duel_mask, response_mask.unsqueeze(-1)], dim=-1)
+        odds_kl = torch.exp(student_anchor).detach() * (duel_terms * duel_mask).sum(dim=-1)
+        pair_loss = None
+        pair_kl = _reverse_pair_kl(pair_logits.detach(), teacher_margins)
     else:
         # Only the v = y_t outcome of the reverse KL. On the aggregated complement
         # column its margin makes the restricted probabilities exactly p(y_t) and
@@ -339,7 +420,12 @@ def compute_l_apd_token_loss(
         pair_loss = F.logsigmoid(pair_logits) - F.logsigmoid(teacher_margins)
         pair_kl = _reverse_pair_kl(pair_logits.detach(), teacher_margins)
 
-    token_loss = (weights * pair_loss).sum(dim=-1) * response_mask
+    if pair_divergence == "partition_kl":
+        token_loss = partition_kl * response_mask
+    elif pair_divergence == "odds_kl":
+        token_loss = odds_kl * response_mask
+    else:
+        token_loss = (weights * pair_loss).sum(dim=-1) * response_mask
 
     with torch.no_grad():
         student_pair_prob = torch.sigmoid(pair_logits)
@@ -363,6 +449,10 @@ def compute_l_apd_token_loss(
             # Share of positions where float32 can no longer resolve the tail mass, so
             # the aggregate-opponent margin is capped instead of exact.
             diagnostics["tail_saturated"] = (covered_student_mass > _LOG1MEXP_MAX).float()
+        if pair_divergence == "partition_kl":
+            diagnostics["partition_kl"] = partition_kl * response_mask
+        elif pair_divergence == "odds_kl":
+            diagnostics["odds_kl"] = odds_kl * response_mask
         elif complement_candidate:
             diagnostics["anchor_weight"] = weights[..., -1]
             diagnostics["anchor_saturated"] = (student_anchor > _LOG1MEXP_MAX).float()

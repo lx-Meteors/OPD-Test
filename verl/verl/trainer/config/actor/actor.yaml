@@ -100,13 +100,17 @@ l_apd:
   # historical open-loop q(o) / (1 - q(y_t)) as an ablation
   weight_source: student
 
-  # Direction of the per-pair KL, taken between the two sides restricted to {y_t, z} and renormalized
-  # there: reverse_kl uses KL(p~ || q~), forward_kl uses KL(q~ || p~). Same optimum and same
-  # first-order behaviour around it; they differ only in how hard confidently misranked pairs are
-  # corrected (reverse decays there, forward does not). log_ratio drops the v = z outcome and keeps
-  # the bare log[p~(y_t) / q~(y_t)]; it is not a divergence (monotone in the margin, unbounded below,
-  # teacher absent from the gradient) and exists as an ablation
-  pair_divergence: reverse_kl
+  # Per-pair divergence, taken between the two sides restricted to {y_t, z} and renormalized there.
+  # jeffreys (default) is the symmetrized KL; its two-point closed form is the win-probability gap
+  # times the margin gap, (sigma(m) - sigma(m_T)) (m - m_T): nonnegative per pair, zero exactly at
+  # m = m_T, and the forward half of its gradient never vanishes on confidently misranked pairs --
+  # the reverse-only sigmoid' gate measurably stalled late training (agreement flat at 0.955,
+  # pair_kl floored then rebounding on data waves, grad_norm at half the baseline's). reverse_kl
+  # keeps only KL(p~ || q~) (historical default, one-direction ablation); forward_kl keeps only
+  # KL(q~ || p~). All three share the same optimum and first-order behaviour around it. log_ratio
+  # drops the v = z outcome and keeps the bare log[p~(y_t) / q~(y_t)]; it is not a divergence
+  # (monotone in the margin, unbounded below, teacher absent from the gradient), ablation only
+  pair_divergence: jeffreys
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
