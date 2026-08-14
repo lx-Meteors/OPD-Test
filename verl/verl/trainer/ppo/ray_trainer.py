@@ -56,6 +56,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -354,7 +355,32 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_prune_opd_dynamic_response_length()
+        self._init_teacher_start()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _init_teacher_start(self):
+        """Validate and cache the teacher-prefix / student-suffix rollout settings."""
+        teacher_start_cfg = self.config.actor_rollout_ref.rollout.get("teacher_start", {})
+        self.teacher_start_enabled = bool(teacher_start_cfg.get("enable", False))
+        self.teacher_start_cfg = teacher_start_cfg
+
+        if not self.teacher_start_enabled:
+            return
+        if not self.use_rm:
+            raise ValueError("teacher_start requires reward_model.enable=True so the teacher can generate prefixes")
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            raise NotImplementedError("teacher_start currently supports synchronous rollouts only")
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+            raise NotImplementedError("teacher_start currently does not support the REMAX baseline rollout")
+
+        prefix_length = int(teacher_start_cfg.get("prefix_length", 500))
+        min_student_response_length = int(teacher_start_cfg.get("min_student_response_length", 256))
+        if prefix_length <= 0:
+            raise ValueError("teacher_start.prefix_length must be positive")
+        if min_student_response_length <= 0:
+            raise ValueError("teacher_start.min_student_response_length must be positive")
+        self.teacher_start_prefix_length = prefix_length
+        self.teacher_start_min_student_response_length = min_student_response_length
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -378,6 +404,114 @@ class RayPPOTrainer:
         if not self.prune_opd_dynamic_response_length_enabled:
             return
         gen_batch.meta_info["max_response_length"] = self.prune_opd_dynamic_response_length
+
+    def _generate_teacher_start_prefix(self, gen_batch: DataProto) -> DataProto:
+        """Ask the frozen teacher to write the prefix for each un-repeated prompt."""
+        if gen_batch.batch["position_ids"].dim() != 2:
+            raise NotImplementedError(
+                "teacher_start currently supports text-only models with one-dimensional positions"
+            )
+
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        if eos_token_id is None or pad_token_id is None:
+            raise ValueError("teacher_start requires tokenizer eos_token_id and pad_token_id")
+
+        teacher_request = DataProto.from_dict(
+            tensors={
+                "input_ids": gen_batch.batch["input_ids"],
+                "attention_mask": gen_batch.batch["attention_mask"],
+                "position_ids": gen_batch.batch["position_ids"],
+            },
+            meta_info={
+                "teacher_start_prefix_length": self.teacher_start_prefix_length,
+                "teacher_start_do_sample": bool(self.teacher_start_cfg.get("do_sample", True)),
+                "teacher_start_temperature": float(self.teacher_start_cfg.get("temperature", 1.0)),
+                "teacher_start_top_p": float(self.teacher_start_cfg.get("top_p", 1.0)),
+                "eos_token_id": eos_token_id,
+                "pad_token_id": pad_token_id,
+            },
+        )
+        prefix = self.rm_wg.generate_teacher_prefix(teacher_request)
+        expected_shape = (len(gen_batch), self.teacher_start_prefix_length)
+        if tuple(prefix.batch["teacher_start_tokens"].shape) != expected_shape:
+            raise RuntimeError(
+                "Teacher prefix shape mismatch: "
+                f"expected {expected_shape}, got {tuple(prefix.batch['teacher_start_tokens'].shape)}"
+            )
+        if not torch.all(prefix.batch["teacher_start_token_mask"] == 1):
+            raise RuntimeError(
+                "teacher_start requires a full fixed-length teacher prefix; the teacher returned an early EOS token"
+            )
+        return prefix
+
+    def _append_teacher_start_to_prompt(self, gen_batch: DataProto, teacher_prefix: DataProto) -> DataProto:
+        """Append teacher tokens to the student rollout prompt while preserving the original prompt separately."""
+        prefix_tokens = teacher_prefix.batch["teacher_start_tokens"]
+        prefix_mask = teacher_prefix.batch["teacher_start_token_mask"]
+        input_ids = gen_batch.batch["input_ids"]
+        attention_mask = gen_batch.batch["attention_mask"]
+        if input_ids.device != prefix_tokens.device:
+            prefix_tokens = prefix_tokens.to(input_ids.device)
+            prefix_mask = prefix_mask.to(attention_mask.device)
+
+        augmented_attention_mask = torch.cat((attention_mask, prefix_mask), dim=-1)
+        augmented_tensors = {key: value for key, value in gen_batch.batch.items()}
+        augmented_tensors["input_ids"] = torch.cat((input_ids, prefix_tokens), dim=-1)
+        augmented_tensors["attention_mask"] = augmented_attention_mask
+        augmented_tensors["position_ids"] = compute_position_id_with_mask(augmented_attention_mask)
+        return DataProto.from_dict(
+            tensors=augmented_tensors,
+            non_tensors=dict(gen_batch.non_tensor_batch),
+            meta_info=dict(gen_batch.meta_info),
+        )
+
+    def _set_teacher_start_student_response_length(self, gen_batch: DataProto):
+        """Reserve the prefix within the normal rollout token budget for the student suffix."""
+        total_response_length = int(
+            gen_batch.meta_info.get("max_response_length", self.config.actor_rollout_ref.rollout.response_length)
+        )
+        student_response_length = total_response_length - self.teacher_start_prefix_length
+        if student_response_length < self.teacher_start_min_student_response_length:
+            raise ValueError(
+                "teacher_start leaves too few rollout tokens for the student: "
+                f"total={total_response_length}, prefix={self.teacher_start_prefix_length}, "
+                f"minimum suffix={self.teacher_start_min_student_response_length}"
+            )
+        gen_batch.meta_info["max_response_length"] = student_response_length
+        return student_response_length
+
+    def _merge_teacher_start_and_student_rollout(
+        self,
+        original_prompts: DataProto,
+        teacher_prefix: DataProto,
+        student_rollout: DataProto,
+    ) -> DataProto:
+        """Restore the original prompt/response boundary after student suffix generation."""
+        device = student_rollout.batch["responses"].device
+        original_prompt_tokens = original_prompts.batch["input_ids"].to(device)
+        original_prompt_mask = original_prompts.batch["attention_mask"].to(device)
+        teacher_tokens = teacher_prefix.batch["teacher_start_tokens"].to(device)
+        teacher_mask = teacher_prefix.batch["teacher_start_token_mask"].to(device)
+        student_tokens = student_rollout.batch["responses"]
+        student_response_length = student_tokens.size(1)
+        student_mask = student_rollout.batch["attention_mask"][:, -student_response_length:]
+        if "response_mask" in student_rollout.batch.keys():
+            student_mask = student_rollout.batch["response_mask"]
+
+        full_response = torch.cat((teacher_tokens, student_tokens), dim=-1)
+        full_attention_mask = torch.cat((original_prompt_mask, teacher_mask, student_mask), dim=-1)
+        teacher_start_mask = torch.cat((teacher_mask, torch.zeros_like(student_mask)), dim=-1)
+        student_response_mask = torch.cat((torch.zeros_like(teacher_mask), student_mask), dim=-1)
+
+        student_rollout.batch["prompts"] = original_prompt_tokens
+        student_rollout.batch["responses"] = full_response
+        student_rollout.batch["input_ids"] = torch.cat((original_prompt_tokens, full_response), dim=-1)
+        student_rollout.batch["attention_mask"] = full_attention_mask
+        student_rollout.batch["position_ids"] = compute_position_id_with_mask(full_attention_mask)
+        student_rollout.batch["teacher_start_mask"] = teacher_start_mask
+        student_rollout.batch["student_response_mask"] = student_response_mask
+        return student_rollout
 
     def _update_prune_opd_dynamic_response_length(self, effective_response_length: torch.Tensor) -> dict[str, float]:
         if not self.prune_opd_dynamic_response_length_enabled:
@@ -1201,13 +1335,30 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
-                self._set_dynamic_response_length_for_generation(gen_batch_output)
+                self._set_dynamic_response_length_for_generation(gen_batch)
+                teacher_prefix = None
+                original_prompts_for_rollout = None
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
+                    if self.teacher_start_enabled:
+                        with marked_timer("teacher_start", timing_raw, color="purple"):
+                            teacher_prefix = self._generate_teacher_start_prefix(gen_batch)
+                            original_prompts_for_rollout = gen_batch.repeat(
+                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                            )
+                            rollout_prompts = self._append_teacher_start_to_prompt(gen_batch, teacher_prefix)
+                            student_response_length = self._set_teacher_start_student_response_length(rollout_prompts)
+                            gen_batch_output = rollout_prompts.repeat(
+                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                            )
+                        metrics["teacher_start/prefix_length"] = float(self.teacher_start_prefix_length)
+                        metrics["teacher_start/student_rollout_max_length"] = float(student_response_length)
+                    else:
+                        gen_batch_output = gen_batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
+
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
@@ -1217,6 +1368,15 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+
+                    if self.teacher_start_enabled:
+                        gen_batch_output = self._merge_teacher_start_and_student_rollout(
+                            original_prompts_for_rollout,
+                            teacher_prefix.repeat(
+                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                            ),
+                            gen_batch_output,
+                        )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1253,7 +1413,9 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    if "response_mask" not in batch.batch.keys():
+                    if self.teacher_start_enabled:
+                        batch.batch["response_mask"] = batch.batch["student_response_mask"]
+                    elif "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,

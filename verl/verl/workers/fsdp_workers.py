@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -83,6 +84,7 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+from verl.utils.torch_functional import get_response_mask
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -874,24 +876,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         distill_teacher_module = None
         distill_teacher_use_remove_padding = False
         attention_distill_config = self.config.actor.get("attention_distill", {})
-        kv_cache_distill_config = self.config.actor.get("kv_cache_distill", {})
-        if attention_distill_config.get("enable", False) or kv_cache_distill_config.get("enable", False):
+        if attention_distill_config.get("enable", False):
             fused_workers = getattr(self, "fused_worker_dict", {})
             teacher_workers = [worker for worker in fused_workers.values() if hasattr(worker, "reward_module")]
             if len(teacher_workers) != 1:
                 raise RuntimeError(
-                    "Attention/KV distillation requires exactly one colocated RewardModelWorker. "
+                    "Attention distillation requires exactly one colocated RewardModelWorker. "
                     "Set reward_model.enable=True and reward_model.enable_resource_pool=False."
                 )
             teacher_worker = teacher_workers[0]
             if getattr(teacher_worker, "_do_switch_chat_template", False):
                 raise RuntimeError(
-                    "Attention/KV distillation requires identical actor/teacher token positions; "
+                    "Attention distillation requires identical actor/teacher token positions; "
                     "set reward_model.model.input_tokenizer=null."
                 )
             if getattr(teacher_worker, "use_ulysses_sp", False):
                 raise RuntimeError(
-                    "Attention/KV distillation currently requires teacher Ulysses sequence parallelism=1"
+                    "Attention distillation currently requires teacher Ulysses sequence parallelism=1"
                 )
             distill_teacher_module = teacher_worker.reward_module
             distill_teacher_use_remove_padding = teacher_worker.use_remove_padding
@@ -1950,6 +1951,91 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="purple", role="teacher_start_generate")
+    @torch.no_grad()
+    def generate_teacher_prefix(self, prompts: DataProto) -> DataProto:
+        """Generate a fixed-length teacher response prefix for hybrid OPD rollouts.
+
+        The prefix is generated from the unmodified prompt and later supplied as
+        context to the student rollout.  It is intentionally returned separately
+        so the trainer can keep the original prompt/response boundary intact.
+        """
+        if self._do_switch_chat_template:
+            raise RuntimeError(
+                "teacher_start requires reward_model.model.input_tokenizer=null so the teacher and student share tokens"
+            )
+        if self.use_ulysses_sp:
+            raise RuntimeError("teacher_start generation currently requires reward Ulysses sequence parallelism=1")
+
+        prefix_length = int(prompts.meta_info["teacher_start_prefix_length"])
+        if prefix_length <= 0:
+            raise ValueError("teacher_start_prefix_length must be positive")
+
+        prompts = prompts.to(get_device_id())
+        input_ids = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        if position_ids.dim() != 2:
+            raise NotImplementedError("teacher_start currently supports one-dimensional position IDs only")
+
+        do_sample = bool(prompts.meta_info.get("teacher_start_do_sample", True))
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        pad_token_id = prompts.meta_info["pad_token_id"]
+        generation_kwargs = {
+            "do_sample": do_sample,
+            "max_new_tokens": prefix_length,
+            "min_new_tokens": prefix_length,
+            "eos_token_id": eos_token_id,
+            "pad_token_id": pad_token_id,
+            "use_cache": True,
+            "return_dict_in_generate": True,
+            "output_scores": False,
+        }
+        if do_sample:
+            generation_kwargs.update(
+                temperature=float(prompts.meta_info.get("teacher_start_temperature", 1.0)),
+                top_p=float(prompts.meta_info.get("teacher_start_top_p", 1.0)),
+            )
+
+        was_training = self.reward_module.training
+        self.reward_module.eval()
+        param_ctx = nullcontext()
+        if isinstance(self.reward_module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.reward_module, writeback=False, recurse=False)
+        with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            generation_output = self.reward_module.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **generation_kwargs,
+            )
+        if was_training:
+            self.reward_module.train()
+
+        prefix_tokens = generation_output.sequences[:, input_ids.size(1) :]
+        if prefix_tokens.size(1) < prefix_length:
+            padding = torch.full(
+                (prefix_tokens.size(0), prefix_length - prefix_tokens.size(1)),
+                fill_value=pad_token_id,
+                dtype=prefix_tokens.dtype,
+                device=prefix_tokens.device,
+            )
+            prefix_tokens = torch.cat((prefix_tokens, padding), dim=1)
+        elif prefix_tokens.size(1) > prefix_length:
+            prefix_tokens = prefix_tokens[:, :prefix_length]
+
+        prefix_mask = get_response_mask(prefix_tokens, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        output = DataProto.from_dict(
+            tensors={
+                "teacher_start_tokens": prefix_tokens,
+                "teacher_start_token_mask": prefix_mask,
+            }
+        )
+        if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
+            self.reward_module._handle.reshard(True)
+        return output.to("cpu")
 
     def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input

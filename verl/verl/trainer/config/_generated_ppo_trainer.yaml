@@ -66,16 +66,10 @@ actor_rollout_ref:
       loss_coef: 0.05
       query_chunk_size: 32
       divergence: reverse_kl
-    kv_cache_distill:
-      _target_: verl.workers.config.KVCacheDistillConfig
+    teacher_start:
+      _target_: verl.workers.config.TeacherStartDistillConfig
       enable: false
-      loss_coef: 0.05
-      layer_indices:
-      - -1
-      token_scope: all
-      token_chunk_size: 1024
-      key_loss_weight: 1.0
-      value_loss_weight: 1.0
+      loss_coef: 1.0
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     entropy_coeff: 0

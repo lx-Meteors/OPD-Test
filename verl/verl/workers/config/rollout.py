@@ -27,6 +27,7 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
+    "TeacherStartConfig",
     "RolloutConfig",
 ]
 
@@ -93,6 +94,28 @@ class ServerConfig(BaseConfig):
 
 
 @dataclass
+class TeacherStartConfig(BaseConfig):
+    """Configuration for teacher-prefix / student-suffix hybrid rollouts."""
+
+    enable: bool = False
+    prefix_length: int = 500
+    min_student_response_length: int = 256
+    do_sample: bool = True
+    temperature: float = 1.0
+    top_p: float = 1.0
+
+    def __post_init__(self):
+        if self.prefix_length <= 0:
+            raise ValueError("teacher_start.prefix_length must be positive")
+        if self.min_student_response_length <= 0:
+            raise ValueError("teacher_start.min_student_response_length must be positive")
+        if self.temperature <= 0:
+            raise ValueError("teacher_start.temperature must be positive")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("teacher_start.top_p must be in (0, 1]")
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -144,6 +167,7 @@ class RolloutConfig(BaseConfig):
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", or "none"
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
     prune_opd: dict = field(default_factory=dict)
+    teacher_start: TeacherStartConfig = field(default_factory=TeacherStartConfig)
 
     disable_log_stats: bool = True
 
