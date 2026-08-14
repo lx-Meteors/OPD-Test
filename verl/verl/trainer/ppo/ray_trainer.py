@@ -511,6 +511,17 @@ class RayPPOTrainer:
         student_rollout.batch["position_ids"] = compute_position_id_with_mask(full_attention_mask)
         student_rollout.batch["teacher_start_mask"] = teacher_start_mask
         student_rollout.batch["student_response_mask"] = student_response_mask
+        if "rollout_log_probs" in student_rollout.batch.keys():
+            # vLLM only generated log-probabilities for the student suffix.  Keep
+            # the full response alignment expected by debug metrics; the prefix
+            # entries are ignored by student_response_mask / response_mask.
+            rollout_log_probs = student_rollout.batch["rollout_log_probs"]
+            prefix_log_probs = torch.zeros(
+                teacher_mask.shape,
+                dtype=rollout_log_probs.dtype,
+                device=rollout_log_probs.device,
+            )
+            student_rollout.batch["rollout_log_probs"] = torch.cat((prefix_log_probs, rollout_log_probs), dim=-1)
         return student_rollout
 
     def _update_prune_opd_dynamic_response_length(self, effective_response_length: torch.Tensor) -> dict[str, float]:
