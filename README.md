@@ -27,7 +27,11 @@ cd /input0/yyy/Prune-OPD
 DRY_RUN=1 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
-# 正式启动，默认就是方法本身（jeffreys 对称成对 KL + student 候选/加权 + 尾部块）
+# 当前方法：序门控双向 KL（order_gated_kl，纯 student top-16 + λ 权重插值，§1.5）
+MODEL_ROOT=/input0/models \
+bash experiments_scripts/og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
+# 成对形式（jeffreys 对称成对 KL + student 候选/加权 + 尾部块，§1）
 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 ```
@@ -382,6 +386,47 @@ token，会让概率质量不断从被采样处逃走、挤进一个越来越窄
 `rm_scores = -(S_logp - T_on_S) * w`，在 `no_grad` 下作为 $\nabla \log \pi$ 的系数，本身不被求导，
 所以单调性无关。想要"一项版"的可微目标，直接对齐 margin 的 $\tfrac12 (m - m_T)^2$ 才是有下界的选择。
 
+### 1.5 `order_gated_kl`：序门控双向 KL（当前方法）
+
+最新形式（2026-08-14）离开成对几何，改用 **baseline OPD 自己的逐格打分与梯度约定**，唯一的新对象
+是一个由**相对序**驱动的权重插值。设计动机与推导见 §10 的更新记录。
+
+**格集**：纯 student top-16（`student_top_k_ids` 原样——采样 token **不**去重出候选，无尾部块、
+无补集），与 baseline `only_stu` 的集合逐字一致。
+
+**损失**（$\Delta_c = \log p_c - \log q_c$ 为 raw 对数比值，即 baseline 的 `kl_val`）：
+
+$$
+w_c = (1-\lambda_t)\,\tilde p_c + \lambda_t\,\tilde q_c,\qquad
+L_t = \sum_{c \in \text{top-16}} \mathrm{sg}\big[w_c\,\Delta_c\big]\cdot \log p_c
+$$
+
+其中 $\tilde p$、$\tilde q$ 是两侧在 16 格上重归一的条件分布——正是 baseline 现成的
+`student_p` / `teacher_p` 两种权重模式。$\lambda_t$ 是 **top-1 锚序差**（detach）：
+
+$$
+m_j = \log p(z_a) - \log p(z_j),\quad m^T_j = \log q(z_a) - \log q(z_j),\quad
+\lambda_t = \max_{j \ne a}\big|\sigma(m_j) - \sigma(m^T_j)\big|,\quad a = \arg\max_j \log p(z_j)
+$$
+
+要点：
+
+- **梯度约定就是 baseline 的**：系数整体 stop-gradient、$\log p_c$ 做载体，等于 PPO wings 在
+  ratio ≈ 1 处的力。KL 散度没有消失——它住在系数 $w_c\Delta_c$ 里，和 baseline 把它放进
+  reward 是同一个位置（可微对象若直接用 KL 数值，autograd 会对权重与归一化项求导，产生
+  与 KL 方向无关的水平漂移）。
+- **λ = 0 逐格还原 baseline**（student_p 权重的逆向 KL 打分）；**λ = 1 是 baseline 自己的
+  teacher_p（正向 KL）变体**。教师质疑学生众数（把任何候选排到 top-1 之上）时 λ 抬升，
+  teacher 质量权重接管被 student 饿死的格——逆向权重 $\tilde p_c \approx 0$ 的死区由
+  $\tilde q_c$ 补上，即"先覆盖防局部最优、再捕获"。
+- **两个方向共享固定点 $p_c = q_c$**（raw 绝对水平）：λ 只改优化路径，不改终点，调度噪声
+  不会指向错误目标。
+- 需要 `tail_candidate=False`、`complement_candidate=False`（违反会报错）；
+  `weight_source` / `normalize_weights` 不生效。锚点张量只喂诊断。
+
+启动脚本：`experiments_scripts/og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh`。
+新增指标见 §7。
+
 ## 2. 代码位置
 
 | 文件 | 作用 |
@@ -391,7 +436,8 @@ token，会让概率质量不断从被采样处逃走、挤进一个越来越窄
 | `verl/verl/workers/config/actor.py` | `LAPDConfig` 配置项 |
 | `verl/verl/trainer/config/actor/actor.yaml` | `actor_rollout_ref.actor.l_apd.*` 默认值 |
 | `verl/verl/trainer/ppo/ray_trainer.py` | 保留 L-APD 需要的 teacher 张量到 actor update |
-| `experiments_scripts/l-apd-*.sh` | Table 1 配置的启动脚本 |
+| `experiments_scripts/l-apd-*.sh` | 成对形式（jeffreys）的启动脚本 |
+| `experiments_scripts/og-kl-*.sh` | 序门控双向 KL（`order_gated_kl`，当前方法，§1.5）的启动脚本 |
 | `verl/tests/trainer/ppo/test_l_apd_on_cpu.py` | 单元测试 |
 
 `l_apd.enable=false` 时以上改动全部旁路，OPD / Prune-OPD 原有行为逐字不变。
@@ -554,13 +600,17 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `L_APD_COMPLEMENT_CANDIDATE` | `...l_apd.complement_candidate` | `False` | 聚合对手取"`y_t` 的补集"（历史两项式，重复计数，消融），见 §1.2 |
 | `L_APD_NORMALIZE_WEIGHTS` | `...l_apd.normalize_weights` | `True` | 权重按自身和归一化；tail 模式下与除以加权侧的 `1 − 锚点质量` 浮点等价 |
 | `L_APD_WEIGHT_SOURCE` | `...l_apd.weight_source` | `student` | 权重用谁的质量：`student` 是方法本身（闭环、与逆向成对 KL 方向一致，§1/§1.1），`teacher` 是历史开环加权，保留为消融 |
-| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `jeffreys` | 每对用什么散度。`jeffreys`（双向 KL 之和，胜率差 × margin 差）是方法本身（§1.3）；`reverse_kl` 是历史默认、现为单向消融（σ′ 门实测晚期停滞）；`forward_kl` 是另一个单向；`log_ratio` 是只保留一项的裸对数比值消融、非散度且实测退化（§1.4）。库默认与脚本默认一致 |
+| `L_APD_PAIR_DIVERGENCE` | `...l_apd.pair_divergence` | `jeffreys` | 每对用什么散度。`order_gated_kl` 是当前方法（§1.5，序门控双向 KL，走独立分支：纯 student top-16 格、λ 插值 baseline 的 student_p/teacher_p 权重、baseline 的 sg-系数梯度约定；要求 tail/complement 全关，用 `og-kl-*.sh` 启动）；`jeffreys`（双向 KL 之和，胜率差 × margin 差）是成对形式（§1.3）；`reverse_kl` 是历史默认、现为单向消融（σ′ 门实测晚期停滞）；`forward_kl` 是另一个单向；`log_ratio` 是只保留一项的裸对数比值消融、非散度且实测退化（§1.4） |
 
 > 两个聚合对手**至少要开一个**。全关掉时锚点概率不可辨识（§1.2），只用于复现那个退化情形。
 
 消融示例：
 
 ```bash
+# 当前方法：序门控双向 KL（专用脚本已把 tail/complement 关掉）
+MODEL_ROOT=/input0/models \
+bash experiments_scripts/og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
 # 单向消融：退回历史默认的逆向 KL（sigma' 门，200 步实测晚期停滞）
 L_APD_PAIR_DIVERGENCE=reverse_kl MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
@@ -633,6 +683,16 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/l_apd_candidate_count` | 参与 loss 的候选数 |
 | `actor/l_apd_candidate_weight_sum` | 候选权重和，`normalize_weights=True` 且有聚合对手时应恒等于 1 |
 
+`order_gated_kl`（§1.5）走独立分支，成对指标（`pair_kl` / `pairwise_*` / `tail_*`）不再记录，
+改为下面这组（锚概率与 `candidate_count` 照常）：
+
+| 指标 | 含义 |
+| --- | --- |
+| `actor/l_apd_order_lambda` | 序门 $\lambda_t$（top-1 锚的最大 $\sigma$ 序差）。预期先高后退火：教师认可学生众数与置信轮廓后 λ → 0，loss 逐格还原 baseline 逆向打分 |
+| `actor/l_apd_rev_kl_est` / `..._fwd_kl_est` | $\sum \tilde p_c \Delta_c$ / $\sum \tilde q_c (-\Delta_c)$，逆向/正向 KL 的 16 格估计。`rev_kl_est` 与 baseline 的 token reward 同尺度，可 1:1 对表 |
+| `actor/l_apd_mode_agreement` | 16 格内两侧 argmax 一致的位置占比，应随 λ 退火而上升 |
+| `actor/l_apd_student_covered_prob` / `..._teacher_covered_prob` | 两侧在 student top-16 上的覆盖质量（raw）。固定点在 raw 水平上，观察 $P$ 是否向 $Q$ 收敛 |
+
 评测结果仍在 `val-core/*` 下（AIME24 / AIME25 / AMC23 的 Avg@16）。
 
 ## 8. 单元测试
@@ -702,6 +762,34 @@ student 加权确实是库默认、权重逐元素等于 $\mathrm{sg}[p(o)/(1-p(
 - 单节点默认 8 卡（`trainer.n_gpus_per_node=8`），卡数不同时请追加 override。
 
 ## 10. 更新记录
+
+### 2026-08-14：序门控双向 KL（`order_gated_kl`，当前方法）
+
+- **loss 从成对 Jeffreys 换成 baseline 力学上的序门控双向 KL**（§1.5，`pair_divergence=order_gated_kl`，
+  独立分支）。与 baseline 的单变量对照被压到极限：格集是 baseline `only_stu` 的**纯 student
+  top-16**（采样 token 不再去重出候选、无尾部块、无补集）；逐格打分是 baseline 自己的 k1 形式
+  ——冻结系数 $\mathrm{sg}[w_c \Delta_c]$ 乘可微 $\log p_c$（即 PPO wings 在 ratio ≈ 1 处的力）；
+  **唯一新对象**是权重 $w = (1-\lambda)\tilde p + \lambda \tilde q$，在 baseline 现成的
+  `student_p`（逆向 KL）/ `teacher_p`（正向 KL）两种权重模式之间逐 token 插值。
+- **λ 是 top-1 锚序差** $\max_{j}\lvert\sigma(m_j) - \sigma(m^T_j)\rvert$（detach）：锚取 student
+  在 16 格内的 argmax（比采样锚稳定、读 state 级属性而非轨迹噪声），margin 相对其余 15 格计算。
+  教师认可学生众数与置信轮廓时 λ → 0，loss 逐格还原 baseline 的逆向打分（安全地板）；教师质疑
+  众数时 λ 抬升，teacher 质量权重接管被 student 饿死的格——逆向权重 $\tilde p_c \approx 0$ 的
+  死区由 $\tilde q_c$ 补上，即"相对序作为捕获许可：先覆盖防局部最优，教师认可后再捕获"。
+- **动机是 jeffreys 200 步完整 run 的实测**：val 全程低于 baseline（step 160 mean@16 0.379 vs
+  0.418，best@16 差距更大），token 熵却相近——pathwise 梯度精确匹配教师的保序结构，收敛太"干净"，
+  输出多样性输给 baseline 的 REINFORCE 式带噪更新。诊断指向逆向侧死区与过早捕获，而不是候选来源。
+- **形式的选择过程**（历次讨论的收敛点）：λ-混合成对 KL → λ-混合 partition KL（需尾部格）→
+  两侧限制重归一的条件分布（去尾部）→ 放弃 GKL 修正项、放弃裸公式（有质量泄漏/尾部湮灭的错误
+  吸引子）→ 最终对齐 baseline 自己的 sg-系数约定：KL 数值住在冻结系数与监控指标里，可微载体
+  只有 $\log p_c$，两个方向共享 raw 水平固定点 $p_c = q_c$，λ 只改路径不改终点。
+- 实现：`l_apd.py` 新增 `_order_gated_kl_token_loss` 分支（要求 `tail_candidate=False`、
+  `complement_candidate=False`，违反报错）；`dp_actor.py` 在该散度下不再把采样 token 从候选中
+  mask 掉；新增专用启动脚本 `og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh`；新指标
+  `order_lambda` / `rev_kl_est` / `fwd_kl_est` / `mode_agreement` / `student(teacher)_covered_prob`（§7）。
+- 单元测试 48/48，新增 7 项：暴力参考实现对照（loss 与 λ 逐元素）、冻结系数解析梯度对照、
+  $p = q$ 零点零梯度、λ 正确读取众数争议（轮廓一致 ⇒ λ ≈ 0 且保留非零 baseline 打分；教师翻转
+  众数 ⇒ λ > 0.5）、teacher 权重救援饿死格、聚合对手拒绝、mask 位无 loss 无 NaN。
 
 ### 2026-08-13：每对散度对称化为 Jeffreys（胜率差 × margin 差）
 

@@ -113,7 +113,12 @@ l_apd:
   # keeps only KL(p~ || q~) (historical default, one-direction ablation); forward_kl keeps only
   # KL(q~ || p~). All three share the same optimum and first-order behaviour around it. log_ratio
   # drops the v = z outcome and keeps the bare log[p~(y_t) / q~(y_t)]; it is not a divergence
-  # (monotone in the margin, unbounded below, teacher absent from the gradient), ablation only
+  # (monotone in the margin, unbounded below, teacher absent from the gradient), ablation only.
+  # order_gated_kl scores the pure student top-k cells the way the OPD baseline does (frozen
+  # per-cell k1 coefficient sg[w_c (log p_c - log q_c)] carried by log p_c), with the weight
+  # vector blending the baseline's student_p and teacher_p modes by the top-1 anchored order gap
+  # lambda = max_j |sigma(m_j) - sigma(m_j^T)|; requires tail_candidate=false and
+  # complement_candidate=false, and ignores weight_source / normalize_weights
   pair_divergence: jeffreys
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C

@@ -84,7 +84,15 @@ import torch.nn.functional as F
 
 __all__ = ["compute_l_apd_token_loss", "l_apd_batch_keys"]
 
-_PAIR_DIVERGENCES = ("reverse_kl", "forward_kl", "log_ratio", "partition_kl", "odds_kl", "jeffreys")
+_PAIR_DIVERGENCES = (
+    "reverse_kl",
+    "forward_kl",
+    "log_ratio",
+    "partition_kl",
+    "odds_kl",
+    "jeffreys",
+    "order_gated_kl",
+)
 
 # Whose probabilities set the per-pair mixture weights.
 _WEIGHT_SOURCES = ("student", "teacher")
@@ -133,6 +141,83 @@ def _log1mexp(x: torch.Tensor) -> torch.Tensor:
     # Both branches stay finite everywhere on x <= _LOG1MEXP_MAX, which keeps
     # ``torch.where`` from propagating NaNs into the backward pass.
     return torch.where(x > -0.6931471805599453, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
+
+
+def _order_gated_kl_token_loss(
+    student_anchor: torch.Tensor,
+    student_candidates: torch.Tensor,
+    teacher_anchor: torch.Tensor,
+    teacher_candidates: torch.Tensor,
+    valid: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Order-gated bidirectional KL over the pure student top-k cells.
+
+    Baseline-mechanics form: the differentiable object is ``sg[w_c Delta_c] * log p_c``
+    per cell, i.e. a frozen per-cell k1 coefficient carried by the student log-prob --
+    exactly the OPD baseline's PPO-wings force at ratio ~= 1. ``Delta_c`` is the raw
+    log-ratio ``log p_c - log q_c`` (the baseline's ``kl_val``) and the weight vector
+    interpolates between the baseline's own two weight modes,
+
+        ``w = (1 - lambda) p~ + lambda q~``,
+
+    with ``p~`` / ``q~`` the student / teacher probabilities renormalized over the
+    cells (``student_p`` / ``teacher_p`` in baseline terms). ``lambda`` is the top-1
+    anchored order gap: the student's strongest cell is the reference, and
+
+        ``lambda = max_j |sigma(m_j) - sigma(m_j^T)|``
+
+    over the remaining cells, detached. At ``lambda = 0`` the loss reproduces the
+    baseline's reverse-KL scoring cell by cell (student_p weights); at ``lambda = 1``
+    it is the baseline's teacher_p (forward-KL) variant, whose teacher-mass weights
+    keep pulling cells the student has starved (``p~ ~ 0`` kills the reverse weight,
+    the classic dead zone). Both directions share the fixed point ``p_c = q_c`` on
+    raw masses, so the gate reroutes the optimization path, never the destination.
+
+    The cells are the candidates exactly as passed (the sampled token is *not*
+    deduplicated out): with ``candidate_source="student"`` this is the baseline's
+    ``student_top_k_ids`` set verbatim. The anchor tensors only feed diagnostics.
+    """
+    neg_inf = torch.finfo(torch.float32).min
+    masked_student = student_candidates.masked_fill(~valid, neg_inf)
+    masked_teacher = teacher_candidates.masked_fill(~valid, neg_inf)
+
+    with torch.no_grad():
+        # Order gate: reference = the student's top-1 cell, the token reverse KL
+        # sharpens toward. Any candidate whose win-probability against that mode
+        # differs between the two models raises lambda toward coverage.
+        top1 = masked_student.argmax(dim=-1, keepdim=True)
+        student_margins = masked_student.gather(-1, top1) - masked_student
+        teacher_margins = masked_teacher.gather(-1, top1) - masked_teacher
+        order_gap = (torch.sigmoid(student_margins) - torch.sigmoid(teacher_margins)).abs()
+        order_gap = torch.where(valid, order_gap, torch.zeros_like(order_gap))
+        order_lambda = order_gap.amax(dim=-1)
+
+        # The baseline's two weight modes over the same cells, blended by the gate.
+        student_weights = torch.softmax(masked_student, dim=-1)
+        teacher_weights = torch.softmax(masked_teacher, dim=-1)
+        delta = student_candidates - teacher_candidates
+        gate = order_lambda.unsqueeze(-1)
+        blended_weights = (1.0 - gate) * student_weights + gate * teacher_weights
+        coefficients = torch.where(valid, blended_weights * delta, torch.zeros_like(delta))
+
+    token_loss = (coefficients * student_candidates).sum(dim=-1) * response_mask
+
+    with torch.no_grad():
+        zeros = torch.zeros_like(delta)
+        diagnostics = {
+            "order_lambda": order_lambda,
+            # Same objects the baseline logs as rewards, so the dashboards compare 1:1.
+            "rev_kl_est": torch.where(valid, student_weights * delta, zeros).sum(dim=-1),
+            "fwd_kl_est": torch.where(valid, teacher_weights * (-delta), zeros).sum(dim=-1),
+            "mode_agreement": (masked_student.argmax(dim=-1) == masked_teacher.argmax(dim=-1)).float(),
+            "student_covered_prob": (torch.exp(student_candidates) * valid).sum(dim=-1),
+            "teacher_covered_prob": (torch.exp(teacher_candidates) * valid).sum(dim=-1),
+            "teacher_anchor_prob": torch.exp(teacher_anchor),
+            "student_anchor_prob": torch.exp(student_anchor),
+            "candidate_count": valid.float().sum(dim=-1),
+        }
+    return token_loss, diagnostics
 
 
 def _reverse_pair_kl(student_margins: torch.Tensor, teacher_margins: torch.Tensor) -> torch.Tensor:
@@ -267,6 +352,21 @@ def compute_l_apd_token_loss(
             either; ``sg[p(y_t)] * sum_c GKL`` upper-bounds the partition KL
             (tight at ``p(y_t) = q(y_t)``).
 
+            ``order_gated_kl`` leaves the pairwise geometry entirely and scores the
+            candidate cells the way the OPD baseline does: per-cell coefficient
+            ``sg[w_c * (log p_c - log q_c)]`` carried by the differentiable
+            ``log p_c`` (the baseline's PPO-wings force at ratio ~= 1), with the
+            weight vector interpolating between the baseline's student_p and
+            teacher_p modes, ``w = (1 - lambda) p~ + lambda q~``. ``lambda`` is the
+            top-1 anchored order gap ``max_j |sigma(m_j) - sigma(m_j^T)|``
+            (detached): order agreement => baseline reverse-KL scoring, order
+            disagreement => teacher-mass (forward-KL) weights that rescue starved
+            cells. Requires ``tail_candidate=False`` and
+            ``complement_candidate=False``; ``candidate_mask`` should keep the
+            sampled token so the cells are the pure student top-k (the caller
+            handles this). ``weight_source`` and ``normalize_weights`` are ignored.
+            The anchor tensors feed diagnostics only.
+
             ``jeffreys`` symmetrizes the per-duel Bernoulli KL: for two-point
             distributions the sum of both directions folds to the closed form
             ``(sigma(m) - sigma(m_T)) * (m - m_T)`` -- win-probability gap times
@@ -298,6 +398,11 @@ def compute_l_apd_token_loss(
             "l_apd.pair_divergence='partition_kl' requires tail_candidate=True: the categorical KL "
             "is defined on the partition {anchor} + candidates + tail, which must cover the vocabulary."
         )
+    if pair_divergence == "order_gated_kl" and (tail_candidate or complement_candidate):
+        raise ValueError(
+            "l_apd.pair_divergence='order_gated_kl' operates on the pure student top-k cells "
+            "(baseline-aligned set); set tail_candidate=False and complement_candidate=False."
+        )
 
     student_anchor = student_anchor_log_probs.float()
     student_candidates = student_candidate_log_probs.float()
@@ -305,6 +410,19 @@ def compute_l_apd_token_loss(
     teacher_candidates = teacher_candidate_log_probs.float().detach()
 
     valid = candidate_mask.bool() & response_mask.unsqueeze(-1).bool()
+
+    if pair_divergence == "order_gated_kl":
+        # Self-contained: no anchor-star machinery, no aggregate opponents, and
+        # ``weight_source`` / ``normalize_weights`` do not apply (the weights are
+        # the lambda-blend of the two baseline modes by construction).
+        return _order_gated_kl_token_loss(
+            student_anchor=student_anchor,
+            student_candidates=student_candidates,
+            teacher_anchor=teacher_anchor,
+            teacher_candidates=teacher_candidates,
+            valid=valid,
+            response_mask=response_mask,
+        )
 
     # The weighting side. Student log-probs are detached here so the weights are
     # per-step constants: they set how loudly each duel is scored, never a second

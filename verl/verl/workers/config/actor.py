@@ -80,6 +80,15 @@ class LAPDConfig(BaseConfig):
             ``1 - p~(y_t)`` never vanishes and never sees the teacher, so the objective is
             unbounded below. Ablation only, and it does degenerate in practice: on-policy it
             collapses the entropy and grows the very KL it is meant to shrink.
+            'order_gated_kl' scores the pure student top-k cells with the OPD baseline's own
+            mechanics -- frozen per-cell k1 coefficient ``sg[w_c (log p_c - log q_c)]`` carried by
+            the differentiable ``log p_c`` -- while the weight vector blends the baseline's
+            student_p and teacher_p modes by the top-1 anchored order gap
+            ``lambda = max_j |sigma(m_j) - sigma(m_j^T)|`` (detached). Order agreement recovers the
+            baseline reverse-KL scoring cell by cell; disagreement shifts budget to teacher-mass
+            (forward-KL) weights that rescue cells the student has starved. Requires
+            ``tail_candidate=False`` and ``complement_candidate=False``; ``weight_source`` and
+            ``normalize_weights`` are ignored.
     """
 
     enable: bool = False

@@ -1452,6 +1452,236 @@ def test_jeffreys_ungates_the_dropped_teacher_token():
     assert abs(dropped_jeffreys) > 10.0 * abs(dropped_pairwise), (dropped_jeffreys, dropped_pairwise)
 
 
+def _call_order_gated(student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs):
+    """order_gated_kl call: cells are the candidates verbatim (mask keeps the sampled token)."""
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    kwargs.setdefault("tail_candidate", False)
+    kwargs.setdefault("complement_candidate", False)
+    return compute_l_apd_token_loss(
+        student_anchor_log_probs=student_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1),
+        student_candidate_log_probs=student_log_probs.gather(-1, candidate_ids),
+        teacher_anchor_log_probs=teacher_log_probs.gather(-1, anchors.unsqueeze(-1)).squeeze(-1),
+        teacher_candidate_log_probs=teacher_log_probs.gather(-1, candidate_ids),
+        candidate_mask=torch.ones_like(candidate_ids, dtype=torch.bool),
+        response_mask=response_mask,
+        pair_divergence="order_gated_kl",
+        **kwargs,
+    )
+
+
+def _reference_order_gated_kl(student_logits, teacher_logits, candidate_ids, response_mask):
+    """Brute-force: L_t = sum_c [(1 - lam) p~ + lam q~]_c * Delta_c * log p_c."""
+    p = torch.log_softmax(student_logits, dim=-1)
+    q = torch.log_softmax(teacher_logits, dim=-1)
+    bs, seq_len, _ = student_logits.shape
+
+    token_loss = torch.zeros(bs, seq_len, dtype=torch.float64)
+    lambdas = torch.zeros(bs, seq_len, dtype=torch.float64)
+    for b in range(bs):
+        for t in range(seq_len):
+            if response_mask[b, t] == 0:
+                continue
+            cells = candidate_ids[b, t]
+            s_lp = p[b, t, cells].double()
+            t_lp = q[b, t, cells].double()
+            top1 = int(s_lp.argmax())
+            margins = s_lp[top1] - s_lp
+            teacher_margins = t_lp[top1] - t_lp
+            lam = (torch.sigmoid(margins) - torch.sigmoid(teacher_margins)).abs().max()
+            student_weights = torch.softmax(s_lp, dim=-1)
+            teacher_weights = torch.softmax(t_lp, dim=-1)
+            blended = (1.0 - lam) * student_weights + lam * teacher_weights
+            token_loss[b, t] = (blended * (s_lp - t_lp) * s_lp).sum()
+            lambdas[b, t] = lam
+    return token_loss, lambdas
+
+
+def test_order_gated_kl_matches_definition():
+    """Loss and lambda match the brute-force definition on student top-k cells."""
+    vocab, k = 16, 6
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=79)
+    candidate_ids = torch.topk(student_logits, k=k, dim=-1).indices
+
+    token_loss, diagnostics = _call_order_gated(
+        student_logits, teacher_logits, anchors, response_mask, candidate_ids
+    )
+    expected_loss, expected_lambda = _reference_order_gated_kl(
+        student_logits, teacher_logits, candidate_ids, response_mask
+    )
+
+    torch.testing.assert_close(token_loss.double(), expected_loss, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(
+        (diagnostics["order_lambda"] * response_mask).double(),
+        expected_lambda,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_order_gated_kl_gradient_is_frozen_coefficient_times_logprob():
+    """Autograd equals d/dz sum_c sg[w_c Delta_c] log p_c: coeff at the cell minus p_v * sum coeff."""
+    vocab, k = 12, 5
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=83)
+    student_logits = student_logits.float().requires_grad_(True)
+    candidate_ids = torch.topk(student_logits.detach(), k=k, dim=-1).indices
+
+    token_loss, _ = _call_order_gated(
+        student_logits, teacher_logits.float(), anchors, response_mask, candidate_ids
+    )
+    token_loss.sum().backward()
+
+    p = torch.log_softmax(student_logits.detach(), dim=-1)
+    q = torch.log_softmax(teacher_logits.float(), dim=-1)
+    s_lp = p.gather(-1, candidate_ids)
+    t_lp = q.gather(-1, candidate_ids)
+    top1 = s_lp.argmax(dim=-1, keepdim=True)
+    lam = (
+        (torch.sigmoid(s_lp.gather(-1, top1) - s_lp) - torch.sigmoid(t_lp.gather(-1, top1) - t_lp))
+        .abs()
+        .amax(dim=-1, keepdim=True)
+    )
+    blended = (1.0 - lam) * torch.softmax(s_lp, dim=-1) + lam * torch.softmax(t_lp, dim=-1)
+    coeff = blended * (s_lp - t_lp) * response_mask.unsqueeze(-1)
+
+    expected = torch.zeros_like(student_logits)
+    expected.scatter_add_(-1, candidate_ids, coeff)
+    expected = expected - p.exp() * coeff.sum(dim=-1, keepdim=True)
+
+    torch.testing.assert_close(student_logits.grad, expected, atol=1e-5, rtol=1e-3)
+
+
+def test_order_gated_kl_is_zero_with_zero_gradient_at_p_equals_q():
+    """The fixed point is p = q on raw cell masses for every lambda."""
+    vocab, k = 12, 5
+    student_logits, _, anchors, response_mask = _make_batch(vocab=vocab, seed=89)
+    student_logits = student_logits.clone().float().requires_grad_(True)
+    teacher_logits = student_logits.detach().clone()
+    candidate_ids = torch.topk(teacher_logits, k=k, dim=-1).indices
+
+    token_loss, diagnostics = _call_order_gated(
+        student_logits, teacher_logits, anchors, response_mask, candidate_ids
+    )
+    token_loss.sum().backward()
+
+    torch.testing.assert_close(token_loss, torch.zeros_like(token_loss), atol=1e-7, rtol=0)
+    torch.testing.assert_close(
+        student_logits.grad, torch.zeros_like(student_logits.grad), atol=1e-6, rtol=0
+    )
+    assert (diagnostics["order_lambda"] * response_mask).abs().max() < 1e-6
+    assert (diagnostics["mode_agreement"] * response_mask).min() >= 0.0
+
+
+def test_order_gated_kl_lambda_reads_the_mode_dispute():
+    """Teacher agreeing on the profile => lambda ~ 0 (pure student_p weighting);
+    teacher reversing the student's mode => lambda large and teacher weights enter.
+
+    The lambda = 0 case keeps a nonzero loss: the teacher differs only outside the
+    cells, so within-cell margins agree while the raw log-ratios carry a constant
+    offset -- exactly the baseline reverse-KL scoring situation.
+    """
+    vocab, k = 8, 4
+    bs, seq_len = 1, 1
+    generator = torch.Generator().manual_seed(97)
+    student_logits = torch.randn(bs, seq_len, vocab, generator=generator, dtype=torch.float64)
+    anchors = torch.zeros(bs, seq_len, dtype=torch.long)
+    response_mask = torch.ones(bs, seq_len)
+    candidate_ids = torch.topk(student_logits, k=k, dim=-1).indices
+
+    # Same logits on the cells, extra mass on a non-cell token: margins agree.
+    agreeing_teacher = student_logits.clone()
+    non_cell = [v for v in range(vocab) if v not in set(candidate_ids[0, 0].tolist())][0]
+    agreeing_teacher[0, 0, non_cell] += 2.0
+
+    loss_agree, diag_agree = _call_order_gated(
+        student_logits, agreeing_teacher, anchors, response_mask, candidate_ids
+    )
+    assert diag_agree["order_lambda"].max() < 1e-6
+    assert loss_agree.abs().max() > 1e-4  # nonzero raw log-ratios, baseline scoring active
+
+    # Teacher strongly prefers the student's weakest cell: mode dispute.
+    disputing_teacher = student_logits.clone()
+    weakest = candidate_ids[0, 0, -1]
+    disputing_teacher[0, 0, weakest] += 8.0
+    _, diag_dispute = _call_order_gated(
+        student_logits, disputing_teacher, anchors, response_mask, candidate_ids
+    )
+    assert diag_dispute["order_lambda"].min() > 0.5
+    assert diag_dispute["mode_agreement"].max() < 1.0
+
+
+def test_order_gated_kl_rescues_starved_cells():
+    """A cell the student starved keeps a gradient through the teacher-mass weights.
+
+    Under pure student_p weighting (the baseline's dead zone) the cell's weight is
+    p~ ~ 0; the order gate raises lambda there, so the teacher weight q~ takes over
+    and the cell's logit is pushed up.
+    """
+    import math
+
+    vocab = 8
+    bs, seq_len = 1, 1
+    student_logits = torch.full((bs, seq_len, vocab), math.log(0.0596), dtype=torch.float64)
+    student_logits[0, 0, 0] = math.log(0.7)
+    student_logits[0, 0, 1] = math.log(0.002)
+    teacher_logits = torch.full((bs, seq_len, vocab), math.log(0.0667), dtype=torch.float64)
+    teacher_logits[0, 0, 0] = math.log(0.1)
+    teacher_logits[0, 0, 1] = math.log(0.5)
+    anchors = torch.zeros(bs, seq_len, dtype=torch.long)
+    response_mask = torch.ones(bs, seq_len)
+    # k = vocab so the starved teacher favourite (p = 0.002, below the student's
+    # top-4 cut) is guaranteed to be a cell; the mechanism under test is the
+    # weight handover, not the nomination.
+    candidate_ids = torch.topk(student_logits, k=vocab, dim=-1).indices
+    assert 1 in candidate_ids[0, 0].tolist()  # the starved teacher favourite is a cell
+
+    logits = student_logits.clone().float().requires_grad_(True)
+    token_loss, diagnostics = _call_order_gated(
+        logits, teacher_logits.float(), anchors, response_mask, candidate_ids
+    )
+    token_loss.sum().backward()
+
+    assert diagnostics["order_lambda"].min() > 0.5  # mode dispute detected
+    assert logits.grad[0, 0, 1] < -1e-3  # starved cell pushed up (descent on negative grad)
+    assert logits.grad[0, 0, 0] > 1e-3  # overconfident wrong mode pushed down
+
+
+def test_order_gated_kl_rejects_aggregate_candidates():
+    vocab, k = 12, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=101)
+    candidate_ids = torch.topk(student_logits, k=k, dim=-1).indices
+
+    for kwargs in (dict(tail_candidate=True), dict(complement_candidate=True)):
+        try:
+            _call_order_gated(
+                student_logits, teacher_logits, anchors, response_mask, candidate_ids, **kwargs
+            )
+        except ValueError as error:
+            assert "order_gated_kl" in str(error)
+        else:
+            raise AssertionError(f"order_gated_kl with {kwargs} should raise")
+
+
+def test_order_gated_kl_masked_positions_are_free_of_loss_and_nan():
+    vocab, k = 10, 4
+    student_logits, teacher_logits, anchors, response_mask = _make_batch(vocab=vocab, seed=103)
+    student_logits = student_logits.float().requires_grad_(True)
+    response_mask = torch.zeros_like(response_mask)
+    response_mask[0, 0] = 1
+    candidate_ids = torch.topk(student_logits.detach(), k=k, dim=-1).indices
+
+    token_loss, diagnostics = _call_order_gated(
+        student_logits, teacher_logits.float(), anchors, response_mask, candidate_ids
+    )
+    token_loss.sum().backward()
+
+    assert torch.isfinite(token_loss).all()
+    assert (token_loss[response_mask == 0] == 0).all()
+    assert torch.isfinite(student_logits.grad).all()
+    for name, value in diagnostics.items():
+        assert torch.isfinite(value).all(), name
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

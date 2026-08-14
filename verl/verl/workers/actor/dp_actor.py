@@ -782,6 +782,14 @@ class DataParallelPPOActor(BasePPOActor):
         teacher_anchor_log_probs = model_inputs[teacher_anchor_key]
         responses = model_inputs["responses"]
 
+        pair_divergence = self.l_apd_config.get("pair_divergence", "reverse_kl")
+        if pair_divergence == "order_gated_kl":
+            # Pure student top-k cells, aligned verbatim with the OPD baseline's set:
+            # the sampled token is not deduplicated out of the candidates.
+            candidate_mask = torch.ones_like(candidate_ids, dtype=torch.bool)
+        else:
+            candidate_mask = candidate_ids != responses.unsqueeze(-1)
+
         entropy, log_prob, _, candidate_log_probs = self._forward_micro_batch(
             model_inputs,
             temperature=temperature,
@@ -795,13 +803,13 @@ class DataParallelPPOActor(BasePPOActor):
             student_candidate_log_probs=candidate_log_probs,
             teacher_anchor_log_probs=teacher_anchor_log_probs,
             teacher_candidate_log_probs=teacher_candidate_log_probs,
-            candidate_mask=candidate_ids != responses.unsqueeze(-1),
+            candidate_mask=candidate_mask,
             response_mask=response_mask,
             tail_candidate=self.l_apd_config.get("tail_candidate", True),
             complement_candidate=self.l_apd_config.get("complement_candidate", False),
             normalize_weights=self.l_apd_config.get("normalize_weights", True),
             weight_source=self.l_apd_config.get("weight_source", "student"),
-            pair_divergence=self.l_apd_config.get("pair_divergence", "reverse_kl"),
+            pair_divergence=pair_divergence,
         )
         loss = agg_loss(loss_mat=token_loss, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
