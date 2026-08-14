@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from contextlib import ExitStack
 
 import torch
 from torch import nn
@@ -28,10 +29,11 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.attention_distill import (
+    LastAttentionQKCapture,
     compute_full_attention_rkl_token_loss,
-    forward_with_last_attention_qk,
 )
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.kv_cache_distill import KVCachedStatesCapture, compute_kv_cosine_token_loss
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -83,6 +85,13 @@ class DataParallelPPOActor(BasePPOActor):
         if torch.distributed.get_rank() == 0:
             print(f"{role} attention_distill={self.use_attention_distill}")
 
+        self.kv_cache_distill_config = self.config.get("kv_cache_distill", {})
+        self.use_kv_cache_distill = self.kv_cache_distill_config.get("enable", False)
+        if self.use_kv_cache_distill and self.use_ulysses_sp:
+            raise ValueError("KV-cache distillation currently requires ulysses_sequence_parallel_size=1")
+        if torch.distributed.get_rank() == 0:
+            print(f"{role} kv_cache_distill={self.use_kv_cache_distill}")
+
         if self.config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
         else:
@@ -95,6 +104,34 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    def _forward_with_distill_states(
+        self,
+        model: nn.Module,
+        forward_kwargs: dict,
+        *,
+        return_attention_qk: bool,
+        return_kv_cached_states: bool,
+        detach: bool = False,
+    ):
+        """Capture enabled attention/KV states in one shared model forward."""
+
+        with ExitStack() as stack:
+            attention_capture = (
+                stack.enter_context(LastAttentionQKCapture(model)) if return_attention_qk else None
+            )
+            kv_capture = (
+                stack.enter_context(
+                    KVCachedStatesCapture(model, self.kv_cache_distill_config["layer_indices"])
+                )
+                if return_kv_cached_states
+                else None
+            )
+            output = model(**forward_kwargs)
+
+        attention_qk = attention_capture.build(detach=detach) if attention_capture is not None else None
+        kv_cached_states = kv_capture.build(detach=detach) if kv_capture is not None else None
+        return output, attention_qk, kv_cached_states
+
     def _forward_micro_batch(
         self,
         micro_batch,
@@ -103,6 +140,7 @@ class DataParallelPPOActor(BasePPOActor):
         top_k=0,
         student_top_k_ids=None,
         return_attention_qk=False,
+        return_kv_cached_states=False,
     ):
         """
         Returns:
@@ -127,6 +165,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_ids = None
             topk_log_probs = None
             attention_qk = None
+            kv_cached_states = None
             
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -199,8 +238,13 @@ class DataParallelPPOActor(BasePPOActor):
                     "use_cache": False,
                     **extra_args,
                 }
-                if return_attention_qk:
-                    output, attention_qk = forward_with_last_attention_qk(self.actor_module, **forward_kwargs)
+                if return_attention_qk or return_kv_cached_states:
+                    output, attention_qk, kv_cached_states = self._forward_with_distill_states(
+                        self.actor_module,
+                        forward_kwargs,
+                        return_attention_qk=return_attention_qk,
+                        return_kv_cached_states=return_kv_cached_states,
+                    )
                 else:
                     output = self.actor_module(**forward_kwargs)
                 
@@ -374,8 +418,13 @@ class DataParallelPPOActor(BasePPOActor):
                     "use_cache": False,
                     **extra_args,
                 }
-                if return_attention_qk:
-                    output, attention_qk = forward_with_last_attention_qk(self.actor_module, **forward_kwargs)
+                if return_attention_qk or return_kv_cached_states:
+                    output, attention_qk, kv_cached_states = self._forward_with_distill_states(
+                        self.actor_module,
+                        forward_kwargs,
+                        return_attention_qk=return_attention_qk,
+                        return_kv_cached_states=return_kv_cached_states,
+                    )
                 else:
                     output = self.actor_module(**forward_kwargs)
                 
@@ -421,20 +470,32 @@ class DataParallelPPOActor(BasePPOActor):
 
             result = (entropy, log_probs, topk_ids, topk_log_probs)
             if return_attention_qk:
-                return (*result, attention_qk)
+                result = (*result, attention_qk)
+            if return_kv_cached_states:
+                result = (*result, kv_cached_states)
             return result
 
-    def _forward_teacher_attention_qk(self, micro_batch, teacher_module, teacher_use_remove_padding):
-        """Capture teacher last-layer Q/K using the actor micro-batch tokenization."""
+    def _forward_teacher_distill_states(
+        self,
+        micro_batch,
+        teacher_module,
+        teacher_use_remove_padding,
+        *,
+        return_attention_qk,
+        return_kv_cached_states,
+    ):
+        """Capture teacher attention/KV states using the actor micro-batch tokenization."""
 
         if "multi_modal_inputs" in micro_batch:
-            raise NotImplementedError("Attention distillation currently supports text-only Qwen2 models")
+            raise NotImplementedError("Attention/KV distillation currently supports text-only Qwen2 models")
 
         input_ids = micro_batch["input_ids"]
         attention_mask = micro_batch["attention_mask"]
         position_ids = micro_batch["position_ids"]
         if position_ids.dim() != 2:
-            raise NotImplementedError("Attention distillation currently supports one-dimensional position IDs only")
+            raise NotImplementedError(
+                "Attention/KV distillation currently supports one-dimensional position IDs only"
+            )
 
         with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             if teacher_use_remove_padding:
@@ -459,11 +520,15 @@ class DataParallelPPOActor(BasePPOActor):
                     "logits_to_keep": 1,
                 }
 
-            output, attention_qk = forward_with_last_attention_qk(
-                teacher_module, detach=True, **forward_kwargs
+            output, attention_qk, kv_cached_states = self._forward_with_distill_states(
+                teacher_module,
+                forward_kwargs,
+                return_attention_qk=return_attention_qk,
+                return_kv_cached_states=return_kv_cached_states,
+                detach=True,
             )
             del output
-        return attention_qk
+        return attention_qk, kv_cached_states
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_probs_for_ids(self, data: DataProto) -> torch.Tensor:
@@ -817,14 +882,14 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(
         self,
         data: DataProto,
-        attention_teacher_module: nn.Module | None = None,
-        attention_teacher_use_remove_padding: bool = False,
+        distill_teacher_module: nn.Module | None = None,
+        distill_teacher_use_remove_padding: bool = False,
     ):
         # make sure we are in training mode
         self.actor_module.train()
 
-        if self.use_attention_distill and attention_teacher_module is None:
-            raise ValueError("attention_distill.enable=True requires a colocated teacher module")
+        if (self.use_attention_distill or self.use_kv_cache_distill) and distill_teacher_module is None:
+            raise ValueError("Attention/KV distillation requires a colocated teacher module")
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
@@ -904,12 +969,15 @@ class DataParallelPPOActor(BasePPOActor):
                     advantages = model_inputs["advantages"]
 
                     teacher_attention_qk = None
-                    if self.use_attention_distill:
-                        attention_teacher_module.eval()
-                        teacher_attention_qk = self._forward_teacher_attention_qk(
+                    teacher_kv_cached_states = None
+                    if self.use_attention_distill or self.use_kv_cache_distill:
+                        distill_teacher_module.eval()
+                        teacher_attention_qk, teacher_kv_cached_states = self._forward_teacher_distill_states(
                             model_inputs,
-                            teacher_module=attention_teacher_module,
-                            teacher_use_remove_padding=attention_teacher_use_remove_padding,
+                            teacher_module=distill_teacher_module,
+                            teacher_use_remove_padding=distill_teacher_use_remove_padding,
+                            return_attention_qk=self.use_attention_distill,
+                            return_kv_cached_states=self.use_kv_cache_distill,
                         )
 
                     entropy_coeff = self.config.entropy_coeff
@@ -940,6 +1008,7 @@ class DataParallelPPOActor(BasePPOActor):
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids,
                             return_attention_qk=self.use_attention_distill,
+                            return_kv_cached_states=self.use_kv_cache_distill,
                         )
                         entropy, _, _, topk_log_probs = forward_result[:4]
                         log_prob_for_loss = topk_log_probs
@@ -950,11 +1019,19 @@ class DataParallelPPOActor(BasePPOActor):
                             temperature=temperature,
                             calculate_entropy=calculate_entropy,
                             return_attention_qk=self.use_attention_distill,
+                            return_kv_cached_states=self.use_kv_cache_distill,
                         )
                         entropy, log_prob, *_ = forward_result[:4]
                         log_prob_for_loss = log_prob
 
-                    student_attention_qk = forward_result[4] if self.use_attention_distill else None
+                    distill_state_idx = 4
+                    student_attention_qk = None
+                    student_kv_cached_states = None
+                    if self.use_attention_distill:
+                        student_attention_qk = forward_result[distill_state_idx]
+                        distill_state_idx += 1
+                    if self.use_kv_cache_distill:
+                        student_kv_cached_states = forward_result[distill_state_idx]
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
@@ -1014,6 +1091,11 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics.update(pg_metrics)
 
                     opd_pg_loss = pg_loss
+                    if self.use_attention_distill or self.use_kv_cache_distill:
+                        micro_batch_metrics["actor/opd_pg_loss"] = (
+                            opd_pg_loss.detach().item() * loss_scale_factor
+                        )
+
                     if self.use_attention_distill:
                         attention_loss_mat = compute_full_attention_rkl_token_loss(
                             student=student_attention_qk,
@@ -1028,10 +1110,7 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=loss_agg_mode,
                         )
                         attention_distill_coef = self.attention_distill_config["loss_coef"]
-                        pg_loss = opd_pg_loss + attention_distill_coef * attention_distill_loss
-                        micro_batch_metrics["actor/opd_pg_loss"] = (
-                            opd_pg_loss.detach().item() * loss_scale_factor
-                        )
+                        pg_loss = pg_loss + attention_distill_coef * attention_distill_loss
                         micro_batch_metrics["actor/attention_distill_loss"] = (
                             attention_distill_loss.detach().item() * loss_scale_factor
                         )
@@ -1040,6 +1119,62 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batch_metrics["actor/attention_distill_coef"] = attention_distill_coef
                         micro_batch_metrics["actor/attention_distill_query_count"] = response_mask.sum().item()
+
+                    if self.use_kv_cache_distill:
+                        kv_token_loss = compute_kv_cosine_token_loss(
+                            student=student_kv_cached_states,
+                            teacher=teacher_kv_cached_states,
+                            attention_mask=model_inputs["attention_mask"],
+                            response_mask=response_mask,
+                            token_scope=self.kv_cache_distill_config["token_scope"],
+                            token_chunk_size=self.kv_cache_distill_config["token_chunk_size"],
+                        )
+                        if self.kv_cache_distill_config["token_scope"] == "all":
+                            kv_loss_mask = model_inputs["attention_mask"]
+                        else:
+                            kv_loss_mask = response_mask
+
+                        kv_key_loss = agg_loss(
+                            loss_mat=kv_token_loss.key,
+                            loss_mask=kv_loss_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        kv_value_loss = agg_loss(
+                            loss_mat=kv_token_loss.value,
+                            loss_mask=kv_loss_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        key_weight = self.kv_cache_distill_config["key_loss_weight"]
+                        value_weight = self.kv_cache_distill_config["value_loss_weight"]
+                        weight_sum = key_weight + value_weight
+                        kv_cache_distill_loss = (
+                            key_weight * kv_key_loss + value_weight * kv_value_loss
+                        ) / weight_sum
+                        kv_cache_distill_coef = self.kv_cache_distill_config["loss_coef"]
+                        pg_loss = pg_loss + kv_cache_distill_coef * kv_cache_distill_loss
+
+                        micro_batch_metrics["actor/kv_cache_distill_key_loss"] = (
+                            kv_key_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/kv_cache_distill_value_loss"] = (
+                            kv_value_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/kv_cache_distill_loss"] = (
+                            kv_cache_distill_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/kv_cache_distill_weighted_loss"] = (
+                            kv_cache_distill_coef * kv_cache_distill_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/kv_cache_distill_to_opd_loss_ratio"] = (
+                            kv_cache_distill_coef
+                            * kv_cache_distill_loss.detach().abs().item()
+                            / (opd_pg_loss.detach().abs().item() + 1e-8)
+                        )
+                        micro_batch_metrics["actor/kv_cache_distill_coef"] = kv_cache_distill_coef
+                        micro_batch_metrics["actor/kv_cache_distill_token_count"] = kv_loss_mask.sum().item()
+                        micro_batch_metrics["actor/kv_cache_distill_layer_count"] = len(
+                            student_kv_cached_states.layers
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

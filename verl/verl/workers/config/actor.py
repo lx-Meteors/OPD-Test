@@ -25,7 +25,14 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "AttentionDistillConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = [
+    "PolicyLossConfig",
+    "AttentionDistillConfig",
+    "KVCacheDistillConfig",
+    "ActorConfig",
+    "FSDPActorConfig",
+    "McoreActorConfig",
+]
 
 
 @dataclass
@@ -72,6 +79,38 @@ class AttentionDistillConfig(BaseConfig):
             raise ValueError("attention_distill.query_chunk_size must be positive")
         if self.divergence != "reverse_kl":
             raise ValueError("attention_distill currently supports only divergence='reverse_kl'")
+
+
+@dataclass
+class KVCacheDistillConfig(BaseConfig):
+    """Configuration for direct, aligned Qwen2 KV-cache distillation.
+
+    Keys and values are compared with cosine distance before RoPE. Negative layer
+    indices follow normal Python indexing and are resolved independently for the
+    teacher and student, so ``[-1]`` selects the last layer in both models.
+    """
+
+    enable: bool = False
+    loss_coef: float = 0.05
+    layer_indices: list[int] = field(default_factory=lambda: [-1])
+    token_scope: str = "all"
+    token_chunk_size: int = 1024
+    key_loss_weight: float = 1.0
+    value_loss_weight: float = 1.0
+
+    def __post_init__(self):
+        if self.loss_coef < 0:
+            raise ValueError("kv_cache_distill.loss_coef must be non-negative")
+        if not self.layer_indices:
+            raise ValueError("kv_cache_distill.layer_indices must contain at least one layer")
+        if self.token_scope not in {"all", "response"}:
+            raise ValueError("kv_cache_distill.token_scope must be either 'all' or 'response'")
+        if self.token_chunk_size <= 0:
+            raise ValueError("kv_cache_distill.token_chunk_size must be positive")
+        if self.key_loss_weight < 0 or self.value_loss_weight < 0:
+            raise ValueError("kv_cache_distill key/value loss weights must be non-negative")
+        if self.key_loss_weight + self.value_loss_weight <= 0:
+            raise ValueError("At least one KV-cache distillation loss weight must be positive")
 
 
 @dataclass
@@ -127,6 +166,7 @@ class ActorConfig(BaseConfig):
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     attention_distill: AttentionDistillConfig = field(default_factory=AttentionDistillConfig)
+    kv_cache_distill: KVCacheDistillConfig = field(default_factory=KVCacheDistillConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0

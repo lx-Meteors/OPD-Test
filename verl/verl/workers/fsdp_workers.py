@@ -871,27 +871,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
-        attention_teacher_module = None
-        attention_teacher_use_remove_padding = False
+        distill_teacher_module = None
+        distill_teacher_use_remove_padding = False
         attention_distill_config = self.config.actor.get("attention_distill", {})
-        if attention_distill_config.get("enable", False):
+        kv_cache_distill_config = self.config.actor.get("kv_cache_distill", {})
+        if attention_distill_config.get("enable", False) or kv_cache_distill_config.get("enable", False):
             fused_workers = getattr(self, "fused_worker_dict", {})
             teacher_workers = [worker for worker in fused_workers.values() if hasattr(worker, "reward_module")]
             if len(teacher_workers) != 1:
                 raise RuntimeError(
-                    "Attention distillation requires exactly one colocated RewardModelWorker. "
+                    "Attention/KV distillation requires exactly one colocated RewardModelWorker. "
                     "Set reward_model.enable=True and reward_model.enable_resource_pool=False."
                 )
             teacher_worker = teacher_workers[0]
             if getattr(teacher_worker, "_do_switch_chat_template", False):
                 raise RuntimeError(
-                    "Attention distillation requires identical actor/teacher token positions; "
+                    "Attention/KV distillation requires identical actor/teacher token positions; "
                     "set reward_model.model.input_tokenizer=null."
                 )
             if getattr(teacher_worker, "use_ulysses_sp", False):
-                raise RuntimeError("Attention distillation currently requires teacher Ulysses sequence parallelism=1")
-            attention_teacher_module = teacher_worker.reward_module
-            attention_teacher_use_remove_padding = teacher_worker.use_remove_padding
+                raise RuntimeError(
+                    "Attention/KV distillation currently requires teacher Ulysses sequence parallelism=1"
+                )
+            distill_teacher_module = teacher_worker.reward_module
+            distill_teacher_use_remove_padding = teacher_worker.use_remove_padding
 
         with self.ulysses_sharding_manager:
             # Keep on GPU to avoid expensive CPU-GPU-CPU round trip
@@ -901,8 +904,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(
                     data=data,
-                    attention_teacher_module=attention_teacher_module,
-                    attention_teacher_use_remove_padding=attention_teacher_use_remove_padding,
+                    distill_teacher_module=distill_teacher_module,
+                    distill_teacher_use_remove_padding=distill_teacher_use_remove_padding,
                 )
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]

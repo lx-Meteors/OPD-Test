@@ -83,6 +83,33 @@ attention_distill:
   # Direction of KL: KL(student attention || teacher attention)
   divergence: reverse_kl
 
+# Direct KV-cache distillation configuration
+kv_cache_distill:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.KVCacheDistillConfig
+
+  # Whether to add aligned pre-RoPE K/V cosine distillation to the actor objective
+  enable: false
+
+  # Multiplier applied to the mean K/V cosine-distance loss
+  loss_coef: 0.05
+
+  # Decoder layers to supervise; negative values use Python-style indexing
+  layer_indices: [-1]
+
+  # "all" supervises prompt and response cache entries; "response" uses response entries only
+  token_scope: all
+
+  # Number of sequence positions processed together when computing cosine distance
+  token_chunk_size: 1024
+
+  # Relative key cosine-loss weight
+  key_loss_weight: 1.0
+
+  # Relative value cosine-loss weight
+  value_loss_weight: 1.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
