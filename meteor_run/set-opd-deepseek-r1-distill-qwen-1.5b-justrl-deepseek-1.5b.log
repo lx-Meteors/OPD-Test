@@ -12855,3 +12855,119 @@ ray init kwargs: {'num_cpus': None, 'runtime_env': {'env_vars': {'VLLM_LOGGING_L
 [36m(WorkerDict pid=132774)[0m In compute_log_prob, top_k: 16[32m [repeated 7x across cluster][0m
 [36m(WorkerDict pid=132767)[0m on_policy
 [36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([5, 12288, 16])
+[36m(WorkerDict pid=132767)[0m on_policy[32m [repeated 24x across cluster][0m
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([7, 12288, 16])[32m [repeated 24x across cluster][0m
+[36m(TaskRunner pid=130984)[0m Training Progress:  50%|████▉     | 101/203 [3:19:48<5:29:16, 193.69s/it]
+[36m(WorkerDict pid=132774)[0m INFO:2026-08-15 16:49:07,872:[Rank 7] Saved optim to /ossfs/workspace/code/Prune-OPD/checkpoint/set-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b_set_opd_DeepSeek-R1-Distill-Qwen-1.5B_JustRL-DeepSeek-1.5B_12288-T_1.0-Tch_1.0-n_4-mbs_64-topk_16-topk_strategy_only_stu-rw_student_p-2026-08-15_13-13-18/global_step_100/actor/optim_world_size_8_rank_7.pt
+[36m(WorkerDict pid=132774)[0m INFO:2026-08-15 16:49:07,892:[Rank 7] Saved extra_state to /ossfs/workspace/code/Prune-OPD/checkpoint/set-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b_set_opd_DeepSeek-R1-Distill-Qwen-1.5B_JustRL-DeepSeek-1.5B_12288-T_1.0-Tch_1.0-n_4-mbs_64-topk_16-topk_strategy_only_stu-rw_student_p-2026-08-15_13-13-18/global_step_100/actor/extra_state_world_size_8_rank_7.pt
+[36m(TaskRunner pid=130984)[0m First forward, get student top k ids and log probs
+[36m(WorkerDict pid=132774)[0m on_policy[32m [repeated 23x across cluster][0m
+[36m(WorkerDict pid=132774)[0m Advantages shape: torch.Size([6, 12288, 16])[32m [repeated 23x across cluster][0m
+[36m(WorkerDict pid=132767)[0m In compute_log_prob, top_k: 16
+[36m(TaskRunner pid=130984)[0m Now we are using rm_scores!
+[36m(TaskRunner pid=130984)[0m True reward score has been added to reward_extra_info!
+[36m(TaskRunner pid=130984)[0m We don't need to re-merge old_log_probs, it's already there.
+[36m(WorkerDict pid=132774)[0m In compute_log_prob, top_k: 16[32m [repeated 7x across cluster][0m
+[36m(WorkerDict pid=132767)[0m on_policy
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([6, 12288, 16])
+[36m(WorkerDict pid=132767)[0m on_policy[32m [repeated 24x across cluster][0m
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([5, 12288, 16])[32m [repeated 24x across cluster][0m
+[36m(TaskRunner pid=130984)[0m Training Progress:  50%|█████     | 102/203 [3:21:10<4:29:37, 160.17s/it]
+[36m(TaskRunner pid=130984)[0m First forward, get student top k ids and log probs
+[36m(WorkerDict pid=132774)[0m on_policy[32m [repeated 23x across cluster][0m
+[36m(WorkerDict pid=132774)[0m Advantages shape: torch.Size([6, 12288, 16])[32m [repeated 23x across cluster][0m
+[36m(WorkerDict pid=132767)[0m In compute_log_prob, top_k: 16
+[36m(TaskRunner pid=130984)[0m Now we are using rm_scores!
+[36m(TaskRunner pid=130984)[0m True reward score has been added to reward_extra_info!
+[36m(TaskRunner pid=130984)[0m We don't need to re-merge old_log_probs, it's already there.
+[36m(WorkerDict pid=132774)[0m In compute_log_prob, top_k: 16[32m [repeated 7x across cluster][0m
+[36m(WorkerDict pid=132767)[0m on_policy
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([6, 12288, 16])
+[36m(WorkerDict pid=132767)[0m on_policy[32m [repeated 24x across cluster][0m
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([6, 12288, 16])[32m [repeated 24x across cluster][0m
+[36m(TaskRunner pid=130984)[0m Training Progress:  51%|█████     | 103/203 [3:22:24<3:43:55, 134.35s/it]
+[36m(TaskRunner pid=130984)[0m First forward, get student top k ids and log probs
+[36m(WorkerDict pid=132774)[0m on_policy[32m [repeated 15x across cluster][0m
+[36m(WorkerDict pid=132774)[0m Advantages shape: torch.Size([6, 12288, 16])[32m [repeated 15x across cluster][0m
+[36m(WorkerDict pid=132767)[0m In compute_log_prob, top_k: 16
+[36m(TaskRunner pid=130984)[0m Now we are using rm_scores!
+[36m(TaskRunner pid=130984)[0m True reward score has been added to reward_extra_info!
+[36m(TaskRunner pid=130984)[0m We don't need to re-merge old_log_probs, it's already there.
+[36m(WorkerDict pid=132774)[0m In compute_log_prob, top_k: 16[32m [repeated 7x across cluster][0m
+[36m(WorkerDict pid=132767)[0m on_policy
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([4, 12288, 16])
+[36m(WorkerDict pid=132767)[0m on_policy[32m [repeated 32x across cluster][0m
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([5, 12288, 16])[32m [repeated 32x across cluster][0m
+[36m(TaskRunner pid=130984)[0m Training Progress:  51%|█████     | 104/203 [3:23:45<3:15:30, 118.49s/it]
+[36m(TaskRunner pid=130984)[0m First forward, get student top k ids and log probs
+[36m(WorkerDict pid=132774)[0m on_policy[32m [repeated 15x across cluster][0m
+[36m(WorkerDict pid=132774)[0m Advantages shape: torch.Size([5, 12288, 16])[32m [repeated 15x across cluster][0m
+[36m(WorkerDict pid=132767)[0m In compute_log_prob, top_k: 16
+[36m(TaskRunner pid=130984)[0m Now we are using rm_scores!
+[36m(TaskRunner pid=130984)[0m True reward score has been added to reward_extra_info!
+[36m(TaskRunner pid=130984)[0m We don't need to re-merge old_log_probs, it's already there.
+[36m(WorkerDict pid=132774)[0m In compute_log_prob, top_k: 16[32m [repeated 7x across cluster][0m
+[36m(WorkerDict pid=132767)[0m on_policy
+[36m(WorkerDict pid=132767)[0m Advantages shape: torch.Size([5, 12288, 16])
+Error executing job with overrides: ['algorithm.adv_estimator=set_opd', 'algorithm.grpo_outcome_weight=1.0', 'algorithm.set_opd_weight=0.2', 'algorithm.set_opd_feature_dim=128', 'algorithm.set_opd_position_bins=8', 'algorithm.set_opd_max_positions=64', 'algorithm.set_opd_logdet_scale=1.0', 'algorithm.set_opd_quality_weight=1.0', 'algorithm.set_opd_diversity_weight=1.0', 'algorithm.set_opd_normalize_by_std=True', 'algorithm.set_opd_correct_threshold=0.5', 'data.shuffle=False', 'data.train_files=/ossfs/workspace/code/Prune-OPD/datasets/dapo-math-17k.parquet', 'data.val_files=["/ossfs/workspace/code/Prune-OPD/datasets/test_data/AMC23/test.parquet","/ossfs/workspace/code/Prune-OPD/datasets/test_data/AIME24/test.parquet","/ossfs/workspace/code/Prune-OPD/datasets/test_data/AIME25/test.parquet","/ossfs/workspace/code/Prune-OPD/datasets/test_data/HMMT24/test.parquet","/ossfs/workspace/code/Prune-OPD/datasets/test_data/HMMT25/test.parquet"]', 'data.train_batch_size=64', 'data.max_prompt_length=1024', 'data.max_response_length=12288', 'data.filter_overlong_prompts=True', 'data.truncation=error', 'data.return_raw_chat=True', 'actor_rollout_ref.model.path=/personal/models/DeepSeek-R1-Distill-Qwen-1.5B', 'actor_rollout_ref.model.use_remove_padding=True', 'actor_rollout_ref.model.enable_activation_offload=True', 'actor_rollout_ref.model.enable_gradient_checkpointing=True', 'actor_rollout_ref.actor.optim.lr=1e-6', 'actor_rollout_ref.actor.ppo_mini_batch_size=64', 'actor_rollout_ref.actor.use_dynamic_bsz=True', 'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1', 'actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768', 'actor_rollout_ref.actor.ulysses_sequence_parallel_size=1', 'actor_rollout_ref.actor.loss_agg_mode=token-mean', 'actor_rollout_ref.actor.fsdp_config.param_offload=False', 'actor_rollout_ref.actor.fsdp_config.optimizer_offload=False', 'actor_rollout_ref.actor.fsdp_config.forward_prefetch=True', 'actor_rollout_ref.actor.fsdp_config.model_dtype=fp32', 'actor_rollout_ref.rollout.max_num_batched_tokens=32768', 'actor_rollout_ref.ref.fsdp_config.param_offload=True', 'actor_rollout_ref.ref.fsdp_config.model_dtype=fp32', 'actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True', 'actor_rollout_ref.rollout.name=vllm', 'actor_rollout_ref.rollout.temperature=1.0', 'actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True', '+actor_rollout_ref.rollout.log_prob_top_k=16', '+actor_rollout_ref.rollout.top_k_strategy=only_stu', '+actor_rollout_ref.rollout.reward_weight_mode=student_p', '+actor_rollout_ref.rollout.teacher_temperature=1.0', 'actor_rollout_ref.rollout.tensor_model_parallel_size=1', 'actor_rollout_ref.rollout.gpu_memory_utilization=0.8', 'actor_rollout_ref.rollout.max_model_len=32768', 'actor_rollout_ref.rollout.n=4', 'actor_rollout_ref.rollout.val_kwargs.do_sample=True', '+actor_rollout_ref.rollout.val_kwargs.max_tokens=31744', 'actor_rollout_ref.rollout.val_kwargs.n=16', 'actor_rollout_ref.rollout.val_kwargs.temperature=1.0', 'actor_rollout_ref.rollout.val_kwargs.top_p=0.95', 'actor_rollout_ref.rollout.repetition_penalty=1.0', 'actor_rollout_ref.rollout.calculate_log_probs=True', 'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1', 'reward_model.enable=True', '+reward_model.reward_kwargs.enable_format_reward=False', 'custom_reward_function.path=/ossfs/workspace/code/Prune-OPD/verl/verl/utils/reward_score/ttrl_math/__init__.py', 'custom_reward_function.name=reward_func', 'trainer.val_before_train=True', 'trainer.log_val_generations=2', 'trainer.logger=[wandb]', 'trainer.project_name=PruneOPD', 'trainer.experiment_name=set-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b_set_opd_DeepSeek-R1-Distill-Qwen-1.5B_JustRL-DeepSeek-1.5B_12288-T_1.0-Tch_1.0-n_4-mbs_64-topk_16-topk_strategy_only_stu-rw_student_p-2026-08-15_13-13-18', 'trainer.validation_data_dir=/ossfs/workspace/code/Prune-OPD/validation_log/set-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b_set_opd_DeepSeek-R1-Distill-Qwen-1.5B_JustRL-DeepSeek-1.5B_12288-T_1.0-Tch_1.0-n_4-mbs_64-topk_16-topk_strategy_only_stu-rw_student_p-2026-08-15_13-13-18', 'trainer.n_gpus_per_node=8', 'trainer.nnodes=1', 'trainer.save_freq=100', 'trainer.test_freq=20', 'trainer.total_training_steps=203', 'trainer.total_epochs=1', 'trainer.default_local_dir=/ossfs/workspace/code/Prune-OPD/checkpoint/set-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b_set_opd_DeepSeek-R1-Distill-Qwen-1.5B_JustRL-DeepSeek-1.5B_12288-T_1.0-Tch_1.0-n_4-mbs_64-topk_16-topk_strategy_only_stu-rw_student_p-2026-08-15_13-13-18', 'trainer.is_plot=False', 'reward_model.model.path=/personal/models/JustRL-DeepSeek-1.5B', 'reward_model.model.input_tokenizer=null', 'reward_model.model.use_remove_padding=True', 'reward_model.model.fsdp_config.param_offload=False', '+reward_model.model.dtype=fp32', 'reward_model.micro_batch_size_per_gpu=24', 'actor_rollout_ref.actor.use_kl_loss=False']
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/ossfs/workspace/code/Prune-OPD/verl/verl/trainer/main_ppo.py", line 439, in <module>
+    main()
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+    raise ex
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+           ^^^^^^
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+            ^^^^^^^^^^
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/_internal/hydra.py", line 132, in run
+    _ = ret.return_value
+        ^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/core/utils.py", line 260, in return_value
+    raise self._return_value
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/ossfs/workspace/code/Prune-OPD/verl/verl/trainer/main_ppo.py", line 42, in main
+    run_ppo(config)
+  File "/ossfs/workspace/code/Prune-OPD/verl/verl/trainer/main_ppo.py", line 96, in run_ppo
+    ray.get(runner.run.remote(config))
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/_private/client_mode_hook.py", line 110, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/_private/worker.py", line 2968, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/_private/worker.py", line 1052, in get_objects
+    raise value
+ray.exceptions.ActorDiedError: The actor died unexpectedly before finishing this task.
+	class_name: TaskRunner
+	actor_id: da5c9176ae5ebf73b1876cdd01000000
+	pid: 130984
+	namespace: db3a7cd9-adeb-4ab5-8052-54f1d39b093b
+	ip: 10.10.19.181
+The actor is dead because its owner has died. Owner Id: 01000000ffffffffffffffffffffffffffffffffffffffffffffffff Owner Ip address: 10.10.19.181 Owner worker exit type: SYSTEM_ERROR Worker exit detail: Owner's node has crashed.
+[36m(TaskRunner pid=130984)[0m  Attempting to recover 8 lost objects by resubmitting their tasks or setting a new primary location from existing copies. To disable object reconstruction, set @ray.remote(max_retries=0).
+[33m(raylet)[0m The autoscaler failed with the following error:
+Terminated with signal 15
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/autoscaler/_private/monitor.py", line 743, in <module>
+    monitor.run()
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/autoscaler/_private/monitor.py", line 600, in run
+    self._run()
+  File "/opt/conda/envs/opd/lib/python3.12/site-packages/ray/autoscaler/_private/monitor.py", line 455, in _run
+    time.sleep(AUTOSCALER_UPDATE_INTERVAL_S)
+
+[36m(WorkerDict pid=132774)[0m on_policy[32m [repeated 7x across cluster][0m
+[36m(WorkerDict pid=132774)[0m Advantages shape: torch.Size([5, 12288, 16])[32m [repeated 7x across cluster][0m
