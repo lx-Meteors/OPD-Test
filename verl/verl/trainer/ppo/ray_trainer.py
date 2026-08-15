@@ -53,6 +53,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.utils.bridge_opd import apply_bridge_opd_to_scores, bridge_opd_metrics
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -1309,6 +1310,32 @@ class RayPPOTrainer:
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+
+                            bridge_opd_cfg = self.config.actor_rollout_ref.rollout.get("bridge_opd", None)
+                            if bridge_opd_cfg is not None and bridge_opd_cfg.get("enable", False):
+                                required_keys = {
+                                    "rm_scores",
+                                    "old_log_probs",
+                                    "teacher_log_probs",
+                                    "response_mask",
+                                }
+                                missing_keys = required_keys.difference(batch.batch.keys())
+                                if missing_keys:
+                                    raise ValueError(
+                                        "Bridge-OPD is enabled but the OPD batch is missing: "
+                                        f"{sorted(missing_keys)}"
+                                    )
+                                weighted_scores, bridge_aux = apply_bridge_opd_to_scores(
+                                    rm_scores=batch.batch["rm_scores"],
+                                    student_log_probs=batch.batch["old_log_probs"],
+                                    teacher_log_probs=batch.batch["teacher_log_probs"],
+                                    response_mask=batch.batch["response_mask"],
+                                    index=batch.non_tensor_batch.get("uid", None),
+                                    config=bridge_opd_cfg,
+                                )
+                                batch.batch["rm_scores"] = weighted_scores
+                                metrics.update(bridge_opd_metrics(bridge_aux, batch.batch["response_mask"]))
+                                del bridge_aux, weighted_scores
 
                         self._log_prune_opd_loss_weights(batch)
                         
