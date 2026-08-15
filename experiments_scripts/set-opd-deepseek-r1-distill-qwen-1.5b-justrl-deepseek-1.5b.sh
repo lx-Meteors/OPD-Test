@@ -18,7 +18,7 @@ export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[wandb]}"
 # per prompt. Set-OPD compares this existing response set and adds no branching.
 export N_RESPONSES="${N_RESPONSES:-4}"
 export ADV_ESTIMATOR="${ADV_ESTIMATOR:-set_opd}"
-export SET_OPD_WEIGHT="${SET_OPD_WEIGHT:-0.05}"
+export SET_OPD_WEIGHT="${SET_OPD_WEIGHT:-0.2}"
 export SET_OPD_FEATURE_DIM="${SET_OPD_FEATURE_DIM:-128}"
 export SET_OPD_POSITION_BINS="${SET_OPD_POSITION_BINS:-8}"
 export SET_OPD_MAX_POSITIONS="${SET_OPD_MAX_POSITIONS:-64}"
