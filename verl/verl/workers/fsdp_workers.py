@@ -1115,9 +1115,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_ref_log_prob_and_topk(self, data: DataProto):
         """Evaluate the frozen reference on sampled anchors and Student Top-K IDs in one forward.
 
-        Chi2-OPD needs ``log R(a|s)`` on exactly the same candidate IDs used
-        for Student/Teacher OPD.  Returning the sampled-token log-probability
-        as well lets the trainer avoid a second reference forward later.
+        G-OPD and Chi2-OPD need ``log R(a|s)`` on exactly the same candidate
+        IDs used for Student/Teacher OPD. Returning the sampled-token
+        log-probability also avoids a second reference forward later.
         """
 
         if "student_top_k_ids" not in data.batch:

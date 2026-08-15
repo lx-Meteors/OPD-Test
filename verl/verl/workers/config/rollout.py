@@ -146,6 +146,7 @@ class RolloutConfig(BaseConfig):
     prune_opd: dict = field(default_factory=dict)
     bridge_opd: dict = field(default_factory=dict)
     chi2_opd: dict = field(default_factory=dict)
+    g_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
 

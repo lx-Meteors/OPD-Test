@@ -13,6 +13,14 @@ export REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${MODEL_ROOT}/JustRL-DeepSeek-1.5
 export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
 
+# Explicit tracking configuration. Authentication still comes from `wandb
+# login`/WANDB_API_KEY and is never stored in the repository.
+export PROJECT_NAME="${PROJECT_NAME:-PruneOPD}"
+export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console,wandb]}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_PROJECT="${WANDB_PROJECT:-${PROJECT_NAME}}"
+export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-chi2-opd}"
+
 # Match the standard OPD baseline except for the target construction.
 export N_RESPONSES="${N_RESPONSES:-4}"
 export ADV_ESTIMATOR="${ADV_ESTIMATOR:-token_reward_direct}"

@@ -203,6 +203,35 @@ def validate_config(
                     f"Chi2-OPD cannot be combined with {modifier_name}; run it alone to preserve its objective."
                 )
 
+    g_opd_cfg = config.actor_rollout_ref.rollout.get("g_opd", None)
+    if g_opd_cfg is not None and g_opd_cfg.get("enable", False):
+        from verl.utils.g_opd import validate_g_opd_config
+
+        validate_g_opd_config(g_opd_cfg)
+        if not use_reference_policy:
+            raise ValueError("G-OPD requires a frozen reference policy.")
+        if not config.reward_model.enable:
+            raise ValueError("G-OPD requires reward_model.enable=True because the reward model is the Teacher.")
+        if config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError("G-OPD Top-K reference evaluation currently supports FSDP/FSDP2 actors only.")
+        if config.actor_rollout_ref.rollout.get("log_prob_top_k", 0) < 2:
+            raise ValueError("G-OPD requires actor_rollout_ref.rollout.log_prob_top_k >= 2.")
+        if config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu") != "only_stu":
+            raise ValueError("G-OPD requires actor_rollout_ref.rollout.top_k_strategy=only_stu.")
+        if config.actor_rollout_ref.rollout.get("reward_weight_mode", "student_p") != "student_p":
+            raise ValueError("G-OPD requires actor_rollout_ref.rollout.reward_weight_mode=student_p.")
+        if chi2_opd_cfg is not None and chi2_opd_cfg.get("enable", False):
+            raise ValueError("G-OPD and Chi2-OPD are separate objectives and cannot be enabled together.")
+        l_apd_cfg = config.actor_rollout_ref.actor.get("l_apd", None)
+        if l_apd_cfg is not None and l_apd_cfg.get("enable", False):
+            raise ValueError("G-OPD cannot be combined with L-APD because L-APD replaces the policy loss.")
+        for modifier_name in ("prune_opd", "bridge_opd"):
+            modifier_cfg = config.actor_rollout_ref.rollout.get(modifier_name, None)
+            if modifier_cfg is not None and modifier_cfg.get("enable", False):
+                raise ValueError(
+                    f"G-OPD cannot be combined with {modifier_name}; run it alone to reproduce the objective."
+                )
+
     # critic
     if use_critic:
         critic_config = omega_conf_to_dataclass(config.critic)

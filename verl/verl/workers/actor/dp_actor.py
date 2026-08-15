@@ -33,8 +33,9 @@ from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, u
 from verl.utils.chi2_opd import compute_chi2_opd_scores
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-from verl.utils.prune_opd import apply_prune_opd_to_scores
+from verl.utils.g_opd import compute_g_opd_scores
 from verl.utils.profiler import GPUMemoryLogger
+from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
@@ -492,6 +493,7 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         prune_opd_cfg = data.meta_info.get("prune_opd", None)
         chi2_opd_cfg = data.meta_info.get("chi2_opd", None)
+        g_opd_cfg = data.meta_info.get("g_opd", None)
 
         # 2. Compute Student Log Probs on Teacher IDs if needed
         # (This replaces the previous call to compute_log_probs_for_ids in ray_trainer)
@@ -586,7 +588,36 @@ class DataParallelPPOActor(BasePPOActor):
 
         res_tensors = {}
 
-        if chi2_opd_cfg and chi2_opd_cfg.get("enable", False):
+        if g_opd_cfg and g_opd_cfg.get("enable", False):
+            if strategy != "only_stu":
+                raise ValueError(
+                    "G-OPD currently requires top_k_strategy=only_stu so Student, Teacher, and Ref are "
+                    "evaluated on one identical candidate set."
+                )
+            if reward_weight_mode != "student_p":
+                raise ValueError(
+                    "G-OPD requires reward_weight_mode=student_p to retain the reverse-KL policy gradient."
+                )
+            if R_on_S is None:
+                raise ValueError(
+                    "G-OPD requires ref_on_student_log_probs. Ensure the reference policy is enabled and "
+                    "evaluated on student_top_k_ids before compute_distillation_reward."
+                )
+            response_mask = data.batch.get("response_mask", None)
+            if response_mask is None:
+                raise ValueError("G-OPD requires response_mask in the distillation batch.")
+            rm_scores, g_opd_aux = compute_g_opd_scores(
+                student_log_probs=S_logp,
+                teacher_log_probs=T_on_S,
+                reference_log_probs=R_on_S,
+                response_mask=response_mask.to(device),
+                config=g_opd_cfg,
+            )
+            # The target itself is not needed after the detached scores have been
+            # formed and would be expensive to carry through the trainer.
+            g_opd_aux.pop("g_opd_target_log_probs", None)
+            res_tensors.update(g_opd_aux)
+        elif chi2_opd_cfg and chi2_opd_cfg.get("enable", False):
             if strategy != "only_stu":
                 raise ValueError(
                     "Chi2-OPD currently requires top_k_strategy=only_stu so Student, Teacher, and Ref are "

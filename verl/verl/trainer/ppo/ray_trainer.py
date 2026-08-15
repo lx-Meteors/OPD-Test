@@ -58,6 +58,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.chi2_opd import chi2_opd_metrics
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.g_opd import g_opd_metrics
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -1303,13 +1304,17 @@ class RayPPOTrainer:
                             chi2_opd_enabled = chi2_opd_cfg is not None and chi2_opd_cfg.get("enable", False)
                             if chi2_opd_enabled:
                                 batch.meta_info["chi2_opd"] = OmegaConf.to_container(chi2_opd_cfg, resolve=True)
+                            g_opd_cfg = self.config.actor_rollout_ref.rollout.get("g_opd", None)
+                            g_opd_enabled = g_opd_cfg is not None and g_opd_cfg.get("enable", False)
+                            if g_opd_enabled:
+                                batch.meta_info["g_opd"] = OmegaConf.to_container(g_opd_cfg, resolve=True)
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
                                 batch = batch.union(teacher_data)
 
                             if top_k > 0:
-                                if chi2_opd_enabled:
+                                if chi2_opd_enabled or g_opd_enabled:
                                     with marked_timer("compute_ref_log_prob_and_topk", timing_raw, color="olive"):
                                         ref_topk_keys = [
                                             "responses",
@@ -1351,6 +1356,13 @@ class RayPPOTrainer:
                                         if key.startswith("chi2_opd_")
                                     }
                                     metrics.update(chi2_opd_metrics(chi2_aux, batch.batch["response_mask"]))
+                                if g_opd_enabled:
+                                    g_opd_aux = {
+                                        key: value
+                                        for key, value in batch.batch.items()
+                                        if key.startswith("g_opd_")
+                                    }
+                                    metrics.update(g_opd_metrics(g_opd_aux, batch.batch["response_mask"]))
 
                             bridge_opd_cfg = self.config.actor_rollout_ref.rollout.get("bridge_opd", None)
                             if bridge_opd_cfg is not None and bridge_opd_cfg.get("enable", False):
@@ -2636,6 +2648,12 @@ class RayPPOTrainer:
                         "chi2_opd_target_shift_tv",
                         "chi2_opd_student_target_kl",
                         "chi2_opd_teacher_target_kl",
+                        "g_opd_lambda",
+                        "g_opd_implicit_reward_mean",
+                        "g_opd_implicit_reward_std",
+                        "g_opd_target_shift_tv",
+                        "g_opd_student_target_kl",
+                        "g_opd_teacher_target_kl",
                     ]
                     if not self.config.actor_rollout_ref.actor.use_kl_loss:
                         keys_to_pop.append("ref_log_prob")
