@@ -145,6 +145,7 @@ class RolloutConfig(BaseConfig):
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
     prune_opd: dict = field(default_factory=dict)
     bridge_opd: dict = field(default_factory=dict)
+    chi2_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
 

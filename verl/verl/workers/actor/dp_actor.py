@@ -30,6 +30,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.l_apd import compute_l_apd_token_loss, l_apd_batch_keys
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+from verl.utils.chi2_opd import compute_chi2_opd_scores
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.prune_opd import apply_prune_opd_to_scores
@@ -407,13 +408,16 @@ class DataParallelPPOActor(BasePPOActor):
             return entropy, log_probs, topk_ids, topk_log_probs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_probs_for_ids(self, data: DataProto) -> torch.Tensor:
+    def compute_log_probs_for_ids(
+        self, data: DataProto, return_anchor_log_probs: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute the log probability for specific token ids
         Args:
             data (DataProto): a DataProto containing input_ids, attention_mask, position_ids, responses, 
                              and target_ids (batch, response_len, k) in batch
         Returns:
-            torch.Tensor: (batch, response_len, k) log probs for target_ids
+            Target-ID log-probabilities, or a tuple containing sampled-token
+            and target-ID log-probabilities when ``return_anchor_log_probs`` is true.
         """
         # set to eval
         self.actor_module.eval()
@@ -435,6 +439,7 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             micro_batches = data.split(micro_batch_size)
 
+        anchor_log_probs_lst = []
         topk_log_probs_lst = []
         top_k = target_ids.shape[-1]
 
@@ -444,12 +449,14 @@ class DataParallelPPOActor(BasePPOActor):
             mb_target_ids = model_inputs["target_ids"]
             with torch.no_grad():
                 # We reuse _forward_micro_batch. It returns (entropy, log_probs, topk_ids, topk_log_probs)
-                _, _, _, topk_log_probs = self._forward_micro_batch(
+                _, anchor_log_probs, _, topk_log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=False, 
                     top_k=top_k, student_top_k_ids=mb_target_ids
                 )
             # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k
             # topk_log_probs = topk_log_probs.to("cpu")
+            if return_anchor_log_probs:
+                anchor_log_probs_lst.append(anchor_log_probs)
             topk_log_probs_lst.append(topk_log_probs)
 
         topk_log_probs_tensor = torch.concat(topk_log_probs_lst, dim=0)
@@ -457,6 +464,11 @@ class DataParallelPPOActor(BasePPOActor):
         if use_dynamic_bsz:
             topk_log_probs_tensor = restore_dynamic_batch(topk_log_probs_tensor, batch_idx_list)
 
+        if return_anchor_log_probs:
+            anchor_log_probs_tensor = torch.concat(anchor_log_probs_lst, dim=0)
+            if use_dynamic_bsz:
+                anchor_log_probs_tensor = restore_dynamic_batch(anchor_log_probs_tensor, batch_idx_list)
+            return anchor_log_probs_tensor, topk_log_probs_tensor
         return topk_log_probs_tensor
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -479,6 +491,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         prune_opd_cfg = data.meta_info.get("prune_opd", None)
+        chi2_opd_cfg = data.meta_info.get("chi2_opd", None)
 
         # 2. Compute Student Log Probs on Teacher IDs if needed
         # (This replaces the previous call to compute_log_probs_for_ids in ray_trainer)
@@ -529,6 +542,9 @@ class DataParallelPPOActor(BasePPOActor):
         if T_ids is not None: T_ids = T_ids.to(device)
         T_logp = data.batch.get("teacher_top_k_log_probs", None)
         if T_logp is not None: T_logp = T_logp.to(device)
+        R_on_S = data.batch.get("ref_on_student_log_probs", None)
+        if R_on_S is not None:
+            R_on_S = R_on_S.to(device)
         overlap_mask = data.batch.get("overlap_mask", None)
         if overlap_mask is not None: overlap_mask = overlap_mask.to(device)
 
@@ -569,8 +585,37 @@ class DataParallelPPOActor(BasePPOActor):
             return weights
 
         res_tensors = {}
-        
-        if strategy == "only_stu":
+
+        if chi2_opd_cfg and chi2_opd_cfg.get("enable", False):
+            if strategy != "only_stu":
+                raise ValueError(
+                    "Chi2-OPD currently requires top_k_strategy=only_stu so Student, Teacher, and Ref are "
+                    "evaluated on one identical candidate set."
+                )
+            if reward_weight_mode != "student_p":
+                raise ValueError(
+                    "Chi2-OPD requires reward_weight_mode=student_p to retain the reverse-KL policy gradient."
+                )
+            if R_on_S is None:
+                raise ValueError(
+                    "Chi2-OPD requires ref_on_student_log_probs. Ensure the reference policy is enabled and "
+                    "evaluated on student_top_k_ids before compute_distillation_reward."
+                )
+            response_mask = data.batch.get("response_mask", None)
+            if response_mask is None:
+                raise ValueError("Chi2-OPD requires response_mask in the distillation batch.")
+            rm_scores, chi2_aux = compute_chi2_opd_scores(
+                student_log_probs=S_logp,
+                teacher_log_probs=T_on_S,
+                reference_log_probs=R_on_S,
+                response_mask=response_mask.to(device),
+                config=chi2_opd_cfg,
+            )
+            # The target itself is not needed after the detached scores have been
+            # formed and would be expensive to carry through the trainer.
+            chi2_aux.pop("chi2_opd_target_log_probs", None)
+            res_tensors.update(chi2_aux)
+        elif strategy == "only_stu":
             kl_val = S_logp - T_on_S
             valid_mask = torch.ones_like(S_logp, dtype=torch.bool)
             norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)

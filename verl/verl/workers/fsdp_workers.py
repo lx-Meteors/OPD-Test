@@ -1110,6 +1110,65 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob_and_topk")
+    def compute_ref_log_prob_and_topk(self, data: DataProto):
+        """Evaluate the frozen reference on sampled anchors and Student Top-K IDs in one forward.
+
+        Chi2-OPD needs ``log R(a|s)`` on exactly the same candidate IDs used
+        for Student/Teacher OPD.  Returning the sampled-token log-probability
+        as well lets the trainer avoid a second reference forward later.
+        """
+
+        if "student_top_k_ids" not in data.batch:
+            raise ValueError("Reference Top-K evaluation requires student_top_k_ids in the batch.")
+        data.batch["target_ids"] = data.batch["student_top_k_ids"]
+
+        if self._is_lora:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            with self.ulysses_sharding_manager:
+                with self.actor.actor_module.disable_adapter():
+                    anchor_log_probs, topk_log_probs = self.actor.compute_log_probs_for_ids(
+                        data=data, return_anchor_log_probs=True
+                    )
+
+            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+                self.actor.actor_module._handle.reshard(True)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload actor model during reference Top-K evaluation", logger=logger)
+        else:
+            assert self._is_ref
+            data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            with self.ulysses_sharding_manager:
+                data = data.to("cpu")
+                anchor_log_probs, topk_log_probs = self.ref_policy.compute_log_probs_for_ids(
+                    data=data, return_anchor_log_probs=True
+                )
+
+            if self.world_size > 1:
+                if fsdp_version(self.ref_policy.actor_module) == 1:
+                    self.ref_policy.actor_module._handle.reshard(True)
+                elif fsdp_version(self.ref_policy.actor_module) == 2:
+                    self.ref_policy.actor_module.reshard()
+
+        output = DataProto.from_dict(
+            tensors={
+                "ref_log_prob": anchor_log_probs,
+                "ref_on_student_log_probs": topk_log_probs,
+            }
+        )
+        return output.to("cpu")
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank

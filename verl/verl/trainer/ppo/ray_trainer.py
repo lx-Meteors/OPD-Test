@@ -55,6 +55,7 @@ from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.bridge_opd import apply_bridge_opd_to_scores, bridge_opd_metrics
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.chi2_opd import chi2_opd_metrics
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
@@ -1298,18 +1299,58 @@ class RayPPOTrainer:
                             prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", None)
                             if prune_opd_cfg is not None and prune_opd_cfg.get("enable", False):
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)
+                            chi2_opd_cfg = self.config.actor_rollout_ref.rollout.get("chi2_opd", None)
+                            chi2_opd_enabled = chi2_opd_cfg is not None and chi2_opd_cfg.get("enable", False)
+                            if chi2_opd_enabled:
+                                batch.meta_info["chi2_opd"] = OmegaConf.to_container(chi2_opd_cfg, resolve=True)
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
                                 batch = batch.union(teacher_data)
 
                             if top_k > 0:
+                                if chi2_opd_enabled:
+                                    with marked_timer("compute_ref_log_prob_and_topk", timing_raw, color="olive"):
+                                        ref_topk_keys = [
+                                            "responses",
+                                            "input_ids",
+                                            "attention_mask",
+                                            "position_ids",
+                                            "student_top_k_ids",
+                                        ]
+                                        ref_topk_non_tensor_keys = (
+                                            ["multi_modal_inputs"]
+                                            if "multi_modal_inputs" in batch.non_tensor_batch
+                                            else []
+                                        )
+                                        ref_topk_input = batch.select(
+                                            batch_keys=ref_topk_keys,
+                                            non_tensor_batch_keys=ref_topk_non_tensor_keys,
+                                        )
+                                        if not self.ref_in_actor:
+                                            ref_topk_data = self.ref_policy_wg.compute_ref_log_prob_and_topk(
+                                                ref_topk_input
+                                            )
+                                        else:
+                                            ref_topk_data = self.actor_rollout_wg.compute_ref_log_prob_and_topk(
+                                                ref_topk_input
+                                            )
+                                        batch = batch.union(ref_topk_data)
+
                                 # All distillation reward calculation is now moved to GPU worker (actor_rollout_wg)
                                 # for efficiency and to reduce CPU tensor ops.
                                 # compute_distillation_reward computes S_on_T and then rm_scores.
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+
+                                if chi2_opd_enabled:
+                                    chi2_aux = {
+                                        key: value
+                                        for key, value in batch.batch.items()
+                                        if key.startswith("chi2_opd_")
+                                    }
+                                    metrics.update(chi2_opd_metrics(chi2_aux, batch.batch["response_mask"]))
 
                             bridge_opd_cfg = self.config.actor_rollout_ref.rollout.get("bridge_opd", None)
                             if bridge_opd_cfg is not None and bridge_opd_cfg.get("enable", False):
@@ -1622,12 +1663,13 @@ class RayPPOTrainer:
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                        if "ref_log_prob" not in batch.batch:
+                            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                if not self.ref_in_actor:
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                else:
+                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
@@ -2584,7 +2626,19 @@ class RayPPOTrainer:
                         "overlap_mask",
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
+                        "ref_on_student_log_probs",
+                        "chi2_opd_kappa",
+                        "chi2_opd_kappa_shrunk",
+                        "chi2_opd_density_min",
+                        "chi2_opd_density_max",
+                        "chi2_opd_reward_mean",
+                        "chi2_opd_reward_std",
+                        "chi2_opd_target_shift_tv",
+                        "chi2_opd_student_target_kl",
+                        "chi2_opd_teacher_target_kl",
                     ]
+                    if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                        keys_to_pop.append("ref_log_prob")
                     # L-APD computes its loss from teacher log-probs inside the actor update,
                     # so the tensors it consumes must survive until then.
                     l_apd_cfg = self.config.actor_rollout_ref.actor.get("l_apd", None)
