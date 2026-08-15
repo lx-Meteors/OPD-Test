@@ -811,12 +811,25 @@ class DataParallelPPOActor(BasePPOActor):
             weight_source=self.l_apd_config.get("weight_source", "student"),
             pair_divergence=pair_divergence,
         )
+
+        # EFW (三条件蒸馏): per-state teaching mass = sg(w) x residual. The field
+        # w(s) = KL(b||q)(s) is frozen (driver-computed from the ref/teacher streams),
+        # so it scales the force at each state without moving the p = q fixed point.
+        efw_field = model_inputs.get("efw_field", None)
+        if efw_field is not None:
+            token_loss = token_loss * efw_field.detach().to(token_loss.dtype)
+
         loss = agg_loss(loss_mat=token_loss, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
         metrics = {
             f"actor/l_apd_{name}": verl_F.masked_mean(value, response_mask).detach().item()
             for name, value in diagnostics.items()
         }
+        if efw_field is not None:
+            metrics["actor/l_apd_efw_field"] = verl_F.masked_mean(efw_field.float(), response_mask).detach().item()
+            metrics["actor/l_apd_efw_token_loss"] = (
+                verl_F.masked_mean(token_loss.detach(), response_mask).detach().item()
+            )
         return entropy, log_prob, loss, metrics
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -848,6 +861,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
+
+        # EFW (三条件蒸馏): the frozen edit field w(s) = KL(b||q)(s), computed in the
+        # driver from the ref/teacher streams. With L-APD it scales the token loss
+        # (teaching mass = reachable x RL-edited x not-learned-yet); without L-APD the
+        # field is already folded into the advantages, so it is not selected here.
+        if self.l_apd_config is not None and "efw_field" in data.batch.keys():
+            select_keys.append("efw_field")
 
         if self.l_apd_config is None:
             # Include student_top_k_log_probs if present (for top-k distillation)

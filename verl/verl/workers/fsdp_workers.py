@@ -1093,10 +1093,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["top_k"] = 0
+        efw_cfg = self.config.rollout.get("efw", None)
+        need_efw_field_log_probs = (
+            efw_cfg is not None
+            and efw_cfg.get("enable", False)
+            and "student_top_k_ids" in data.batch.keys()
+        )
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            if need_efw_field_log_probs:
+                # EFW edit field w(s) = KL(b||q)(s) needs log b on the student's own
+                # top-k candidate ids. One designated-ids forward covers both streams:
+                # the candidates and the sampled token (appended as the last id).
+                data.batch["target_ids"] = torch.cat(
+                    [data.batch["student_top_k_ids"], data.batch["responses"].unsqueeze(-1)], dim=-1
+                )
+                ref_log_probs_on_ids = self.ref_policy.compute_log_probs_for_ids(data=data)
+                output = DataProto.from_dict(
+                    tensors={
+                        "ref_log_prob": ref_log_probs_on_ids[..., -1].contiguous(),
+                        "ref_on_student_log_probs": ref_log_probs_on_ids[..., :-1].contiguous(),
+                    }
+                )
+            else:
+                output, _, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+                output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")
 

@@ -85,6 +85,15 @@ We provide OPD and Prune-OPD scripts for two teacher-student pairs.
 | `experiments_scripts/opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.sh` | OPD baseline for Qwen3-4B-Base / Qwen3-4B (Non-thinking) |
 | `experiments_scripts/prune-opd-qwen3-4b-base-qwen3-4b-non-thinking.sh` | Prune-OPD for Qwen3-4B-Base / Qwen3-4B (Non-thinking) |
 | `experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh` | L-APD for DeepSeek-R1-Distill-Qwen-1.5B / JustRL-DeepSeek-1.5B |
+| `experiments_scripts/og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh` | Order-gated bidirectional KL (L-APD `order_gated_kl`) for the same pair |
+| `experiments_scripts/efw-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh` | EFW: edit-field weighted OPD (baseline channel, primary comparison arm vs the OPD baseline) |
+| `experiments_scripts/efw-og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh` | EFW on the og-kl channel (second arm) |
+
+EFW scales the per-state teaching signal by the frozen edit field
+`w(s) = KL(base || teacher)(s)` estimated on the student top-16 ids, so
+distillation concentrates where the teacher's RL actually changed the policy.
+See the "EFW" section of [`README.md`](README.md) for the derivation, switches
+and metrics.
 
 Preview the resolved command without launching training:
 

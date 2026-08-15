@@ -1615,6 +1615,42 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # EFW (三条件蒸馏): compute the frozen edit field w(s) = KL(b||q)(s)
+                        # on the student top-k ids and fold it into the teaching signal.
+                        # Teaching mass = (reachable) x (RL edited here) x (not learned yet).
+                        # Two consumption paths, one per objective:
+                        #   - L-APD flows (e.g. og-kl): "efw_field" survives into the actor
+                        #     update, where it scales the differentiable token loss.
+                        #   - advantage flows (OPD baseline): the field is folded into
+                        #     token_level_scores here, before the advantage estimator.
+                        efw_cfg = self.config.actor_rollout_ref.rollout.get("efw", None)
+                        if efw_cfg is not None and efw_cfg.get("enable", False):
+                            if "ref_on_student_log_probs" not in batch.batch.keys():
+                                raise ValueError(
+                                    "efw.enable=True but ref_on_student_log_probs is missing: the ref "
+                                    "(base) worker must run and produce log b on the student top-k ids. "
+                                    "Check that the reference policy is instantiated (main_ppo enables it "
+                                    "when efw is on) and that log_prob_top_k > 0."
+                                )
+                            from verl.utils.efw import apply_efw_field_to_scores
+
+                            weighted_scores, efw_field, efw_metrics = apply_efw_field_to_scores(
+                                scores=batch.batch["token_level_scores"],
+                                ref_on_student_log_probs=batch.batch["ref_on_student_log_probs"],
+                                teacher_on_student_log_probs=batch.batch["teacher_on_student_log_probs"],
+                                response_mask=batch.batch["response_mask"],
+                                student_top_k_log_probs=batch.batch.get("student_top_k_log_probs", None),
+                                floor=float(efw_cfg.get("floor", 0.0)),
+                            )
+                            batch.batch["efw_field"] = efw_field
+                            metrics.update(efw_metrics)
+                            l_apd_cfg = self.config.actor_rollout_ref.actor.get("l_apd", None)
+                            if l_apd_cfg is None or not l_apd_cfg.get("enable", False):
+                                # Advantage flow only: L-APD never reads advantages, and
+                                # folding the field here too would double-count it there.
+                                batch.batch["token_level_scores"] = weighted_scores
+                            del weighted_scores
+
                         if "true_reward_score" in reward_extra_infos_dict:
                             true_reward_val = reward_extra_infos_dict["true_reward_score"]
                             if isinstance(true_reward_val, torch.Tensor):
@@ -2557,6 +2593,7 @@ class RayPPOTrainer:
                         "overlap_mask",
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
+                        "ref_on_student_log_probs",
                     ]
                     # L-APD computes its loss from teacher log-probs inside the actor update,
                     # so the tensors it consumes must survive until then.

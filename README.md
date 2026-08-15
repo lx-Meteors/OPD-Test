@@ -31,6 +31,14 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 MODEL_ROOT=/input0/models \
 bash experiments_scripts/og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
 
+# EFW 编辑场加权（三条件蒸馏，§1.6）——主对照臂：baseline 通道 ± 场
+MODEL_ROOT=/input0/models \
+bash experiments_scripts/efw-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
+# EFW × og-kl（第二臂：无死区残差配场）
+MODEL_ROOT=/input0/models \
+bash experiments_scripts/efw-og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
+
 # 成对形式（jeffreys 对称成对 KL + student 候选/加权 + 尾部块，§1）
 MODEL_ROOT=/input0/models \
 bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh
@@ -427,20 +435,87 @@ $$
 启动脚本：`experiments_scripts/og-kl-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh`。
 新增指标见 §7。
 
+### 1.6 EFW：编辑场加权（三条件蒸馏，2026-08-15）
+
+EFW（Edit-Field Weighting）不是一种新的残差 loss，而是一层**逐状态的教学配额**，
+可叠加在两条已有通道的任意一条上。出发点是三条公理——一个状态值得教，当且仅当：
+
+1. **有 RL 信息**：teacher 的 RL 编辑过此处（否则教的是 teacher 自有信息）；
+2. **student 到得了**：不然教了也用不上；
+3. **student 还没学会**：学会了就不用再教。
+
+三条件各占一个因子、互不重复记账，乘积即目标：
+
+$$
+\mathcal{L}(\theta)=\mathbb{E}_{\tau\sim p_\theta}\Bigl[\sum_t\
+\underbrace{\mathrm{sg}\bigl(w(s_t)\bigr)}_{\text{RL 改过多少}}\cdot
+\underbrace{\mathcal{R}(s_t)}_{\text{还差多少}}\Bigr],
+\qquad
+w(s)=\mathrm{KL}\bigl(b\,\Vert\,q\bigr)(s)
+$$
+
+其中 $b$ 是 **base 模型**（= student 初始权重 = teacher 的 RL 起点，由 ref worker
+提供），$q$ 是 teacher，$\mathcal{R}$ 是所在通道自己的残差（baseline 的 only_stu
+打分，或 §1.5 的 og-kl token loss）。$w$ 由两个冻结模型定义，是**静态历史事实**
+——RL 当年在哪个状态花了多少修正预算；残差是活的进度，学会即熄灭。init 时
+student $=b$，二者恒等（$\mathrm{KL}(p\Vert q)|_{p=b}=\mathrm{KL}(b\Vert q)$），
+于是有效信号以 $w^2$ 起步：教学从 RL 修正最密的状态二次聚焦展开，高场处收敛后
+配额自动移向中场——"逐步捕获"是乘积结构的定理，不是调度器。$w>0$ 处不动点仍是
+$p=q$，$w=0$ 处不施约束（student 保持 base），无外推、无 λ 旋钮。
+
+**场的估计（student top-16）**：$\hat w(s)=-\sum_{z\in T_{16}(p_\theta)}b(z)\,
+(\log q-\log b)(z\mid s)$，截断和落负钳 0。候选集就是管线现成的
+`student_top_k_ids`；init 时它等于 $T_{16}(b)$，$b$-质量覆盖 >99%，96 条真实轨迹
+上对精确全词表场 $r=0.9955$、中位相对误差 1.6%（q top-16 仅 $r=0.9408$——漏掉
+被 RL 压低的 token；union32 $r=0.9948$，增益可忽略而成本翻倍）。训练中候选集随
+student 漂移，健康度由 `efw/b_mass_coverage` 在线监控（持续 <0.9 再考虑退回
+union）。三路 designated-ids log prob 里 student / teacher 两路管线已有，**唯一
+新增计算是每步一次 ref designated-ids 前向**（顺带免费产出 `ref_log_prob`）。
+
+**两条消费通道，互斥、各恰好一次**（同一个 `efw.enable` 旗子）：
+
+| 通道 | 残差 $\mathcal{R}$ | 场乘在哪 | 脚本 |
+| --- | --- | --- | --- |
+| baseline（`l_apd.enable=False`，**主对照臂**） | only_stu 3D `rm_scores`（冻结常数，走 PPO 代理） | driver 里乘进 `token_level_scores`，再变 advantage | `efw-opd-*.sh` |
+| og-kl（`l_apd.enable=True`，第二臂） | §1.5 的 token loss（可微，逐 micro-batch 现算） | `_compute_l_apd_loss` 里乘 `token_loss`（`efw_field` 经 select_keys 存活到 update） | `efw-og-kl-*.sh` |
+
+**对照设计**：主对照走 baseline 通道——EFW-基线 vs baseline 是严格单变量
+（同 rollout、同 teacher 打分、同残差、同 PPO 机器，唯一差别是乘不乘场），且与
+Prune-OPD / G-OPD 同通道可比，"场是否有效"归因最干净；og-kl±场作第二臂，回答
+"给场配上无死区残差（λ 门控救活 $\tilde p\approx0$ 的饿死格、逐 micro-batch
+自熄灭）还能再涨多少"。完整阶梯：baseline / EFW-基线 / og-kl / EFW-og-kl。
+
+开关（Hydra `+actor_rollout_ref.rollout.efw.*`，或脚本环境变量）：
+
+| 开关 | 默认 | 含义 |
+| --- | --- | --- |
+| `efw.enable` | 无（脚本置 `True`） | 开启场权重；同时令 `main_ppo` 在 KL 关闭时也拉起 ref worker |
+| `efw.floor`（env `EFW_FLOOR`） | `0.0`（关） | 场的 $\epsilon$ 地板——唯一预留旋钮，防低场区失锚漂移；动它之前先看 `efw/low_field_kl_p_b` |
+
+注意 ref worker 加载 `actor_rollout_ref.model.path`（即 student 初始权重）。本仓库
+的两个配对里它恰好就是 teacher 的 RL 起点，$b$ 的语义由构造保证；若换成别的
+teacher/student 配对，需确认这一点仍成立。指标见 §7，测试见 §8。
+
 ## 2. 代码位置
 
 | 文件 | 作用 |
 | --- | --- |
 | `verl/verl/trainer/ppo/l_apd.py` | 目标函数本体（只依赖 torch，可独立测试） |
-| `verl/verl/workers/actor/dp_actor.py` | `update_policy` 中的 L-APD 分支与 `_compute_l_apd_loss` |
+| `verl/verl/workers/actor/dp_actor.py` | `update_policy` 中的 L-APD 分支与 `_compute_l_apd_loss`（EFW 开启时在此把场乘进 token loss） |
 | `verl/verl/workers/config/actor.py` | `LAPDConfig` 配置项 |
 | `verl/verl/trainer/config/actor/actor.yaml` | `actor_rollout_ref.actor.l_apd.*` 默认值 |
-| `verl/verl/trainer/ppo/ray_trainer.py` | 保留 L-APD 需要的 teacher 张量到 actor update |
+| `verl/verl/trainer/ppo/ray_trainer.py` | 保留 L-APD 需要的 teacher 张量到 actor update；EFW 场的计算、指标与通道注入（§1.6） |
+| `verl/verl/utils/efw.py` | EFW 编辑场 $w=\mathrm{KL}(b\Vert q)$ 的估计与打分加权（§1.6，只依赖 torch） |
+| `verl/verl/workers/fsdp_workers.py` | `compute_ref_log_prob`：EFW 开启时 ref 在 student top-16 ids（附采样 token）上做一次 designated-ids 前向 |
+| `verl/verl/trainer/main_ppo.py` | EFW 开启时（即使 KL 关闭）也实例化 ref worker |
 | `experiments_scripts/l-apd-*.sh` | 成对形式（jeffreys）的启动脚本 |
 | `experiments_scripts/og-kl-*.sh` | 序门控双向 KL（`order_gated_kl`，当前方法，§1.5）的启动脚本 |
-| `verl/tests/trainer/ppo/test_l_apd_on_cpu.py` | 单元测试 |
+| `experiments_scripts/efw-opd-*.sh` / `efw-og-kl-*.sh` | EFW 两臂（§1.6：baseline 通道主对照 / og-kl 通道第二臂）的启动脚本 |
+| `verl/tests/trainer/ppo/test_l_apd_on_cpu.py` | L-APD 单元测试 |
+| `verl/tests/utils/test_efw_on_cpu.py` | EFW 单元测试 |
 
-`l_apd.enable=false` 时以上改动全部旁路，OPD / Prune-OPD 原有行为逐字不变。
+`l_apd.enable=false` 且 `efw.enable` 未开时以上改动全部旁路，OPD / Prune-OPD
+原有行为逐字不变。
 
 ## 3. 实验配置（与 Table 1 对齐）
 
@@ -693,6 +768,16 @@ bash experiments_scripts/l-apd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5
 | `actor/l_apd_mode_agreement` | 16 格内两侧 argmax 一致的位置占比，应随 λ 退火而上升 |
 | `actor/l_apd_student_covered_prob` / `..._teacher_covered_prob` | 两侧在 student top-16 上的覆盖质量（raw）。固定点在 raw 水平上，观察 $P$ 是否向 $Q$ 收敛 |
 
+EFW（§1.6）开启时另有两组：
+
+| 指标 | 含义 |
+| --- | --- |
+| `efw/field_mean` / `_p50` / `_p90` / `_p99` / `_max` | 编辑场 $\hat w$ 在有效 token 上的分布轮廓（driver 侧，两条通道都记录） |
+| `efw/field_frac_low` | $\hat w<10^{-2}$ 的位置占比——失锚面大小：这些状态基本不被教 |
+| `efw/b_mass_coverage` | student top-16 覆盖的 $b$-质量均值，估计器健康度；init ≈1，持续 <0.9 说明候选集已漂离 $b$，考虑退回 union |
+| `efw/low_field_kl_p_b` | 低场区的 $\widehat{\mathrm{KL}}(p\Vert b)$（截断），失锚漂移监控；它持续走高才考虑打开 `efw.floor` |
+| `actor/l_apd_efw_field` / `..._efw_token_loss` | og-kl 通道专有：进入 update 的场均值、实际优化的加权 loss（init 应为 $w^2$ 量级；高场桶先熄灭即"逐步捕获"的读数） |
+
 评测结果仍在 `val-core/*` 下（AIME24 / AIME25 / AMC23 的 Avg@16）。
 
 ## 8. 单元测试
@@ -702,7 +787,15 @@ cd /input0/yyy/Prune-OPD/verl
 PYTHONPATH=$(pwd) python tests/trainer/ppo/test_l_apd_on_cpu.py
 # 或
 PYTHONPATH=$(pwd) pytest tests/trainer/ppo/test_l_apd_on_cpu.py -v
+
+# EFW（§1.6）：
+PYTHONPATH=$(pwd) python tests/utils/test_efw_on_cpu.py
 ```
+
+EFW 测试覆盖：$\hat w$ 在 >99% 覆盖下对全词表精确 KL 的相对误差 <5%、截断和落负
+钳 0、`floor` 只抬零场、打分逐位置缩放且零场处教学信号精确归零、掩码位置不泄漏
+进指标，以及关键一条——场乘 og-kl token loss（真实 `compute_l_apd_token_loss`）
+后，逐位置 autograd 梯度精确等于场值 × 未加权梯度（乘积结构的机械验证）。
 
 覆盖：`jeffreys` 逐元素等于双向 Bernoulli KL 之和（暴力参考实现）、$p=q$ 处零损失零梯度、
 被丢弃的 teacher 想要 token 相对单向逆向拿到 >10 倍梯度（去门控）、且确实是库的默认散度；
@@ -762,6 +855,38 @@ student 加权确实是库默认、权重逐元素等于 $\mathrm{sg}[p(o)/(1-p(
 - 单节点默认 8 卡（`trainer.n_gpus_per_node=8`），卡数不同时请追加 override。
 
 ## 10. 更新记录
+
+### 2026-08-15：EFW 编辑场加权（三条件蒸馏，叠加层）
+
+- **新增一层逐状态教学配额**（§1.6）：$\mathcal{L}=\sum_t \mathrm{sg}(w(s_t))\cdot
+  \mathcal{R}(s_t)$，$w=\mathrm{KL}(b\Vert q)$ 是 base→teacher 的**冻结编辑场**
+  （RL 当年在该状态花掉的修正量），$\mathcal{R}$ 是所在通道自己的残差。三条公理
+  （有 RL 信息 / student 到得了 / 还没学会）各占一个因子：on-policy 采样承载可达性，
+  冻结场承载 RL 信息，残差承载未学会且自熄灭。init 时 student $=b$ ⇒ 有效信号
+  $=w^2$ 起步，"逐步捕获"（高场先教、收敛后配额外移）是乘积结构的定理而非调度器；
+  不动点 $p=q$ 不动，无外推、无 λ。与 Prune-OPD 方向相反的可检验预测：错误轨迹
+  尾部场强实测 3.2×——失败模式恰是 RL 修正预算的重仓区，本方法在"案发现场"加重
+  教学而不是剪掉。
+- **场的估计定稿为 student top-16**：候选集用管线现成的 `student_top_k_ids`，
+  init 时即 $T_{16}(b)$、$b$-质量覆盖 >99%；96 条真实轨迹上对精确全词表场
+  $r=0.9955$、中位相对误差 1.6%（q top-16 仅 0.9408，union32 0.9948 增益可忽略
+  而成本翻倍）。漂移由 `efw/b_mass_coverage` 在线监控。唯一新增计算是每步一次
+  ref designated-ids 前向（在 student top-16 ids 后附上采样 token，一趟同时产出
+  `ref_on_student_log_probs` 与 `ref_log_prob`）。
+- **双通道实现，互斥、各恰好一次**（同一 `efw.enable` 旗子）：baseline 通道
+  （主对照臂，与 baseline OPD / Prune-OPD / G-OPD 同通道单变量可比）在 driver 把场
+  折进 `token_level_scores`；og-kl 通道（第二臂，无死区残差）把 `efw_field` 经
+  select_keys 送进 actor update、在 `_compute_l_apd_loss` 里乘 token loss。对照
+  阶梯：baseline / EFW-基线 / og-kl / EFW-og-kl。
+- 实现：`verl/utils/efw.py`（场估计 + 打分加权 + 指标）；
+  `fsdp_workers.compute_ref_log_prob`（ref designated-ids 前向）；`ray_trainer`
+  （场计算与通道注入）；`dp_actor`（og-kl 通道的 loss 乘法与 select）；`main_ppo`
+  （EFW 开启时 KL 关闭也拉起 ref worker）。脚本 `efw-opd-*.sh` / `efw-og-kl-*.sh`；
+  预留旋钮仅 `efw.floor`（$\epsilon$ 地板，默认关，防低场失锚漂移，动前先看
+  `efw/low_field_kl_p_b`）。新指标见 §7。
+- 单元测试 `tests/utils/test_efw_on_cpu.py` 7/7：全词表精确场对拍（>99% 覆盖下
+  相对误差 <5%）、截断落负钳 0、floor 只抬零场、逐位置缩放与零场归零、掩码不泄漏、
+  2D/3D 打分两条路径、场乘真实 og-kl loss 后逐位置梯度精确等于场值 × 未加权梯度。
 
 ### 2026-08-14：序门控双向 KL（`order_gated_kl`，当前方法）
 
