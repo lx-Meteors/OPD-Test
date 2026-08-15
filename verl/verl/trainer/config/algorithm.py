@@ -349,6 +349,16 @@ class AlgoConfig(BaseConfig):
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
     grpo_outcome_weight: float = 1.0
+    # Set-OPD: response-set coverage objective over independent rollouts from the same prompt.
+    set_opd_weight: float = 0.05
+    set_opd_feature_dim: int = 128
+    set_opd_position_bins: int = 8
+    set_opd_max_positions: int = 64
+    set_opd_logdet_scale: float = 1.0
+    set_opd_quality_weight: float = 1.0
+    set_opd_diversity_weight: float = 1.0
+    set_opd_normalize_by_std: bool = True
+    set_opd_correct_threshold: float = 0.5
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

@@ -252,6 +252,10 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "true_reward_score" in data.batch: # optional
             adv_kwargs["true_reward_score"] = data.batch["true_reward_score"]
+        if "teacher_top_k_ids" in data.batch:  # optional, used by Set-OPD
+            adv_kwargs["teacher_top_k_ids"] = data.batch["teacher_top_k_ids"]
+        if "teacher_top_k_log_probs" in data.batch:  # optional, used by Set-OPD
+            adv_kwargs["teacher_top_k_log_probs"] = data.batch["teacher_top_k_log_probs"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 

@@ -759,6 +759,8 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if "set_opd_advantages" in data.batch.keys():
+            select_keys.append("set_opd_advantages")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -849,7 +851,7 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, log_prob, _, topk_log_probs = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
@@ -918,6 +920,31 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batch_metrics.update(pg_metrics)
 
+                    set_opd_pg_loss = None
+                    if "set_opd_advantages" in model_inputs:
+                        set_opd_advantages = model_inputs["set_opd_advantages"]
+                        # Set-OPD is a response-level objective over the actually sampled
+                        # trajectory. Keep it separate from the 3D Top-K OPD objective so
+                        # the same scalar advantage is not incorrectly applied to every
+                        # candidate token in the Top-K support.
+                        set_old_log_prob = log_prob.detach() if on_policy else model_inputs["old_log_probs"]
+                        set_opd_pg_loss, set_opd_pg_metrics = policy_loss_fn(
+                            old_log_prob=set_old_log_prob,
+                            log_prob=log_prob,
+                            advantages=set_opd_advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode="seq-mean-token-mean",
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
+                        )
+                        for metric_name, metric_value in set_opd_pg_metrics.items():
+                            if metric_name.startswith("actor/"):
+                                metric_name = f"actor/set_opd_{metric_name[len('actor/') :]}"
+                            else:
+                                metric_name = f"actor/set_opd_{metric_name}"
+                            micro_batch_metrics[metric_name] = metric_value
+
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -925,6 +952,15 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if set_opd_pg_loss is not None:
+                        policy_loss = policy_loss + set_opd_pg_loss
+                        micro_batch_metrics["actor/set_opd_pg_loss"] = (
+                            set_opd_pg_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/total_pg_loss"] = (
+                            (pg_loss + set_opd_pg_loss).detach().item() * loss_scale_factor
+                        )
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]

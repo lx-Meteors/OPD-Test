@@ -880,6 +880,214 @@ def compute_token_reward_direct_advantage(
     return advantages, returns
 
 
+def _set_opd_config_value(config: Optional[AlgoConfig], name: str, default: Any) -> Any:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def build_set_opd_teacher_policy_features(
+    teacher_top_k_ids: torch.Tensor,
+    teacher_top_k_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    feature_dim: int = 128,
+    position_bins: int = 8,
+    max_positions: int = 64,
+) -> torch.Tensor:
+    """Build a compact trajectory sketch from teacher distributions on student prefixes.
+
+    The feature is a signed, position-binned hash of teacher Top-K probabilities.
+    It reuses logits already computed by OPD, so Set-OPD does not require another
+    encoder or teacher forward pass. Features are L2-normalized per response.
+    """
+    if teacher_top_k_ids.ndim != 3 or teacher_top_k_log_probs.ndim != 3:
+        raise ValueError("Set-OPD expects teacher Top-K tensors with shape (batch, response_length, k).")
+    if teacher_top_k_ids.shape != teacher_top_k_log_probs.shape:
+        raise ValueError("Set-OPD teacher Top-K ids and log-probabilities must have identical shapes.")
+    if response_mask.shape != teacher_top_k_ids.shape[:2]:
+        raise ValueError("Set-OPD response mask must match the first two teacher Top-K dimensions.")
+    if feature_dim < 1 or position_bins < 1 or max_positions < 1:
+        raise ValueError("Set-OPD feature_dim, position_bins, and max_positions must all be positive.")
+
+    device = teacher_top_k_log_probs.device
+    if teacher_top_k_ids.device != device:
+        teacher_top_k_ids = teacher_top_k_ids.to(device)
+    if response_mask.device != device:
+        response_mask = response_mask.to(device)
+    features = torch.zeros(
+        (teacher_top_k_ids.shape[0], feature_dim), device=device, dtype=torch.float32
+    )
+    hash_dim = max(feature_dim // position_bins, 1)
+    effective_bins = max(min(position_bins, feature_dim), 1)
+
+    for sample_idx in range(teacher_top_k_ids.shape[0]):
+        valid_positions = torch.nonzero(response_mask[sample_idx].bool(), as_tuple=False).flatten()
+        if valid_positions.numel() == 0:
+            continue
+        if valid_positions.numel() > max_positions:
+            sampled_offsets = torch.linspace(
+                0,
+                valid_positions.numel() - 1,
+                steps=max_positions,
+                device=valid_positions.device,
+            ).round().long()
+            valid_positions = valid_positions[sampled_offsets]
+
+        token_ids = teacher_top_k_ids[sample_idx, valid_positions].long()
+        token_weights = torch.nan_to_num(
+            teacher_top_k_log_probs[sample_idx, valid_positions].float().exp(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        num_positions = valid_positions.numel()
+        position_ids = torch.div(
+            torch.arange(num_positions, device=device) * effective_bins,
+            num_positions,
+            rounding_mode="floor",
+        ).clamp_max(effective_bins - 1)
+
+        hashed_ids = torch.remainder(token_ids * 1_000_003 + 97, hash_dim)
+        target_ids = position_ids.unsqueeze(-1) * hash_dim + hashed_ids
+        target_ids = target_ids.clamp_max(feature_dim - 1)
+        signs = torch.where(
+            torch.remainder(token_ids * 97 + 13, 2) == 0,
+            torch.ones_like(token_weights),
+            -torch.ones_like(token_weights),
+        )
+        features[sample_idx].scatter_add_(
+            0,
+            target_ids.reshape(-1),
+            (token_weights * signs).reshape(-1),
+        )
+
+    return torch.nn.functional.normalize(features, p=2, dim=-1, eps=1e-12)
+
+
+def compute_set_opd_sequence_advantages(
+    features: torch.Tensor,
+    correctness: torch.Tensor,
+    index: np.ndarray,
+    *,
+    logdet_scale: float = 1.0,
+    quality_weight: float = 1.0,
+    diversity_weight: float = 1.0,
+    normalize_by_std: bool = True,
+    correct_threshold: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute each rollout's marginal contribution to its prompt-level response set.
+
+    Correctness supplies the quality term. Diversity is the leave-one-out marginal
+    contribution to a DPP-style log-determinant score over correct trajectories.
+    The resulting score is centered within each prompt group, just like a
+    group-relative advantage, but no shared-prefix branching is involved.
+    """
+    if features.ndim != 2:
+        raise ValueError("Set-OPD features must have shape (batch, feature_dim).")
+    if correctness.ndim != 1 or correctness.shape[0] != features.shape[0]:
+        raise ValueError("Set-OPD correctness must have shape (batch,).")
+    if len(index) != features.shape[0]:
+        raise ValueError("Set-OPD group ids must have one entry per response.")
+
+    sequence_advantage = torch.zeros(features.shape[0], device=features.device, dtype=torch.float32)
+    raw_scores = torch.zeros_like(sequence_advantage)
+    groups: dict[Any, list[int]] = defaultdict(list)
+    for sample_idx, group_id in enumerate(index):
+        groups[group_id].append(sample_idx)
+
+    def logdet_score(rows: torch.Tensor) -> torch.Tensor:
+        if rows.shape[0] == 0:
+            return torch.zeros((), device=features.device, dtype=torch.float32)
+        gram = rows.float() @ rows.float().transpose(0, 1)
+        matrix = torch.eye(rows.shape[0], device=features.device, dtype=torch.float32) + logdet_scale * gram
+        sign, value = torch.linalg.slogdet(matrix)
+        return torch.where(sign > 0, value, torch.zeros_like(value))
+
+    for group_indices in groups.values():
+        group_tensor = torch.as_tensor(group_indices, device=features.device, dtype=torch.long)
+        group_correct = correctness[group_tensor].float() > correct_threshold
+        correct_local_indices = torch.nonzero(group_correct, as_tuple=False).flatten()
+        group_raw = quality_weight * group_correct.float()
+
+        if correct_local_indices.numel() > 0 and diversity_weight != 0:
+            correct_features = features[group_tensor[correct_local_indices]]
+            full_score = logdet_score(correct_features)
+            for correct_offset, local_idx in enumerate(correct_local_indices):
+                keep_mask = torch.ones(correct_features.shape[0], device=features.device, dtype=torch.bool)
+                keep_mask[correct_offset] = False
+                marginal = full_score - logdet_score(correct_features[keep_mask])
+                group_raw[local_idx] += diversity_weight * marginal
+
+        raw_scores[group_tensor] = group_raw
+        centered = group_raw - group_raw.mean()
+        if normalize_by_std:
+            std = centered.std(unbiased=False)
+            if std > 1e-6:
+                centered = centered / std
+        sequence_advantage[group_tensor] = centered
+
+    return sequence_advantage, raw_scores
+
+
+@register_adv_est("set_opd")
+def compute_set_opd_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    true_reward_score: torch.Tensor,
+    teacher_top_k_ids: torch.Tensor,
+    teacher_top_k_log_probs: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep standard OPD advantages and add a separate set-level policy signal."""
+    del kwargs
+    direct_advantage, direct_returns = compute_token_reward_direct_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        config=config,
+    )
+    feature_dim = int(_set_opd_config_value(config, "set_opd_feature_dim", 128))
+    position_bins = int(_set_opd_config_value(config, "set_opd_position_bins", 8))
+    max_positions = int(_set_opd_config_value(config, "set_opd_max_positions", 64))
+    with torch.no_grad():
+        features = build_set_opd_teacher_policy_features(
+            teacher_top_k_ids=teacher_top_k_ids,
+            teacher_top_k_log_probs=teacher_top_k_log_probs,
+            response_mask=response_mask,
+            feature_dim=feature_dim,
+            position_bins=position_bins,
+            max_positions=max_positions,
+        )
+        correctness = true_reward_score.float().sum(dim=-1).to(features.device)
+        sequence_advantage, raw_scores = compute_set_opd_sequence_advantages(
+            features=features,
+            correctness=correctness,
+            index=index,
+            logdet_scale=float(_set_opd_config_value(config, "set_opd_logdet_scale", 1.0)),
+            quality_weight=float(_set_opd_config_value(config, "set_opd_quality_weight", 1.0)),
+            diversity_weight=float(_set_opd_config_value(config, "set_opd_diversity_weight", 1.0)),
+            normalize_by_std=bool(_set_opd_config_value(config, "set_opd_normalize_by_std", True)),
+            correct_threshold=float(_set_opd_config_value(config, "set_opd_correct_threshold", 0.5)),
+        )
+    set_weight = float(_set_opd_config_value(config, "set_opd_weight", 0.05))
+    set_token_advantage = (
+        set_weight * sequence_advantage.to(response_mask.device).unsqueeze(-1) * response_mask.float()
+    )
+    sequence_advantage = sequence_advantage.to(response_mask.device)
+    raw_scores = raw_scores.to(response_mask.device)
+    correctness = correctness.to(response_mask.device)
+    return direct_advantage, direct_returns, {
+        "token_level_advantage_direct": direct_advantage,
+        "set_opd_advantages": set_token_advantage,
+        "set_opd_sequence_advantage": sequence_advantage,
+        "set_opd_raw_score": raw_scores,
+        "set_opd_correctness": correctness,
+    }
+
+
 @register_adv_est("token_reward_direct_plus_grpo")
 def compute_token_reward_direct_plus_grpo_advantage(
     token_level_rewards: torch.Tensor,

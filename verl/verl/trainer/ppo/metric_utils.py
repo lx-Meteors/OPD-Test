@@ -213,6 +213,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         partial_adv_metrics["critic/advantages/direct_max"] = torch.max(valid_direct_adv).detach().item() if valid_direct_adv.numel() > 0 else 0.0
         partial_adv_metrics["critic/advantages/direct_min"] = torch.min(valid_direct_adv).detach().item() if valid_direct_adv.numel() > 0 else 0.0
 
+    if "set_opd_sequence_advantage" in batch.batch.keys():
+        set_sequence_advantage = batch.batch["set_opd_sequence_advantage"].float()
+        set_raw_score = batch.batch["set_opd_raw_score"].float()
+        set_correctness = batch.batch["set_opd_correctness"].float()
+        partial_adv_metrics["set_opd/sequence_advantage_mean"] = set_sequence_advantage.mean().detach().item()
+        partial_adv_metrics["set_opd/sequence_advantage_abs_mean"] = (
+            set_sequence_advantage.abs().mean().detach().item()
+        )
+        partial_adv_metrics["set_opd/sequence_advantage_max"] = set_sequence_advantage.max().detach().item()
+        partial_adv_metrics["set_opd/sequence_advantage_min"] = set_sequence_advantage.min().detach().item()
+        partial_adv_metrics["set_opd/active_response_ratio"] = (
+            (set_sequence_advantage.abs() > 1e-8).float().mean().detach().item()
+        )
+        partial_adv_metrics["set_opd/raw_score_mean"] = set_raw_score.mean().detach().item()
+        partial_adv_metrics["set_opd/correct_ratio"] = (set_correctness > 0.5).float().mean().detach().item()
+
 
     max_response_length = response_mask.size(-1)
     step = 2 * 1024
