@@ -144,6 +144,9 @@ class RolloutConfig(BaseConfig):
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", or "none"
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
     prune_opd: dict = field(default_factory=dict)
+    # EFW (edit-field weighting): registered here so hydra's strict dataclass
+    # instantiation accepts the `+actor_rollout_ref.rollout.efw.*` overrides.
+    efw: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
 
