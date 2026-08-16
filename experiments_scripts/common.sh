@@ -126,10 +126,16 @@ run_opd() {
     export REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
-    # bfloat16 keeps FlashAttention happy (it has no fp32 kernels); accepted
-    # spellings per PrecisionType: bf16/bfloat16. Feeds all three dtype
-    # overrides below (actor + ref fsdp_config.model_dtype, reward_model dtype).
-    export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
+    # Actor master weights + Adam states must stay fp32: forward/backward
+    # already run in bf16 via FSDP mixed precision, but with lr=1e-6 a bf16
+    # master weight (ULP ~6e-5 at |w|~0.02) rounds every ~1e-6 update to zero
+    # and the model stops learning. The load-time FlashAttention fp32 warning
+    # is cosmetic: attention inputs are cast to bf16 before the kernel.
+    # Inference-only legs (ref base model, teacher scoring) run bf16 -- halves
+    # their memory at no cost that survives batch averaging. Setting the legacy
+    # MODEL_DTYPE still overrides both legs at once.
+    export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-${MODEL_DTYPE:-fp32}}"
+    export INFER_MODEL_DTYPE="${INFER_MODEL_DTYPE:-${MODEL_DTYPE:-bfloat16}}"
     export IS_PLOT="${IS_PLOT:-False}"
     export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
     export PARALLEL_SIZE="${PARALLEL_SIZE:-1}"
@@ -236,10 +242,10 @@ run_opd() {
         "actor_rollout_ref.actor.fsdp_config.param_offload=False"
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False"
         "actor_rollout_ref.actor.fsdp_config.forward_prefetch=True"
-        "actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE}"
+        "actor_rollout_ref.actor.fsdp_config.model_dtype=${ACTOR_MODEL_DTYPE}"
         "actor_rollout_ref.rollout.max_num_batched_tokens=${ppo_max_token_len_per_gpu}"
         "actor_rollout_ref.ref.fsdp_config.param_offload=True"
-        "actor_rollout_ref.ref.fsdp_config.model_dtype=${MODEL_DTYPE}"
+        "actor_rollout_ref.ref.fsdp_config.model_dtype=${INFER_MODEL_DTYPE}"
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True"
         "actor_rollout_ref.rollout.name=vllm"
         "actor_rollout_ref.rollout.temperature=${TEMPERATURE}"
@@ -286,7 +292,7 @@ run_opd() {
             "reward_model.model.input_tokenizer=null"
             "reward_model.model.use_remove_padding=True"
             "reward_model.model.fsdp_config.param_offload=False"
-            "+reward_model.model.dtype=${MODEL_DTYPE}"
+            "+reward_model.model.dtype=${INFER_MODEL_DTYPE}"
             "reward_model.micro_batch_size_per_gpu=24"
         )
     fi
