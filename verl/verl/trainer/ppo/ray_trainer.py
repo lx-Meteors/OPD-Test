@@ -411,6 +411,36 @@ class RayPPOTrainer:
             "prune_opd/dynamic_response_length_no_hit_steps": float(self.prune_opd_dynamic_response_length_no_hit_steps),
         }
 
+    def _collect_preference_opd_metrics(self, batch: DataProto) -> dict[str, float]:
+        """Aggregate temperature-decomposed OPD diagnostics over response positions."""
+        if "preference_opd_temperature" not in batch.batch.keys():
+            return {}
+
+        response_mask = batch.batch["response_mask"].detach().float()
+        valid_count = batch.batch["preference_opd_valid_candidate_count"].detach().float()
+        metric_mask = response_mask * (valid_count > 0).to(response_mask.dtype)
+        denominator = metric_mask.sum().clamp_min(1.0)
+        tensor_to_metric = {
+            "preference_opd_temperature": "preference_opd/temperature_mean",
+            "preference_opd_explained_ratio": "preference_opd/temperature_explained_ratio",
+            "preference_opd_top1_agreement": "preference_opd/top1_agreement",
+            "preference_opd_preference_abs": "preference_opd/preference_adv_abs_mean",
+            "preference_opd_confidence_abs": "preference_opd/confidence_adv_abs_mean",
+            "preference_opd_standard_abs": "preference_opd/standard_adv_abs_mean",
+            "preference_opd_preference_fraction": "preference_opd/preference_fraction",
+            "preference_opd_student_candidate_mass": "preference_opd/student_candidate_mass",
+            "preference_opd_teacher_candidate_mass": "preference_opd/teacher_candidate_mass",
+            "preference_opd_valid_candidate_count": "preference_opd/valid_candidate_count",
+        }
+        metrics = {}
+        for tensor_key, metric_key in tensor_to_metric.items():
+            values = batch.batch[tensor_key].detach().float()
+            metrics[metric_key] = ((values * metric_mask).sum() / denominator).item()
+
+        preference_cfg = self.config.actor_rollout_ref.rollout.get("preference_opd", {})
+        metrics["preference_opd/confidence_beta"] = float(preference_cfg.get("confidence_beta", 0.25))
+        return metrics
+
     def _log_prune_opd_loss_weights(self, batch: DataProto):
         """Log prune-opd loss-weight diagnostics without touching training tensors."""
         if "prune_opd_loss_weights" not in batch.batch.keys():
@@ -1296,6 +1326,11 @@ class RayPPOTrainer:
                             prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", None)
                             if prune_opd_cfg is not None and prune_opd_cfg.get("enable", False):
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)
+                            preference_opd_cfg = self.config.actor_rollout_ref.rollout.get("preference_opd", None)
+                            if preference_opd_cfg is not None and preference_opd_cfg.get("enable", False):
+                                batch.meta_info["preference_opd"] = OmegaConf.to_container(
+                                    preference_opd_cfg, resolve=True
+                                )
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
@@ -1308,6 +1343,7 @@ class RayPPOTrainer:
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+                                metrics.update(self._collect_preference_opd_metrics(batch))
 
                         self._log_prune_opd_loss_weights(batch)
                         
@@ -2556,6 +2592,16 @@ class RayPPOTrainer:
                         "overlap_mask",
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
+                        "preference_opd_temperature",
+                        "preference_opd_explained_ratio",
+                        "preference_opd_top1_agreement",
+                        "preference_opd_preference_abs",
+                        "preference_opd_confidence_abs",
+                        "preference_opd_standard_abs",
+                        "preference_opd_preference_fraction",
+                        "preference_opd_student_candidate_mass",
+                        "preference_opd_teacher_candidate_mass",
+                        "preference_opd_valid_candidate_count",
                     ]
                     for key in keys_to_pop:
                         if key in batch.batch.keys():

@@ -31,8 +31,9 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-from verl.utils.prune_opd import apply_prune_opd_to_scores
+from verl.utils.preference_opd import apply_preference_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
+from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
@@ -468,6 +469,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         prune_opd_cfg = data.meta_info.get("prune_opd", None)
+        preference_opd_cfg = data.meta_info.get("preference_opd", None)
 
         # 2. Compute Student Log Probs on Teacher IDs if needed
         # (This replaces the previous call to compute_log_probs_for_ids in ray_trainer)
@@ -558,18 +560,26 @@ class DataParallelPPOActor(BasePPOActor):
             return weights
 
         res_tensors = {}
+        score_student_logp = None
+        score_teacher_logp = None
+        score_valid_mask = None
+        score_weights = None
         
         if strategy == "only_stu":
             kl_val = S_logp - T_on_S
             valid_mask = torch.ones_like(S_logp, dtype=torch.bool)
             norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
             rm_scores = -kl_val * norm_weights
+            score_student_logp, score_teacher_logp = S_logp, T_on_S
+            score_valid_mask, score_weights = valid_mask, norm_weights
             
         elif strategy == "only_tch":
             kl_val = S_on_T - T_logp
             valid_mask = torch.ones_like(S_on_T, dtype=torch.bool)
             norm_weights = compute_reward_weights(S_on_T, T_logp, valid_mask, reward_weight_mode)
             rm_scores = -kl_val * norm_weights
+            score_student_logp, score_teacher_logp = S_on_T, T_logp
+            score_valid_mask, score_weights = valid_mask, norm_weights
             res_tensors["union_top_k_ids"] = T_ids
             
         elif strategy == "intersection":
@@ -578,6 +588,8 @@ class DataParallelPPOActor(BasePPOActor):
             kl_val = torch.where(valid_mask, kl_val, torch.zeros_like(kl_val))
             norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
             rm_scores = -kl_val * norm_weights
+            score_student_logp, score_teacher_logp = S_logp, T_on_S
+            score_valid_mask, score_weights = valid_mask, norm_weights
             
         elif strategy == "union":
             union_ids = torch.cat([S_ids, T_ids], dim=-1)
@@ -594,6 +606,8 @@ class DataParallelPPOActor(BasePPOActor):
             kl_val = torch.where(valid_mask, kl_val, torch.zeros_like(kl_val))
             norm_weights = compute_reward_weights(S_logp_union, T_logp_union, valid_mask, reward_weight_mode)
             rm_scores = -kl_val * norm_weights
+            score_student_logp, score_teacher_logp = S_logp_union, T_logp_union
+            score_valid_mask, score_weights = valid_mask, norm_weights
             
             # Use different keys to avoid conflict with batch's student_top_k_ids
             res_tensors["union_top_k_ids"] = union_ids
@@ -616,11 +630,26 @@ class DataParallelPPOActor(BasePPOActor):
             kl_val = torch.where(valid_mask, kl_val, torch.zeros_like(kl_val))
             norm_weights = compute_reward_weights(S_logp_union, T_logp_union, valid_mask, reward_weight_mode, normalize=False)
             rm_scores = -kl_val * norm_weights
+            score_student_logp, score_teacher_logp = S_logp_union, T_logp_union
+            score_valid_mask, score_weights = valid_mask, norm_weights
             
             # Use different keys to avoid conflict with batch's student_top_k_ids
             res_tensors["union_top_k_ids"] = union_ids
             res_tensors["union_top_k_log_probs"] = S_logp_union
             res_tensors["student_log_probs_on_teacher_ids"] = S_on_T
+
+        else:
+            raise NotImplementedError(f"Unsupported top_k_strategy: {strategy}")
+
+        if preference_opd_cfg and preference_opd_cfg.get("enable", False):
+            rm_scores, preference_aux_tensors = apply_preference_opd_to_scores(
+                student_log_probs=score_student_logp,
+                teacher_log_probs=score_teacher_logp,
+                valid_mask=score_valid_mask,
+                reward_weights=score_weights,
+                config=preference_opd_cfg,
+            )
+            res_tensors.update(preference_aux_tensors)
             
         if prune_opd_cfg and prune_opd_cfg.get("enable", False):
             response_mask = data.batch.get("response_mask", None)
