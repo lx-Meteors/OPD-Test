@@ -1105,9 +1105,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # EFW edit field w(s) = KL(b||q)(s) needs log b on the student's own
                 # top-k candidate ids. One designated-ids forward covers both streams:
                 # the candidates and the sampled token (appended as the last id).
-                data.batch["target_ids"] = torch.cat(
-                    [data.batch["student_top_k_ids"], data.batch["responses"].unsqueeze(-1)], dim=-1
-                )
+                # data.batch arrives consolidated (and therefore locked) from Ray
+                # serialization (DataProto.__getstate__ -> consolidate() on
+                # tensordict>=0.5), so unlock it around this key insertion.
+                with data.batch.unlock_():
+                    data.batch["target_ids"] = torch.cat(
+                        [data.batch["student_top_k_ids"], data.batch["responses"].unsqueeze(-1)], dim=-1
+                    )
                 ref_log_probs_on_ids = self.ref_policy.compute_log_probs_for_ids(data=data)
                 output = DataProto.from_dict(
                     tensors={
