@@ -126,7 +126,10 @@ run_opd() {
     export REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
-    export MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
+    # bfloat16 keeps FlashAttention happy (it has no fp32 kernels); accepted
+    # spellings per PrecisionType: bf16/bfloat16. Feeds all three dtype
+    # overrides below (actor + ref fsdp_config.model_dtype, reward_model dtype).
+    export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
     export IS_PLOT="${IS_PLOT:-False}"
     export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
     export PARALLEL_SIZE="${PARALLEL_SIZE:-1}"
