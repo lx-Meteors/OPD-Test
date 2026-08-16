@@ -19,7 +19,7 @@ export PRUNE_OPD_W_BASE="${PRUNE_OPD_W_BASE:-0.5}"
 export PRUNE_OPD_HIT_RATIO="${PRUNE_OPD_HIT_RATIO:-0.1}"
 export DATA_SHUFFLE="${DATA_SHUFFLE:-True}"
 
-run_opd "prune-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b-m_${PRUNE_OPD_METRIC}-t_${PRUNE_OPD_THRESHOLD}-w_${PRUNE_OPD_W_DROP}-b_${PRUNE_OPD_W_BASE}-h_${PRUNE_OPD_HIT_RATIO}" \
+run_opd "prune-opd" \
     "+actor_rollout_ref.rollout.prune_opd.enable=True" \
     "+actor_rollout_ref.rollout.prune_opd.metric=${PRUNE_OPD_METRIC}" \
     "+actor_rollout_ref.rollout.prune_opd.threshold=${PRUNE_OPD_THRESHOLD}" \
