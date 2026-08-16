@@ -31,6 +31,7 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.horizon_opd import normalize_horizon_weights_for_loss
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
@@ -766,6 +767,9 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
 
+        if "horizon_opd_weights" in data.batch.keys():
+            select_keys.append("horizon_opd_weights")
+
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
         
@@ -806,6 +810,12 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                if "horizon_opd_weights" in mini_batch.batch:
+                    mini_batch.batch["horizon_opd_weights"] = normalize_horizon_weights_for_loss(
+                        horizon_weights=mini_batch.batch["horizon_opd_weights"],
+                        response_mask=mini_batch.batch["response_mask"],
+                        loss_agg_mode=self.config.loss_agg_mode,
+                    )
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -824,6 +834,11 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    if "horizon_opd_weights" in model_inputs:
+                        horizon_weights = model_inputs["horizon_opd_weights"]
+                        if advantages.ndim == 3:
+                            horizon_weights = horizon_weights.unsqueeze(-1)
+                        advantages = advantages * horizon_weights
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode

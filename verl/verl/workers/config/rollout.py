@@ -143,6 +143,7 @@ class RolloutConfig(BaseConfig):
     top_k_strategy: str = "only_stu"  # "only_stu", "only_tch", "intersection", or "union"
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", or "none"
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
+    horizon_invariant_opd: dict = field(default_factory=dict)
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True

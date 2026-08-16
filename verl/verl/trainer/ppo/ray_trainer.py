@@ -55,6 +55,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.horizon_opd import HorizonInvariantOPDTracker
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -354,7 +355,22 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_prune_opd_dynamic_response_length()
+        self._init_horizon_invariant_opd()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _init_horizon_invariant_opd(self):
+        horizon_cfg = self.config.actor_rollout_ref.rollout.get("horizon_invariant_opd", {})
+        self.horizon_opd_tracker = HorizonInvariantOPDTracker(
+            config=horizon_cfg,
+            max_response_length=int(self.config.actor_rollout_ref.rollout.response_length),
+        )
+        if self.horizon_opd_tracker.enabled:
+            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+            if loss_agg_mode != "seq-mean-token-sum":
+                raise ValueError(
+                    "Horizon-Invariant OPD requires actor.loss_agg_mode=seq-mean-token-sum "
+                    f"for exact aggregation, got {loss_agg_mode}."
+                )
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -1261,6 +1277,13 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    if self.horizon_opd_tracker.enabled:
+                        horizon_weights, horizon_metrics = self.horizon_opd_tracker.compute(
+                            batch.batch["response_mask"]
+                        )
+                        batch.batch["horizon_opd_weights"] = horizon_weights
+                        metrics.update(horizon_metrics)
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
