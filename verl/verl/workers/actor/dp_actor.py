@@ -33,6 +33,7 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
+from verl.utils.tri_reward import compute_tri_scores
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
@@ -463,7 +464,11 @@ class DataParallelPPOActor(BasePPOActor):
         top_k = data.meta_info.get("log_prob_top_k", 0)
         strategy = data.meta_info.get("top_k_strategy", "only_stu")
         kl_estimator = data.meta_info.get("kl_estimator", "k1")
-        reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")  # "student_p", "teacher_p", or "none"
+        # "student_p", "teacher_p", "none", or "tri" (signed triangular-discrimination
+        # cell rewards; replaces the -p*(logp-logq) formula, only_stu strategy only)
+        reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")
+        if reward_weight_mode == "tri" and strategy != "only_stu":
+            raise ValueError(f"reward_weight_mode='tri' is only validated with top_k_strategy='only_stu', got '{strategy}'")
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -560,10 +565,13 @@ class DataParallelPPOActor(BasePPOActor):
         res_tensors = {}
         
         if strategy == "only_stu":
-            kl_val = S_logp - T_on_S
             valid_mask = torch.ones_like(S_logp, dtype=torch.bool)
-            norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
-            rm_scores = -kl_val * norm_weights
+            if reward_weight_mode == "tri":
+                rm_scores = compute_tri_scores(S_logp, T_on_S, valid_mask)
+            else:
+                kl_val = S_logp - T_on_S
+                norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
+                rm_scores = -kl_val * norm_weights
             
         elif strategy == "only_tch":
             kl_val = S_on_T - T_logp
