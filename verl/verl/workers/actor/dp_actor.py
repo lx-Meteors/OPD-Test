@@ -750,6 +750,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        dtg_weight = float(data.meta_info.get("dtg_weight", 0.0))
 
         select_keys = [
             "responses",
@@ -769,6 +770,9 @@ class DataParallelPPOActor(BasePPOActor):
 
         if "horizon_opd_weights" in data.batch.keys():
             select_keys.append("horizon_opd_weights")
+
+        if "dtg_advantages" in data.batch.keys():
+            select_keys.append("dtg_advantages")
 
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
@@ -832,7 +836,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
+                    sampled_old_log_prob = model_inputs["old_log_probs"]
+                    old_log_prob = sampled_old_log_prob
                     advantages = model_inputs["advantages"]
                     if "horizon_opd_weights" in model_inputs:
                         horizon_weights = model_inputs["horizon_opd_weights"]
@@ -864,17 +869,22 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, sampled_log_prob, _, topk_log_probs = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
                         log_prob_for_loss = topk_log_probs
                         
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
+                        entropy, sampled_log_prob, *_ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                         )
-                        log_prob_for_loss = log_prob
+                        log_prob_for_loss = sampled_log_prob
+
+                    # Preserve the sampled-token log probability for DTG and
+                    # the optional reference-policy KL path.  Top-K OPD uses a
+                    # separate candidate-axis tensor as its primary loss.
+                    log_prob = sampled_log_prob
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
@@ -933,6 +943,25 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batch_metrics.update(pg_metrics)
 
+                    dtg_pg_loss = None
+                    if "dtg_advantages" in model_inputs:
+                        if dtg_weight <= 0.0:
+                            raise ValueError("DTG advantages were provided without a positive dtg_weight.")
+                        dtg_old_log_prob = sampled_log_prob.detach() if on_policy else sampled_old_log_prob
+                        dtg_pg_loss, dtg_pg_metrics = policy_loss_fn(
+                            old_log_prob=dtg_old_log_prob,
+                            log_prob=sampled_log_prob,
+                            advantages=model_inputs["dtg_advantages"],
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
+                        )
+                        for metric_name, metric_value in dtg_pg_metrics.items():
+                            suffix = metric_name.removeprefix("actor/")
+                            micro_batch_metrics[f"actor/dtg_{suffix}"] = metric_value
+
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -940,6 +969,13 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if dtg_pg_loss is not None:
+                        policy_loss = policy_loss + dtg_weight * dtg_pg_loss
+                        micro_batch_metrics["actor/dtg_pg_loss"] = (
+                            dtg_pg_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/dtg_weight"] = dtg_weight
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]

@@ -55,6 +55,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.distillation_to_go import compute_distillation_to_go_advantages
 from verl.utils.horizon_opd import HorizonInvariantOPDTracker
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
@@ -1684,6 +1685,27 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        dtg_cfg = self.config.algorithm.get("distillation_to_go", {})
+                        if dtg_cfg is not None and dtg_cfg.get("enable", False):
+                            dtg_weight = float(dtg_cfg.get("weight", 0.05))
+                            if not np.isfinite(dtg_weight) or dtg_weight <= 0.0:
+                                raise ValueError(f"DTG weight must be positive, got {dtg_weight}.")
+                            dtg_advantages, dtg_metrics = compute_distillation_to_go_advantages(
+                                response_mask=batch.batch["response_mask"],
+                                group_ids=batch.non_tensor_batch["uid"],
+                                config=dtg_cfg,
+                                true_reward_score=batch.batch.get("true_reward_score", None),
+                                student_top_k_log_probs=batch.batch.get("student_top_k_log_probs", None),
+                                teacher_on_student_log_probs=batch.batch.get(
+                                    "teacher_on_student_log_probs", None
+                                ),
+                                token_level_rewards=batch.batch.get("token_level_rewards", None),
+                            )
+                            batch.batch["dtg_advantages"] = dtg_advantages
+                            batch.meta_info["dtg_weight"] = dtg_weight
+                            metrics.update(dtg_metrics)
+                            metrics["dtg/weight"] = dtg_weight
  
 
                         # --- Top-K Metrics Analysis (Chunked) ---
