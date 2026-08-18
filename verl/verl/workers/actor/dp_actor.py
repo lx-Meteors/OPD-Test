@@ -759,6 +759,8 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if "grpo_advantages" in data.batch.keys():
+            select_keys.append("grpo_advantages")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -849,17 +851,21 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, sampled_log_prob, _, topk_log_probs = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
                         log_prob_for_loss = topk_log_probs
+                        # KL regularization, when enabled, is defined on the
+                        # sampled rollout tokens rather than the Top-K support.
+                        log_prob = sampled_log_prob
                         
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
+                        entropy, log_prob, *_ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                         )
                         log_prob_for_loss = log_prob
+                        sampled_log_prob = log_prob
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
@@ -906,7 +912,7 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
+                    opd_pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
                         advantages=advantages,
@@ -917,6 +923,33 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+                    pg_loss = opd_pg_loss
+                    micro_batch_metrics["actor/opd_pg_loss"] = opd_pg_loss.detach().item() * loss_scale_factor
+
+                    # A genuine GRPO term acts on the sampled response token, not on
+                    # every candidate in the Top-K OPD support.
+                    if "grpo_advantages" in model_inputs:
+                        grpo_advantages = model_inputs["grpo_advantages"]
+                        grpo_old_log_prob = (
+                            sampled_log_prob.detach() if on_policy else model_inputs["old_log_probs"]
+                        )
+                        grpo_pg_loss, grpo_metrics = policy_loss_fn(
+                            old_log_prob=grpo_old_log_prob,
+                            log_prob=sampled_log_prob,
+                            advantages=grpo_advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
+                        )
+                        pg_loss = pg_loss + grpo_pg_loss
+                        micro_batch_metrics["actor/grpo_pg_loss"] = (
+                            grpo_pg_loss.detach().item() * loss_scale_factor
+                        )
+                        for key, value in grpo_metrics.items():
+                            metric_name = key.replace("actor/", "actor/grpo_", 1)
+                            micro_batch_metrics[metric_name] = value
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

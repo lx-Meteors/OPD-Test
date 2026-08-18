@@ -889,8 +889,13 @@ def compute_token_reward_direct_plus_grpo_advantage(
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Combine token_reward_direct and GRPO outcome advantage.
-    adv = direct_adv + weight * grpo_adv
+    Prepare independent OPD and GRPO advantages for a joint actor update.
+
+    Keeping the two tensors separate is important for Top-K OPD. The OPD
+    advantage may have shape ``(B, T, K)`` and applies to candidate-token log
+    probabilities, whereas GRPO has shape ``(B, T)`` and must apply only to the
+    tokens actually sampled in the rollout. Broadcasting the GRPO advantage to
+    all K candidates would not be equivalent to GRPO.
     
     Args:
         token_level_rewards: (bs, response_length)
@@ -906,6 +911,10 @@ def compute_token_reward_direct_plus_grpo_advantage(
     # 2. Compute GRPO advantage
     # Use true_reward_score if available (raw reward without KL penalty), otherwise use token_level_rewards
     rewards_for_grpo = kwargs.get("true_reward_score", token_level_rewards)
+    if rewards_for_grpo.dim() == 1:
+        token_outcome_rewards = torch.zeros_like(response_mask, dtype=rewards_for_grpo.dtype)
+        token_outcome_rewards[:, 0] = rewards_for_grpo
+        rewards_for_grpo = token_outcome_rewards
     
     norm_adv_by_std_in_grpo = config.norm_adv_by_std_in_grpo if config else True
     grpo_adv, _ = compute_grpo_outcome_advantage(
@@ -914,14 +923,14 @@ def compute_token_reward_direct_plus_grpo_advantage(
         config=config
     )
     
-    # 3. Combine
+    # 3. Keep both gradient channels separate. dp_actor combines their losses.
     weight = config.grpo_outcome_weight if config else 1.0
-    
-    combined_adv = direct_adv + weight * grpo_adv
-    # Since token_reward_direct sets returns=adv, we follow suit
-    combined_returns = combined_adv.clone()
-    
-    return combined_adv, combined_returns, {"token_level_advantage_direct": direct_adv}
+    weighted_grpo_adv = weight * grpo_adv
+
+    return direct_adv, direct_adv.clone(), {
+        "token_level_advantage_direct": direct_adv,
+        "grpo_advantages": weighted_grpo_adv,
+    }
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
