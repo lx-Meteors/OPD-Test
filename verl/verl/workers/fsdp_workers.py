@@ -1773,6 +1773,35 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             reward_module.to(model_dtype)
 
             if self.train_teacher:
+                # PEFT probes every optional LoRA backend while injecting an adapter.
+                # Some OPD images ship torchao==0.9.0, while recent PEFT requires
+                # torchao>=0.16.0 and raises before reaching the ordinary torch Linear
+                # dispatcher. This experiment does not use TorchAO, so skip only that
+                # incompatible optional dispatcher instead of requiring an environment
+                # mutation on every worker.
+                try:
+                    from importlib.metadata import PackageNotFoundError, version
+
+                    from packaging.version import Version
+
+                    try:
+                        torchao_version = version("torchao")
+                    except PackageNotFoundError:
+                        torchao_version = None
+                    if torchao_version is not None and Version(torchao_version) < Version("0.16.0"):
+                        from peft.tuners.lora import torchao as peft_lora_torchao
+
+                        peft_lora_torchao.is_torchao_available = lambda: False
+                        if self.rank == 0:
+                            logger.warning(
+                                "Ignoring incompatible optional torchao==%s while injecting Teacher LoRA; "
+                                "the standard torch Linear dispatcher will be used.",
+                                torchao_version,
+                            )
+                except (ImportError, ValueError) as error:
+                    if self.rank == 0:
+                        logger.warning("Could not inspect optional TorchAO backend: %s", error)
+
                 lora_rank = self.teacher_training_config.get("lora_rank", 8)
                 lora_alpha = self.teacher_training_config.get("lora_alpha", 16)
                 target_modules = self.teacher_training_config.get("target_modules", "all-linear")
