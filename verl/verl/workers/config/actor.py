@@ -105,6 +105,11 @@ class ActorConfig(BaseConfig):
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
+    # Restrict the actor objective to response-token positions in
+    # [loss_position_start, loss_position_end).  The original response mask is
+    # kept intact for rollout statistics and diagnostics.
+    loss_position_start: int = 0
+    loss_position_end: Optional[int] = None
     entropy_coeff: float = 0
     use_kl_loss: bool = False
     use_torch_compile: bool = True
@@ -146,6 +151,10 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.loss_position_start < 0:
+            raise ValueError("loss_position_start must be non-negative")
+        if self.loss_position_end is not None and self.loss_position_end <= self.loss_position_start:
+            raise ValueError("loss_position_end must be greater than loss_position_start")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

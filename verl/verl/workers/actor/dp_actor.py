@@ -759,6 +759,8 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if "actor_loss_mask" in data.batch.keys():
+            select_keys.append("actor_loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -821,7 +823,10 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
+                    # Keep response_mask unchanged in the trainer for rollout
+                    # metrics, while allowing the actor objective to use only a
+                    # configured response-position interval.
+                    response_mask = model_inputs.get("actor_loss_mask", model_inputs["response_mask"])
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 

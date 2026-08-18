@@ -1661,6 +1661,48 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # Optionally restrict direct actor optimization to a
+                        # response-position interval.  This is a loss mask only:
+                        # the original response_mask remains available for
+                        # rollout statistics, diagnostics, and validation.
+                        loss_position_start = int(
+                            self.config.actor_rollout_ref.actor.get("loss_position_start", 0)
+                        )
+                        loss_position_end = self.config.actor_rollout_ref.actor.get("loss_position_end", None)
+                        if loss_position_end is not None:
+                            loss_position_end = int(loss_position_end)
+
+                        if loss_position_start > 0 or loss_position_end is not None:
+                            actor_loss_mask = core_algos.compute_position_loss_mask(
+                                batch.batch["response_mask"],
+                                start=loss_position_start,
+                                end=loss_position_end,
+                            )
+                            batch.batch["actor_loss_mask"] = actor_loss_mask
+
+                            original_token_count = batch.batch["response_mask"].sum().float()
+                            selected_tokens_per_response = actor_loss_mask.sum(dim=-1).float()
+                            selected_token_count = selected_tokens_per_response.sum()
+                            nonempty_response_ratio = (selected_tokens_per_response > 0).float().mean()
+                            metrics.update(
+                                {
+                                    "actor_loss_mask/position_start": float(loss_position_start),
+                                    "actor_loss_mask/position_end": float(
+                                        loss_position_end
+                                        if loss_position_end is not None
+                                        else batch.batch["response_mask"].shape[-1]
+                                    ),
+                                    "actor_loss_mask/token_fraction": (
+                                        selected_token_count / original_token_count.clamp_min(1.0)
+                                    ).item(),
+                                    "actor_loss_mask/response_fraction": nonempty_response_ratio.item(),
+                                    "actor_loss_mask/empty_response_ratio": (1.0 - nonempty_response_ratio).item(),
+                                    "actor_loss_mask/mean_tokens_per_response": (
+                                        selected_tokens_per_response.mean().item()
+                                    ),
+                                }
+                            )
  
 
                         # --- Top-K Metrics Analysis (Chunked) ---

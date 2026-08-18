@@ -18,7 +18,7 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator", "compute_position_loss_mask"]
 
 from collections import defaultdict
 from enum import Enum
@@ -48,6 +48,31 @@ PolicyLossFn = Callable[
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+
+
+def compute_position_loss_mask(
+    response_mask: torch.Tensor,
+    start: int = 0,
+    end: Optional[int] = None,
+) -> torch.Tensor:
+    """Limit a response mask to the half-open token interval ``[start, end)``.
+
+    Positions are relative to the first generated response token, not the
+    prompt.  Returning a separate mask lets callers restrict the actor loss
+    without corrupting rollout-length and validation statistics.
+    """
+    if response_mask.ndim != 2:
+        raise ValueError(f"response_mask must be 2D, got shape={tuple(response_mask.shape)}")
+    if start < 0:
+        raise ValueError(f"start must be non-negative, got {start}")
+    if end is not None and end <= start:
+        raise ValueError(f"end must be greater than start, got start={start}, end={end}")
+
+    positions = torch.arange(response_mask.shape[-1], device=response_mask.device)
+    position_mask = positions >= start
+    if end is not None:
+        position_mask = position_mask & (positions < end)
+    return response_mask * position_mask.unsqueeze(0).to(response_mask.dtype)
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:

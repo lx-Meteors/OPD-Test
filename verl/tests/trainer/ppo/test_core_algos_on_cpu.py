@@ -21,6 +21,7 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    compute_position_loss_mask,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -29,6 +30,35 @@ from verl.trainer.ppo.core_algos import (
     get_adv_estimator_fn,
     register_adv_est,
 )
+
+
+def test_compute_position_loss_mask_selects_half_open_suffix_interval():
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+
+    actual = compute_position_loss_mask(response_mask, start=4, end=7)
+    expected = torch.tensor(
+        [
+            [0, 0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 1, 0, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(-1, None), (4, 4), (5, 4)],
+)
+def test_compute_position_loss_mask_rejects_invalid_interval(start, end):
+    with pytest.raises(ValueError):
+        compute_position_loss_mask(torch.ones(2, 8), start=start, end=end)
 
 
 def mock_test_fn():
