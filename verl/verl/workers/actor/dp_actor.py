@@ -84,6 +84,46 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    def _update_opd_constraint(self, data: DataProto) -> tuple[float, float, float]:
+        """Measure prefix disagreement and perform one synchronized dual update.
+
+        Top-K OPD rewards are ``-p_S(a) * log(p_S(a) / p_T(a))`` (up to
+        the configured support normalization), so their negative sum is the
+        matching per-token divergence estimate. The optimizer state stores the
+        multiplier so it is included in normal optimizer checkpoints.
+        """
+        advantages = data.batch["advantages"]
+        response_mask = data.batch["response_mask"]
+        prefix_tokens = min(int(self.config.opd_constraint_prefix_tokens), response_mask.shape[-1])
+        positions = torch.arange(response_mask.shape[-1], device=response_mask.device)
+        prefix_mask = response_mask * (positions < prefix_tokens).to(response_mask.dtype).unsqueeze(0)
+
+        if advantages.dim() == 3:
+            per_token_divergence = (-advantages.float().sum(dim=-1)).clamp_min(0.0)
+        else:
+            # The hybrid estimator normally uses Top-K rewards. Keep a safe
+            # fallback for scalar token rewards without treating their sign as
+            # a divergence direction.
+            per_token_divergence = advantages.float().abs()
+
+        local_sum = (per_token_divergence * prefix_mask).sum()
+        local_count = prefix_mask.float().sum()
+        stats = torch.stack([local_sum, local_count]).to(get_device_id())
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+
+        constraint_value = (stats[0] / stats[1].clamp_min(1.0)).item()
+        violation = constraint_value - float(self.config.opd_constraint_target)
+
+        state_key = "_opd_prefix_constraint"
+        dual_state = self.actor_optimizer.state[state_key]
+        old_coef = float(dual_state.get("coef", self.config.opd_constraint_init_coef))
+        new_coef = old_coef + float(self.config.opd_constraint_dual_lr) * violation
+        new_coef = min(max(new_coef, 0.0), float(self.config.opd_constraint_max_coef))
+        dual_state["coef"] = new_coef
+        dual_state["updates"] = int(dual_state.get("updates", 0)) + 1
+        return constraint_value, violation, new_coef
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -750,6 +790,15 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        use_opd_constraint = bool(self.config.get("opd_constraint_enable", False))
+        opd_constraint_value = 0.0
+        opd_constraint_violation = 0.0
+        opd_loss_coef = 1.0
+        if use_opd_constraint:
+            if "grpo_advantages" not in data.batch.keys():
+                raise ValueError("Adaptive prefix OPD requires the OPD+GRPO hybrid advantage estimator")
+            opd_constraint_value, opd_constraint_violation, opd_loss_coef = self._update_opd_constraint(data)
+
         select_keys = [
             "responses",
             "response_mask",
@@ -826,6 +875,15 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+
+                    opd_response_mask = response_mask
+                    if use_opd_constraint:
+                        prefix_tokens = min(
+                            int(self.config.opd_constraint_prefix_tokens), response_mask.shape[-1]
+                        )
+                        positions = torch.arange(response_mask.shape[-1], device=response_mask.device)
+                        prefix_mask = (positions < prefix_tokens).to(response_mask.dtype).unsqueeze(0)
+                        opd_response_mask = response_mask * prefix_mask
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -916,15 +974,26 @@ class DataParallelPPOActor(BasePPOActor):
                         old_log_prob=old_log_prob,
                         log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=opd_response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
-                    pg_loss = opd_pg_loss
+                    weighted_opd_pg_loss = opd_loss_coef * opd_pg_loss
+                    pg_loss = weighted_opd_pg_loss
                     micro_batch_metrics["actor/opd_pg_loss"] = opd_pg_loss.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/opd_weighted_pg_loss"] = (
+                        weighted_opd_pg_loss.detach().item() * loss_scale_factor
+                    )
+                    if use_opd_constraint:
+                        micro_batch_metrics["actor/opd_constraint_value"] = opd_constraint_value
+                        micro_batch_metrics["actor/opd_constraint_target"] = float(
+                            self.config.opd_constraint_target
+                        )
+                        micro_batch_metrics["actor/opd_constraint_violation"] = opd_constraint_violation
+                        micro_batch_metrics["actor/opd_constraint_coef"] = opd_loss_coef
 
                     # A genuine GRPO term acts on the sampled response token, not on
                     # every candidate in the Top-K OPD support.
