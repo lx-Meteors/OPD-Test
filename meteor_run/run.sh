@@ -1,1 +1,1 @@
-nohup bash experiments_scripts/opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh > meteor_run/opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.log 2>&1 &
+nohup bash experiments_scripts/opd-suffix-6k-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.sh > meteor_run/opd-suffix-6k-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b.log 2>&1 &

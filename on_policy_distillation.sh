@@ -250,3 +250,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     echo "End time: $(date)"
     echo "=========================================="
 fi
+
+
+
+
+# export DATA_ROOT=/ossfs/workspace/OPD-Test/datasets
+# export MODEL_ROOT=/personal/models
