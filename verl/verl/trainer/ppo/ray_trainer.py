@@ -994,6 +994,10 @@ class RayPPOTrainer:
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
+        if OmegaConf.select(self.config, "reward_model.teacher_training.enable", default=False):
+            teacher_adapter_path = os.path.join(local_global_step_folder, "teacher_lora_adapter")
+            self.rm_wg.save_teacher_adapter(teacher_adapter_path)
+
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
@@ -1638,6 +1642,37 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # The trainable Teacher is supervised by learning progress rather than by
+                        # the current Student/Teacher KL. Group-normalized verifier reward supplies
+                        # a sequence-level sign: reinforce teaching tokens from relatively successful
+                        # responses and suppress those from relatively unsuccessful responses.
+                        if OmegaConf.select(
+                            self.config, "reward_model.teacher_training.enable", default=False
+                        ):
+                            teacher_reward = batch.batch["true_reward_score"]
+                            if teacher_reward.ndim == 1:
+                                token_teacher_reward = torch.zeros_like(
+                                    batch.batch["response_mask"], dtype=teacher_reward.dtype
+                                )
+                                token_teacher_reward[:, -1] = teacher_reward
+                            else:
+                                token_teacher_reward = teacher_reward
+                            teacher_advantages, _ = core_algos.compute_grpo_outcome_advantage(
+                                token_level_rewards=token_teacher_reward,
+                                response_mask=batch.batch["response_mask"],
+                                index=batch.non_tensor_batch["uid"],
+                                norm_adv_by_std_in_grpo=OmegaConf.select(
+                                    self.config,
+                                    "reward_model.teacher_training.norm_adv_by_std",
+                                    default=True,
+                                ),
+                            )
+                            response_mask_float = batch.batch["response_mask"].float()
+                            batch.batch["teacher_outcome_advantage"] = (
+                                (teacher_advantages * response_mask_float).sum(dim=-1)
+                                / response_mask_float.sum(dim=-1).clamp_min(1.0)
+                            )
 
                         # Compute rollout correction weights centrally (once per batch)
                         # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
@@ -2576,6 +2611,22 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        # Student first consumes the frozen teaching signal cached above. The
+                        # Teacher LoRA is then updated and affects the following rollout/OPD step.
+                        if OmegaConf.select(
+                            self.config, "reward_model.teacher_training.enable", default=False
+                        ):
+                            update_interval = OmegaConf.select(
+                                self.config,
+                                "reward_model.teacher_training.update_interval",
+                                default=1,
+                            )
+                            if self.global_steps % update_interval == 0:
+                                with marked_timer("update_teacher", timing_raw, color="orange"):
+                                    teacher_output = self.rm_wg.update_teacher(batch)
+                                teacher_output_metrics = reduce_metrics(teacher_output.meta_info["metrics"])
+                                metrics.update(teacher_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

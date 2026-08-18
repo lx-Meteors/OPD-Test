@@ -124,6 +124,17 @@ run_opd() {
     export TEST_FREQ="${TEST_FREQ:-20}"
     export SAVE_FREQ="${SAVE_FREQ:-100}"
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
+    export TRAIN_TEACHER="${TRAIN_TEACHER:-False}"
+    export TEACHER_LORA_RANK="${TEACHER_LORA_RANK:-8}"
+    export TEACHER_LORA_ALPHA="${TEACHER_LORA_ALPHA:-16}"
+    export TEACHER_LR="${TEACHER_LR:-1e-5}"
+    export TEACHER_KL_COEF="${TEACHER_KL_COEF:-0.1}"
+    export TEACHER_ANCHOR_TOP_K="${TEACHER_ANCHOR_TOP_K:-16}"
+    export TEACHER_UPDATE_INTERVAL="${TEACHER_UPDATE_INTERVAL:-1}"
+    export TEACHER_UPDATE_EPOCHS="${TEACHER_UPDATE_EPOCHS:-1}"
+    export TEACHER_MICRO_BATCH_SIZE="${TEACHER_MICRO_BATCH_SIZE:-1}"
+    export TEACHER_MAX_GRAD_NORM="${TEACHER_MAX_GRAD_NORM:-1.0}"
+    export TEACHER_NORM_ADV_BY_STD="${TEACHER_NORM_ADV_BY_STD:-True}"
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
     require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
@@ -188,6 +199,7 @@ run_opd() {
     echo "Experiment name: ${experiment_name}"
     echo "Checkpoint dir: ${ckpt_path}"
     echo "Tracking backends: ${TRACKING_BACKENDS}"
+    echo "Train Teacher LoRA: ${TRAIN_TEACHER}"
     echo "W&B dir: ${WANDB_DIR}"
 
     local -a cmd=(
@@ -262,13 +274,29 @@ run_opd() {
     )
 
     if [[ "${REWARD_MODEL_ENABLE}" == "True" ]]; then
+        local teacher_use_remove_padding="True"
+        if [[ "${TRAIN_TEACHER}" == "True" ]]; then
+            teacher_use_remove_padding="False"
+        fi
         cmd+=(
             "reward_model.model.path=${REWARD_MODEL_PATH}"
             "reward_model.model.input_tokenizer=null"
-            "reward_model.model.use_remove_padding=True"
+            "reward_model.model.use_remove_padding=${teacher_use_remove_padding}"
             "reward_model.model.fsdp_config.param_offload=False"
             "+reward_model.model.dtype=${MODEL_DTYPE}"
             "reward_model.micro_batch_size_per_gpu=24"
+            "+reward_model.teacher_training.enable=${TRAIN_TEACHER}"
+            "+reward_model.teacher_training.lora_rank=${TEACHER_LORA_RANK}"
+            "+reward_model.teacher_training.lora_alpha=${TEACHER_LORA_ALPHA}"
+            "+reward_model.teacher_training.target_modules=all-linear"
+            "+reward_model.teacher_training.lr=${TEACHER_LR}"
+            "+reward_model.teacher_training.kl_coef=${TEACHER_KL_COEF}"
+            "+reward_model.teacher_training.anchor_top_k=${TEACHER_ANCHOR_TOP_K}"
+            "+reward_model.teacher_training.update_interval=${TEACHER_UPDATE_INTERVAL}"
+            "+reward_model.teacher_training.update_epochs=${TEACHER_UPDATE_EPOCHS}"
+            "+reward_model.teacher_training.micro_batch_size_per_gpu=${TEACHER_MICRO_BATCH_SIZE}"
+            "+reward_model.teacher_training.max_grad_norm=${TEACHER_MAX_GRAD_NORM}"
+            "+reward_model.teacher_training.norm_adv_by_std=${TEACHER_NORM_ADV_BY_STD}"
         )
     fi
 

@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+import contextlib
 import datetime
 import json
 import logging
@@ -1711,6 +1712,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
         self.use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+        self.teacher_training_config = self.config.get("teacher_training", {})
+        self.train_teacher = self.teacher_training_config.get("enable", False)
 
         # normalize config
         if self.config.micro_batch_size is not None:
@@ -1769,7 +1772,30 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
             reward_module.to(model_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
+            if self.train_teacher:
+                lora_rank = self.teacher_training_config.get("lora_rank", 8)
+                lora_alpha = self.teacher_training_config.get("lora_alpha", 16)
+                target_modules = self.teacher_training_config.get("target_modules", "all-linear")
+                reward_module.enable_input_require_grads()
+                reward_module = get_peft_model(
+                    reward_module,
+                    LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        r=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=self.teacher_training_config.get("lora_dropout", 0.0),
+                        target_modules=target_modules,
+                        bias="none",
+                    ),
+                )
+                if self.rank == 0:
+                    reward_module.print_trainable_parameters()
+
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=reward_module,
+            config=self.config.model.fsdp_config,
+            is_lora=self.train_teacher,
+        )
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
@@ -1778,11 +1804,14 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             reward_module = FSDP(
                 reward_module,
                 param_init_fn=init_fn,
-                use_orig_params=False,
+                # Mixed frozen/trainable parameters from PEFT require original parameters.
+                use_orig_params=self.train_teacher,
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 sync_module_states=True,
+                # Reward/Teacher workers are colocated with the Actor. Keep the base
+                # Teacher offloaded between forwards even when its small LoRA is trained.
                 cpu_offload=CPUOffload(offload_params=True),
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
@@ -1921,6 +1950,166 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
+        self.teacher_optimizer = None
+        if self.train_teacher:
+            trainable_parameters = [parameter for parameter in self.reward_module.parameters() if parameter.requires_grad]
+            if not trainable_parameters:
+                raise RuntimeError("Teacher training is enabled, but the Teacher LoRA has no trainable parameters.")
+            self.teacher_optimizer = torch.optim.AdamW(
+                trainable_parameters,
+                lr=self.teacher_training_config.get("lr", 1e-5),
+                betas=tuple(self.teacher_training_config.get("betas", [0.9, 0.999])),
+                weight_decay=self.teacher_training_config.get("weight_decay", 0.0),
+            )
+
+    def _unwrap_teacher(self):
+        return getattr(self.reward_module, "module", self.reward_module)
+
+    def _teacher_logits(self, micro_batch, disable_adapter=False):
+        """Forward the padded batch and return response-position logits.
+
+        Teacher adaptation deliberately uses the ordinary padded path. It keeps the
+        autograd graph simple and avoids mixing PEFT gradients with the packed-sequence
+        inference-only path used by ``compute_rm_score``.
+        """
+        response_length = micro_batch["responses"].size(-1)
+        teacher = self._unwrap_teacher()
+        adapter_context = teacher.disable_adapter() if disable_adapter else contextlib.nullcontext()
+        with adapter_context, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            output = self.reward_module(
+                input_ids=micro_batch["input_ids"],
+                attention_mask=micro_batch["attention_mask"],
+                position_ids=micro_batch["position_ids"],
+                use_cache=False,
+            )
+            logits = output.logits[:, -response_length - 1 : -1, :]
+        return logits
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="orange")
+    def update_teacher(self, data: DataProto):
+        """Train the Teacher LoRA from outcome-aligned teaching feedback.
+
+        The sampled-token term is a first-order gradient-alignment surrogate:
+        positive group advantage raises the likelihood of tokens on a successful
+        Student trajectory, while negative advantage suppresses unsuccessful ones.
+        A Top-K KL to the adapter-disabled Teacher prevents capability drift.
+        """
+        if not self.train_teacher:
+            return DataProto(meta_info={"metrics": {}})
+        if self.use_remove_padding:
+            raise RuntimeError(
+                "Trainable Teacher currently requires reward_model.model.use_remove_padding=False."
+            )
+
+        data = data.to(get_device_id())
+        required = {
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "responses",
+            "response_mask",
+            "teacher_outcome_advantage",
+        }
+        missing = required.difference(data.batch.keys())
+        if missing:
+            raise KeyError(f"Teacher update is missing batch fields: {sorted(missing)}")
+
+        micro_batch_size = self.teacher_training_config.get("micro_batch_size_per_gpu", 1)
+        beta = self.teacher_training_config.get("kl_coef", 0.1)
+        anchor_top_k = self.teacher_training_config.get("anchor_top_k", 16)
+        max_grad_norm = self.teacher_training_config.get("max_grad_norm", 1.0)
+        update_epochs = self.teacher_training_config.get("update_epochs", 1)
+        metrics = {
+            "teacher/align_loss": [],
+            "teacher/anchor_kl": [],
+            "teacher/loss": [],
+            "teacher/outcome_adv_mean": [],
+            "teacher/outcome_adv_abs_mean": [],
+            "teacher/outcome_adv_positive_fraction": [],
+        }
+
+        self.reward_module.train()
+        for _ in range(update_epochs):
+            micro_batches = list(data.batch.split(micro_batch_size))
+            for micro_batch in micro_batches:
+                self.teacher_optimizer.zero_grad(set_to_none=True)
+                response_mask = micro_batch["response_mask"].float()
+                advantage = micro_batch["teacher_outcome_advantage"].float().view(-1, 1)
+                denominator = response_mask.sum().clamp_min(1.0)
+
+                with torch.no_grad():
+                    base_logits = self._teacher_logits(micro_batch, disable_adapter=True)
+                    base_top_logits, base_top_ids = base_logits.topk(anchor_top_k, dim=-1)
+                    base_top_log_probs = torch.log_softmax(base_top_logits.float(), dim=-1)
+                    del base_logits, base_top_logits
+
+                adapted_logits = self._teacher_logits(micro_batch)
+                sampled_log_probs = verl_F.logprobs_from_logits(
+                    logits=adapted_logits,
+                    labels=micro_batch["responses"],
+                    inplace_backward=False,
+                ).float()
+                align_loss = -(advantage * sampled_log_probs * response_mask).sum() / denominator
+                metrics["teacher/outcome_adv_mean"].append(advantage.mean().detach().item())
+                metrics["teacher/outcome_adv_abs_mean"].append(advantage.abs().mean().detach().item())
+                metrics["teacher/outcome_adv_positive_fraction"].append(
+                    (advantage > 0).float().mean().detach().item()
+                )
+                if "old_log_probs" in micro_batch:
+                    teaching_signal = (sampled_log_probs.detach() - micro_batch["old_log_probs"].float()) * response_mask
+                    signal_mean = teaching_signal.sum() / denominator
+                    advantage_tokens = advantage * response_mask
+                    advantage_mean = advantage_tokens.sum() / denominator
+                    covariance = (
+                        (teaching_signal - signal_mean)
+                        * (advantage_tokens - advantage_mean)
+                        * response_mask
+                    ).sum() / denominator
+                    metrics.setdefault("teacher/signal_adv_covariance", []).append(covariance.item())
+
+                adapted_top_logits = adapted_logits.gather(-1, base_top_ids)
+                adapted_top_log_probs = torch.log_softmax(adapted_top_logits.float(), dim=-1)
+                base_top_probs = base_top_log_probs.exp()
+                token_kl = (base_top_probs * (base_top_log_probs - adapted_top_log_probs)).sum(dim=-1)
+                anchor_kl = (token_kl * response_mask).sum() / denominator
+                loss = align_loss + beta * anchor_kl
+                loss.backward()
+                grad_norm = self.reward_module.clip_grad_norm_(max_grad_norm)
+                self.teacher_optimizer.step()
+
+                metrics["teacher/align_loss"].append(align_loss.detach().item())
+                metrics["teacher/anchor_kl"].append(anchor_kl.detach().item())
+                metrics["teacher/loss"].append(loss.detach().item())
+                metrics.setdefault("teacher/grad_norm", []).append(float(grad_norm))
+
+        self.reward_module.eval()
+        reduced_metrics = {key: float(np.mean(values)) for key, values in metrics.items() if values}
+        return DataProto(meta_info={"metrics": reduced_metrics})
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_teacher_adapter(self, local_path):
+        """Save the learned teaching adapter separately from the frozen base Teacher."""
+        if not self.train_teacher:
+            return
+        teacher = self._unwrap_teacher()
+        if not hasattr(teacher, "peft_config"):
+            raise RuntimeError("Teacher training is enabled, but no PEFT adapter was found.")
+
+        peft_config = {}
+        if dist.get_rank() == 0:
+            os.makedirs(local_path, exist_ok=True)
+            peft_config = asdict(teacher.peft_config.get("default", {}))
+            peft_config["task_type"] = peft_config["task_type"].value
+            peft_config["peft_type"] = peft_config["peft_type"].value
+            peft_config["target_modules"] = list(peft_config["target_modules"])
+
+        lora_parameters = layered_summon_lora_params(self.reward_module)
+        if dist.get_rank() == 0:
+            save_file(lora_parameters, os.path.join(local_path, "adapter_model.safetensors"))
+            with open(os.path.join(local_path, "adapter_config.json"), "w", encoding="utf-8") as config_file:
+                json.dump(peft_config, config_file, ensure_ascii=False, indent=4)
+        dist.barrier()
 
     def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
