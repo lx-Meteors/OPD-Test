@@ -34,7 +34,7 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.detemper_reward import compute_rkl_dt_scores
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
-from verl.utils.sdt_reward import compute_rkl_sdt_scores
+from verl.utils.sdt_reward import compute_rkl_sdt_scores, compute_rkl_sdtw_scores
 from verl.utils.tri_reward import compute_tri_scores
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -468,11 +468,13 @@ class DataParallelPPOActor(BasePPOActor):
         kl_estimator = data.meta_info.get("kl_estimator", "k1")
         # "student_p", "teacher_p", "none", "tri" (signed triangular-discrimination
         # cell rewards), "rkl_dt" (baseline -p*(logp-logq) against a one-sided
-        # entropy-detempered teacher), or "rkl_sdt" (rKL at the entropy-matched
+        # entropy-detempered teacher), "rkl_sdt" (rKL at the entropy-matched
         # point of the student's temperature family, scaled by the 1/mu Jacobian;
-        # teacher untouched). "tri"/"rkl_dt"/"rkl_sdt": only_stu strategy only.
+        # teacher untouched), or "rkl_sdtw" (baseline field reweighted per cell
+        # by the entropy-matched p~ = p^mu with H(p~) = H(q); two-sided,
+        # clamp-free). "tri"/"rkl_dt"/"rkl_sdt"/"rkl_sdtw": only_stu only.
         reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")
-        if reward_weight_mode in ("tri", "rkl_dt", "rkl_sdt") and strategy != "only_stu":
+        if reward_weight_mode in ("tri", "rkl_dt", "rkl_sdt", "rkl_sdtw") and strategy != "only_stu":
             raise ValueError(
                 f"reward_weight_mode='{reward_weight_mode}' is only validated with top_k_strategy='only_stu', got '{strategy}'"
             )
@@ -579,6 +581,8 @@ class DataParallelPPOActor(BasePPOActor):
                 rm_scores = compute_rkl_dt_scores(S_logp, T_on_S, valid_mask)
             elif reward_weight_mode == "rkl_sdt":
                 rm_scores = compute_rkl_sdt_scores(S_logp, T_on_S, valid_mask)
+            elif reward_weight_mode == "rkl_sdtw":
+                rm_scores = compute_rkl_sdtw_scores(S_logp, T_on_S, valid_mask)
             else:
                 kl_val = S_logp - T_on_S
                 norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
