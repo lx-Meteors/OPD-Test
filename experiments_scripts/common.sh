@@ -126,6 +126,7 @@ run_opd() {
     export TEST_FREQ="${TEST_FREQ:-20}"
     export SAVE_FREQ="${SAVE_FREQ:-100}"
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
+    export TOTAL_TRAINING_EPOCHS="${TOTAL_TRAINING_EPOCHS:-1}"
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
     require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
@@ -261,7 +262,7 @@ run_opd() {
         "trainer.save_freq=${SAVE_FREQ}"
         "trainer.test_freq=${TEST_FREQ}"
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
-        "trainer.total_epochs=1"
+        "trainer.total_epochs=${TOTAL_TRAINING_EPOCHS}"
         "trainer.default_local_dir=${ckpt_path}"
         "trainer.is_plot=${IS_PLOT}"
     )
