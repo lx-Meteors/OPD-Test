@@ -65,6 +65,9 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Weight of CE supervision on the teacher-generated suffix in handoff OPD
+  handoff_sft_weight: 1.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

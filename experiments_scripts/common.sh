@@ -240,7 +240,7 @@ run_opd() {
         "+actor_rollout_ref.rollout.handoff_opd.teacher_temperature=${HANDOFF_TEACHER_TEMPERATURE}"
         "+actor_rollout_ref.rollout.handoff_opd.teacher_top_p=${HANDOFF_TEACHER_TOP_P}"
         "+actor_rollout_ref.rollout.handoff_opd.teacher_micro_batch_size=${HANDOFF_TEACHER_MICRO_BATCH_SIZE}"
-        "+actor_rollout_ref.actor.policy_loss.handoff_sft_weight=${HANDOFF_SFT_WEIGHT}"
+        "actor_rollout_ref.actor.policy_loss.handoff_sft_weight=${HANDOFF_SFT_WEIGHT}"
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${PARALLEL_SIZE}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.8"
         "actor_rollout_ref.rollout.max_model_len=${max_model_len}"
