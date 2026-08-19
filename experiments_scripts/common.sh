@@ -73,7 +73,7 @@ setup_tracking() {
     export WANDB_MODE="${WANDB_MODE:-online}"
     export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/logs/wandb}"
     export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${REPO_ROOT}/.cache/wandb}"
-    export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console]}"
+    export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console,wandb]}"
 
     mkdir -p "${WANDB_DIR}" "${WANDB_CACHE_DIR}"
 }
