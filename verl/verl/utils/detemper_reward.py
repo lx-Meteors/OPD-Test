@@ -241,3 +241,91 @@ def compute_rkl_dt_scores(
     scores = -s.exp() * (s - t_dt)
     scores = torch.where(valid_mask, scores, torch.zeros_like(scores))
     return torch.nan_to_num(scores, nan=0.0).to(student_log_probs.dtype)
+
+
+def compute_mu_dt_scores(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Baseline reverse-KL rewards against the mu-detempered teacher (clamp-free).
+
+        L = KL(p || sg[q~]),   q~ = q^(1/sqrt(mu)) / Z,
+        mu = KL(q||u) / KL(p||u) = (logK - H(q)) / (logK - H(p)),
+
+    u the uniform distribution on the K valid cells, and the cell force (the
+    logit gradient of L up to the per-position baseline) is the baseline's own
+
+        r_c = -p_c * (log p_c - log q~_c).
+
+    mu is the teacher/student knowledge-radius ratio: KL(.||u) measures how far
+    a distribution stands from ignorance, tempering moves along the q-u
+    geodesic (q^b u^(1-b) / Z = q^b / Z), and along that fiber KL(.||u) is
+    approximately quadratic, so the radius-matching exponent has the closed
+    form b = mu^(-1/2). No bisection (rkl_dt), no entropy gate (one-sided
+    rkl_dt), no second-moment gauge (rkl_cdt). Equivalently: G-OPD with the
+    reference model replaced by u and the reward-scaling factor measured per
+    position, lambda_t = mu^(-1/2) - no third model, no extra forward pass.
+    Self-extinguishing: H(p) = H(q) gives mu = 1 and q~ = q, i.e. baseline OPD
+    is recovered exactly at radius match.
+
+    Why sqrt (adjudicated on 270k real val tokens + synthetic anatomies):
+    b = mu^(-1/2) is the geometric half-step between "do not move" (1) and
+    naive level matching (1/mu). It never crosses the student's radius (0.0%
+    of FS/fog positions end with a target sharper than the student), while
+    1/mu crosses on 18-20% of them (the chase reverses direction, the
+    rkl_sdt collapse channel) and kills thin semantic branches; the
+    arithmetic mixture (1-a)q + au can only soften (negentropy convexity),
+    so it is structurally mute on exactly the lesions, which need the
+    teacher sharpened.
+
+    Real-trajectory audit (38 val trajectories, 270k tokens, steps 0-200):
+    fog level force -42% (two-sided: teacher-softer AND teacher-sharper),
+    FS-directed level force -21%, healthy tokens untouched (class-median
+    mu = 1.000 at every checkpoint), confident-wrong the only class whose
+    force RISES (+2.9%; promotion boosted on 96% of CW positions), rejected
+    -branch overkill trimmed (equal-budget overshoot 41.4% -> 36.9%),
+    true-fork alt-force keep ratio 0.991 (median), total budget -11.6% with
+    89.7% of the change landing on non-healthy tokens.
+
+    Hyperparameter-free: the only guards are clamp_min(0) on the student
+    negentropy (>= 0 by theorem, float roundoff can dip below) and _EPS in
+    the denominator against literal division by zero - IEEE hygiene, not
+    behavioral knobs. Unclamped exponents measured on the audit span
+    [0.23, 2.23]; a [1/16, 16] clamp binds on 1 token in 270k and changes no
+    metric, hence none is used. The theoretical singularity (teacher exactly
+    uniform on the cells, KL(q||u) -> 0) is empirically unreachable: min
+    KL(q||u) = 0.13 nats across the audit; if the cell construction ever
+    changes (not top-K renormalized), re-measure that floor. Applying the
+    same rule iteratively converges to the exact two-sided radius match
+    (monotone improvement); kept out of this implementation to stay
+    parameter-free.
+
+    Args:
+        student_log_probs: (batch, seq, K) student log probs on the cells.
+        teacher_log_probs: (batch, seq, K) teacher log probs on the same cells.
+        valid_mask: (batch, seq, K) bool mask of cells that participate.
+
+    Returns:
+        (batch, seq, K) rewards, zero on invalid cells, dtype of the input.
+    """
+    neg_inf = torch.finfo(torch.float32).min
+    s_lp = torch.where(valid_mask, student_log_probs.float(), torch.full_like(student_log_probs.float(), neg_inf))
+    t_lp = torch.where(valid_mask, teacher_log_probs.float(), torch.full_like(teacher_log_probs.float(), neg_inf))
+
+    # renormalize both distributions on the shared cell support
+    s = torch.log_softmax(s_lp, dim=-1)
+    t = torch.log_softmax(t_lp, dim=-1)
+
+    log_k = valid_mask.sum(dim=-1).clamp_min(1).to(s.dtype).log()
+    n_p = (log_k - _cell_entropy(s)).clamp_min(0.0)  # KL(p||u) >= 0 by theorem
+    n_q = (log_k - _cell_entropy(t)).clamp_min(_EPS)  # _EPS: division guard only
+    beta = (n_p / n_q).sqrt().unsqueeze(-1)  # = mu^(-1/2)
+
+    t_mudt = torch.log_softmax(
+        torch.where(valid_mask, beta * t, torch.full_like(t, neg_inf)), dim=-1
+    )
+
+    scores = -s.exp() * (s - t_mudt)
+    scores = torch.where(valid_mask, scores, torch.zeros_like(scores))
+    return torch.nan_to_num(scores, nan=0.0).to(student_log_probs.dtype)

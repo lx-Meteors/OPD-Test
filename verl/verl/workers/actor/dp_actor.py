@@ -31,7 +31,12 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-from verl.utils.detemper_reward import compute_fkl_scores, compute_rkl_cdt_scores, compute_rkl_dt_scores
+from verl.utils.detemper_reward import (
+    compute_fkl_scores,
+    compute_mu_dt_scores,
+    compute_rkl_cdt_scores,
+    compute_rkl_dt_scores,
+)
 from verl.utils.fq_reward import compute_fq_scores
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
@@ -480,14 +485,19 @@ class DataParallelPPOActor(BasePPOActor):
         # "fq" (fiber quotient by z-score matching: r = z(logq) - z(logp);
         # the z-score is the complete invariant of the tempering group, so
         # this distills structure modulo temperature; closed form, no
-        # bisection, no gates), or "fkl" (forward-KL transport r = q - p,
+        # bisection, no gates), "fkl" (forward-KL transport r = q - p,
         # the exact logit gradient of -KL(q||p): zero-sum, |r|<=1, convex
         # in the student logits; cells the teacher endorses but the student
         # starves get the full mass difference - the lesion triage embedded
-        # in one formula).
-        # "tri"/"rkl_dt"/"rkl_cdt"/"rkl_sdt"/"rkl_sdtw"/"fq"/"fkl": only_stu only.
+        # in one formula), or "mu_dt" (baseline force against the
+        # mu-detempered teacher q~ = q^(1/sqrt(mu)) / Z with
+        # mu = KL(q||u)/KL(p||u) = (logK-H(q))/(logK-H(p)), u uniform on the
+        # cells: the closed-form knowledge-radius match on the q-u geodesic;
+        # two-sided, clamp-free, hyperparameter-free; equals baseline OPD
+        # exactly when H(p) = H(q)).
+        # "tri"/"rkl_dt"/"rkl_cdt"/"rkl_sdt"/"rkl_sdtw"/"fq"/"fkl"/"mu_dt": only_stu only.
         reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")
-        if reward_weight_mode in ("tri", "rkl_dt", "rkl_cdt", "rkl_sdt", "rkl_sdtw", "fq", "fkl") and strategy != "only_stu":
+        if reward_weight_mode in ("tri", "rkl_dt", "rkl_cdt", "rkl_sdt", "rkl_sdtw", "fq", "fkl", "mu_dt") and strategy != "only_stu":
             raise ValueError(
                 f"reward_weight_mode='{reward_weight_mode}' is only validated with top_k_strategy='only_stu', got '{strategy}'"
             )
@@ -597,6 +607,8 @@ class DataParallelPPOActor(BasePPOActor):
                 rm_scores = compute_rkl_dt_scores(S_logp, T_on_S, valid_mask)
             elif reward_weight_mode == "rkl_cdt":
                 rm_scores = compute_rkl_cdt_scores(S_logp, T_on_S, valid_mask)
+            elif reward_weight_mode == "mu_dt":
+                rm_scores = compute_mu_dt_scores(S_logp, T_on_S, valid_mask)
             elif reward_weight_mode == "fkl":
                 rm_scores = compute_fkl_scores(S_logp, T_on_S, valid_mask)
             elif reward_weight_mode == "rkl_sdt":
