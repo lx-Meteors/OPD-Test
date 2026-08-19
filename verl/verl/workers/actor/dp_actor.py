@@ -637,7 +637,8 @@ class DataParallelPPOActor(BasePPOActor):
             res_tensors.update(prune_aux_tensors)
 
         if handoff_opd_mask is not None:
-            rm_scores = rm_scores * handoff_opd_mask.to(rm_scores.dtype).unsqueeze(-1)
+            handoff_opd_mask = handoff_opd_mask.to(device=rm_scores.device, dtype=rm_scores.dtype)
+            rm_scores = rm_scores * handoff_opd_mask.unsqueeze(-1)
 
         res_tensors["rm_scores"] = rm_scores
         return DataProto.from_dict(tensors=res_tensors)
