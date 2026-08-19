@@ -44,6 +44,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.handoff_opd import attach_teacher_continuations
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -354,7 +355,28 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_prune_opd_dynamic_response_length()
+        self._init_handoff_opd()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _init_handoff_opd(self):
+        handoff_cfg = self.config.actor_rollout_ref.rollout.get("handoff_opd", {})
+        self.handoff_opd_enabled = bool(handoff_cfg.get("enable", False))
+        self.handoff_opd_cfg = handoff_cfg
+        if not self.handoff_opd_enabled:
+            return
+
+        if not self.use_rm:
+            raise ValueError("handoff_opd requires reward_model.enable=True so the teacher can generate continuations.")
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            raise ValueError("handoff_opd currently supports synchronous rollout only.")
+        if self.prune_opd_dynamic_response_length_enabled:
+            raise ValueError("handoff_opd cannot be combined with prune_opd.dynamic_response_length.")
+
+        cutoff = int(handoff_cfg.get("cutoff", 4096))
+        total_length = int(self.config.actor_rollout_ref.rollout.response_length)
+        if cutoff <= 0 or cutoff >= total_length:
+            raise ValueError(f"handoff_opd cutoff must be in (0, {total_length}), got {cutoff}.")
+        self.handoff_opd_cutoff = cutoff
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -375,9 +397,30 @@ class RayPPOTrainer:
         self.prune_opd_dynamic_response_length = max(min_len, min(init_len, max_len))
 
     def _set_dynamic_response_length_for_generation(self, gen_batch: DataProto):
+        if self.handoff_opd_enabled:
+            gen_batch.meta_info["max_response_length"] = self.handoff_opd_cutoff
+            return
         if not self.prune_opd_dynamic_response_length_enabled:
             return
         gen_batch.meta_info["max_response_length"] = self.prune_opd_dynamic_response_length
+
+    def _apply_handoff_opd(self, student_output: DataProto, timing_raw: dict) -> DataProto:
+        if not self.handoff_opd_enabled:
+            return student_output
+
+        total_length = int(self.config.actor_rollout_ref.rollout.response_length)
+        student_output.meta_info.update(
+            {
+                "handoff_cutoff": self.handoff_opd_cutoff,
+                "handoff_suffix_max_tokens": total_length - self.handoff_opd_cutoff,
+                "handoff_teacher_temperature": float(self.handoff_opd_cfg.get("teacher_temperature", 1.0)),
+                "handoff_teacher_top_p": float(self.handoff_opd_cfg.get("teacher_top_p", 0.95)),
+                "handoff_teacher_micro_batch_size": int(self.handoff_opd_cfg.get("teacher_micro_batch_size", 1)),
+            }
+        )
+        with marked_timer("teacher_continuation", timing_raw, color="purple"):
+            teacher_output = self.rm_wg.generate_continuations(student_output)
+        return attach_teacher_continuations(student_output, teacher_output)
 
     def _update_prune_opd_dynamic_response_length(self, effective_response_length: torch.Tensor) -> dict[str, float]:
         if not self.prune_opd_dynamic_response_length_enabled:
@@ -1217,6 +1260,7 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        gen_batch_output = self._apply_handoff_opd(gen_batch_output, timing_raw)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1255,6 +1299,14 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if self.handoff_opd_enabled:
+                        handoff_count = batch.batch["handoff_mask"].float().sum()
+                        suffix_tokens = batch.batch["handoff_ce_mask"].float().sum()
+                        metrics["handoff/ratio"] = (handoff_count / max(len(batch), 1)).item()
+                        metrics["handoff/teacher_suffix_tokens"] = suffix_tokens.item()
+                        metrics["handoff/teacher_suffix_tokens_per_sample"] = (
+                            suffix_tokens / handoff_count.clamp_min(1)
+                        ).item()
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

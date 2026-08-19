@@ -1726,6 +1726,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.model.path, use_shm=use_shm)
 
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+
         if self.config.model.input_tokenizer is None:
             self._do_switch_chat_template = False
         else:
@@ -1734,7 +1736,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.input_tokenizer = hf_tokenizer(
                 input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False)
             )
-            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
@@ -1921,6 +1922,95 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="purple")
+    def generate_continuations(self, data: DataProto):
+        """Generate teacher suffixes only for unfinished responses at the handoff boundary.
+
+        The teacher is already loaded as an FSDP causal LM for OPD scoring.  We
+        temporarily summon its full parameters and call the underlying HF
+        ``generate`` method, avoiding a second persistent teacher copy.
+        """
+
+        if not isinstance(self.reward_module, FSDP):
+            raise NotImplementedError("Teacher continuation currently requires reward_model.strategy=fsdp.")
+
+        data = data.to(get_device_id())
+        cutoff = int(data.meta_info["handoff_cutoff"])
+        suffix_max_tokens = int(data.meta_info["handoff_suffix_max_tokens"])
+        temperature = float(data.meta_info.get("handoff_teacher_temperature", 1.0))
+        top_p = float(data.meta_info.get("handoff_teacher_top_p", 0.95))
+        generation_micro_batch_size = int(data.meta_info.get("handoff_teacher_micro_batch_size", 1))
+        if generation_micro_batch_size <= 0:
+            raise ValueError("handoff_teacher_micro_batch_size must be positive.")
+
+        responses = data.batch["responses"]
+        if responses.shape[-1] != cutoff:
+            raise ValueError(f"Expected student response width {cutoff}, got {responses.shape[-1]}.")
+
+        response_attention = data.batch["attention_mask"][:, -cutoff:].bool()
+        valid_lengths = response_attention.sum(dim=-1)
+        eos_token_id = self.tokenizer.eos_token_id
+        last_indices = (valid_lengths - 1).clamp_min(0).long()
+        last_tokens = responses.gather(1, last_indices.unsqueeze(-1)).squeeze(-1)
+        handoff_mask = (valid_lengths == cutoff) & (last_tokens != eos_token_id)
+
+        batch_size = responses.shape[0]
+        suffixes = torch.full(
+            (batch_size, suffix_max_tokens),
+            self.tokenizer.pad_token_id,
+            dtype=responses.dtype,
+            device=responses.device,
+        )
+        suffix_mask = torch.zeros((batch_size, suffix_max_tokens), dtype=torch.long, device=responses.device)
+        selected = torch.nonzero(handoff_mask, as_tuple=False).squeeze(-1)
+
+        # All ranks must enter summon_full_params even when a local shard has no
+        # handoff samples, because entering/exiting the context is collective.
+        self.reward_module.eval()
+        with FSDP.summon_full_params(
+            self.reward_module, recurse=True, writeback=False, rank0_only=False, offload_to_cpu=False
+        ):
+            if selected.numel() > 0:
+                for start in range(0, selected.numel(), generation_micro_batch_size):
+                    selected_chunk = selected[start : start + generation_micro_batch_size]
+                    selected_input_ids = data.batch["input_ids"][selected_chunk]
+                    selected_attention = data.batch["attention_mask"][selected_chunk]
+                    generation_kwargs = {
+                        "input_ids": selected_input_ids,
+                        "attention_mask": selected_attention,
+                        "max_new_tokens": suffix_max_tokens,
+                        "do_sample": temperature > 0,
+                        "top_p": top_p,
+                        "use_cache": True,
+                        "eos_token_id": eos_token_id,
+                        "pad_token_id": self.tokenizer.pad_token_id,
+                    }
+                    if temperature > 0:
+                        generation_kwargs["temperature"] = temperature
+                    with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                        generated = self.reward_module.module.generate(**generation_kwargs)
+
+                    generated_suffix = generated[:, selected_input_ids.shape[-1] :]
+                    copy_length = min(generated_suffix.shape[-1], suffix_max_tokens)
+                    suffixes[selected_chunk, :copy_length] = generated_suffix[:, :copy_length]
+
+                    local_mask = torch.ones_like(generated_suffix[:, :copy_length], dtype=torch.long)
+                    if eos_token_id is not None:
+                        eos_hits = generated_suffix[:, :copy_length].eq(eos_token_id)
+                        eos_seen_before = eos_hits.cumsum(dim=-1) - eos_hits.long()
+                        local_mask = eos_seen_before.eq(0).long()
+                    suffix_mask[selected_chunk, :copy_length] = local_mask
+
+        get_torch_device().empty_cache()
+        return DataProto.from_dict(
+            tensors={
+                "teacher_suffixes": suffixes,
+                "teacher_suffix_mask": suffix_mask,
+                "handoff_mask": handoff_mask,
+            }
+        )
 
     def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input

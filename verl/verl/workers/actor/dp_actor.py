@@ -468,6 +468,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         prune_opd_cfg = data.meta_info.get("prune_opd", None)
+        handoff_opd_mask = data.batch.get("handoff_opd_mask", None)
 
         # 2. Compute Student Log Probs on Teacher IDs if needed
         # (This replaces the previous call to compute_log_probs_for_ids in ray_trainer)
@@ -635,6 +636,9 @@ class DataParallelPPOActor(BasePPOActor):
             )
             res_tensors.update(prune_aux_tensors)
 
+        if handoff_opd_mask is not None:
+            rm_scores = rm_scores * handoff_opd_mask.to(rm_scores.dtype).unsqueeze(-1)
+
         res_tensors["rm_scores"] = rm_scores
         return DataProto.from_dict(tensors=res_tensors)
 
@@ -768,6 +772,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
+
+        if "handoff_opd_mask" in data.batch.keys():
+            select_keys.append("handoff_opd_mask")
+        if "handoff_ce_mask" in data.batch.keys():
+            select_keys.append("handoff_ce_mask")
         
         # Include student_top_k_log_probs if present (for top-k distillation)
         if "student_top_k_log_probs" in data.batch.keys():
@@ -849,7 +858,7 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, token_log_prob, _, topk_log_probs = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
@@ -859,6 +868,7 @@ class DataParallelPPOActor(BasePPOActor):
                         _, log_prob, *_ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                         )
+                        token_log_prob = log_prob
                         log_prob_for_loss = log_prob
 
                     format_mask = None
@@ -905,12 +915,14 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
+                    opd_loss_mask = model_inputs.get("handoff_opd_mask", response_mask)
+
                     # Compute policy loss (any function is expected to return 2 values)
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=opd_loss_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
@@ -925,6 +937,15 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if "handoff_ce_mask" in model_inputs:
+                        ce_mask = model_inputs["handoff_ce_mask"].to(token_log_prob.dtype)
+                        ce_loss = agg_loss(loss_mat=-token_log_prob, loss_mask=ce_mask, loss_agg_mode="token-mean")
+                        ce_weight = float(self.config.policy_loss.get("handoff_sft_weight", 1.0))
+                        policy_loss = policy_loss + ce_weight * ce_loss
+                        micro_batch_metrics["actor/handoff_sft_loss"] = ce_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/handoff_sft_weight"] = ce_weight
+                        micro_batch_metrics["actor/handoff_sft_tokens"] = ce_mask.sum().detach().item()
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
