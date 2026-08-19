@@ -1923,133 +1923,182 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
 
-    def _build_handoff_teacher_rollout(self, data: DataProto, suffix_max_tokens: int, temperature: float, top_p: float):
-        """Build one frozen vLLM teacher replica per reward worker/GPU.
-
-        The reward-model FSDP parameters use CPU offload.  The vLLM replica is
-        therefore colocated on the same GPU and put into sleep level 1 after
-        every handoff generation, so reward scoring can reclaim the device.
-        """
-
-        teacher_max_model_len = int(data.meta_info["handoff_teacher_max_model_len"])
-        required_model_len = int(data.batch["input_ids"].shape[-1]) + suffix_max_tokens
-        if teacher_max_model_len < required_model_len:
-            raise ValueError(
-                f"Teacher vLLM max_model_len={teacher_max_model_len} is smaller than the required "
-                f"prefix+suffix length {required_model_len}."
+    def _get_handoff_student_tokenizer(self, data: DataProto):
+        model_path = str(data.meta_info["handoff_student_model_path"])
+        cached_path = getattr(self, "_handoff_student_tokenizer_path", None)
+        if cached_path != model_path:
+            local_path = copy_to_local(model_path, use_shm=self.config.model.get("use_shm", False))
+            self._handoff_student_tokenizer = hf_tokenizer(
+                local_path, trust_remote_code=self.config.model.get("trust_remote_code", False)
             )
+            self._handoff_student_tokenizer_path = model_path
+            self._handoff_tokenizers_identical = None
+        return self._handoff_student_tokenizer
 
-        gpu_memory_utilization = float(data.meta_info.get("handoff_teacher_gpu_memory_utilization", 0.4))
-        if not 0 < gpu_memory_utilization < 1:
-            raise ValueError("handoff teacher_gpu_memory_utilization must be between 0 and 1.")
-
-        max_num_batched_tokens = max(
-            teacher_max_model_len,
-            int(data.meta_info.get("handoff_teacher_max_num_batched_tokens", teacher_max_model_len)),
-        )
-        max_num_seqs = int(data.meta_info.get("handoff_teacher_max_num_seqs", 64))
-        if max_num_seqs <= 0:
-            raise ValueError("handoff teacher_max_num_seqs must be positive.")
-
-        if self.rank == 0:
-            print(
-                "[handoff] Initializing frozen Teacher vLLM "
-                f"(max_model_len={teacher_max_model_len}, max_num_seqs={max_num_seqs}, "
-                f"gpu_memory_utilization={gpu_memory_utilization})."
+    def _handoff_tokenizers_match(self, student_tokenizer) -> bool:
+        cached = getattr(self, "_handoff_tokenizers_identical", None)
+        if cached is None:
+            special_ids_match = all(
+                getattr(student_tokenizer, key, None) == getattr(self.tokenizer, key, None)
+                for key in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
             )
+            chat_template_match = getattr(student_tokenizer, "chat_template", None) == getattr(
+                self.tokenizer, "chat_template", None
+            )
+            cached = (
+                special_ids_match
+                and chat_template_match
+                and student_tokenizer.get_vocab() == self.tokenizer.get_vocab()
+            )
+            self._handoff_tokenizers_identical = cached
+            if self.rank == 0:
+                bridge = "direct token IDs" if cached else "text/tokenizer bridge"
+                print(f"[handoff] Student/Teacher tokenizer bridge: {bridge}.")
+        return cached
 
-        rollout_config = RolloutConfig(
-            name="vllm",
-            mode="sync",
-            temperature=temperature,
-            top_k=-1,
-            top_p=top_p,
-            do_sample=temperature > 0,
-            n=1,
-            prompt_length=int(data.batch["input_ids"].shape[-1]),
-            response_length=suffix_max_tokens,
-            dtype=str(data.meta_info.get("handoff_teacher_dtype", "bfloat16")),
-            gpu_memory_utilization=gpu_memory_utilization,
-            enforce_eager=bool(data.meta_info.get("handoff_teacher_enforce_eager", False)),
-            free_cache_engine=True,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            data_parallel_size=1,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_model_len=teacher_max_model_len,
-            max_num_seqs=max_num_seqs,
-            load_format="auto",
-            calculate_log_probs=False,
-            enable_chunked_prefill=True,
-            enable_prefix_caching=True,
-            # Force sleep level 1: the frozen teacher weights are retained in
-            # CPU memory and can be restored without actor-style weight sync.
-            layered_summon=True,
+    def _get_handoff_teacher_client(self, data: DataProto):
+        from verl.workers.rollout.handoff_teacher_server import TeacherVLLMClient
+
+        teacher_model_path = str(data.meta_info["handoff_teacher_model_path"])
+        local_teacher_path = copy_to_local(
+            teacher_model_path, use_shm=self.config.model.get("use_shm", False)
         )
-        model_config = HFModelConfig(
-            path=self.config.model.path,
-            use_shm=self.config.model.get("use_shm", False),
-            trust_remote_code=self.config.model.get("trust_remote_code", False),
-            external_lib=self.config.model.get("external_lib", None),
-            dtype=str(data.meta_info.get("handoff_teacher_dtype", "bfloat16")),
+        client_key = (
+            local_teacher_path,
+            str(data.meta_info.get("handoff_teacher_dtype", "bfloat16")),
+            float(data.meta_info.get("handoff_teacher_gpu_memory_utilization", 0.4)),
+            int(data.meta_info.get("handoff_teacher_max_model_len", 32768)),
+            int(data.meta_info.get("handoff_teacher_max_num_batched_tokens", 32768)),
+            int(data.meta_info.get("handoff_teacher_max_num_seqs", 64)),
+            bool(data.meta_info.get("handoff_teacher_enforce_eager", False)),
         )
-        aggressive_empty_cache(force_sync=True)
-        rollout_cls = get_rollout_class("vllm", "sync")
-        self.handoff_teacher_rollout = rollout_cls(
-            config=rollout_config,
-            model_config=model_config,
-            device_mesh=self.device_mesh,
-        )
-        self.handoff_teacher_rollout_sleeping = False
-        if self.rank == 0:
-            print("[handoff] Teacher vLLM is ready; suffix generation uses continuous batching and paged KV cache.")
+        if getattr(self, "_handoff_teacher_client_key", None) != client_key:
+            old_client = getattr(self, "_handoff_teacher_client", None)
+            if old_client is not None:
+                old_client.close()
+            self._handoff_teacher_client = TeacherVLLMClient(
+                model_path=local_teacher_path,
+                rank=self.rank,
+                dtype=client_key[1],
+                gpu_memory_utilization=client_key[2],
+                max_model_len=client_key[3],
+                max_num_batched_tokens=client_key[4],
+                max_num_seqs=client_key[5],
+                enforce_eager=client_key[6],
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
+            )
+            self._handoff_teacher_client_key = client_key
+        return self._handoff_teacher_client
+
+    def _build_handoff_teacher_prompts(
+        self,
+        data: DataProto,
+        selected_indices: list[int],
+        valid_lengths: torch.Tensor,
+        student_tokenizer,
+        tokenizers_identical: bool,
+    ) -> list[list[int]]:
+        prompts = []
+        raw_prompts = data.non_tensor_batch.get("raw_prompt")
+        for index in selected_indices:
+            if tokenizers_identical:
+                valid_input = data.batch["input_ids"][index][data.batch["attention_mask"][index].bool()]
+                prompts.append(valid_input.detach().cpu().tolist())
+                continue
+
+            student_prefix_ids = data.batch["responses"][index, : int(valid_lengths[index].item())]
+            prefix_text = student_tokenizer.decode(
+                student_prefix_ids.detach().cpu().tolist(),
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            if raw_prompts is not None:
+                messages = raw_prompts[index]
+                if isinstance(messages, np.ndarray):
+                    messages = messages.tolist()
+                teacher_prompt_ids = self.tokenizer.apply_chat_template(
+                    list(messages), tokenize=True, add_generation_prompt=True
+                )
+                if torch.is_tensor(teacher_prompt_ids):
+                    teacher_prompt_ids = teacher_prompt_ids.tolist()
+                teacher_prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+                prompts.append(list(teacher_prompt_ids) + list(teacher_prefix_ids))
+            else:
+                valid_input = data.batch["input_ids"][index][data.batch["attention_mask"][index].bool()]
+                input_text = student_tokenizer.decode(
+                    valid_input.detach().cpu().tolist(),
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                prompts.append(self.tokenizer.encode(input_text, add_special_tokens=False))
+        return prompts
 
     def _generate_handoff_with_vllm(
         self,
         data: DataProto,
         selected: torch.Tensor,
+        valid_lengths: torch.Tensor,
         suffixes: torch.Tensor,
         suffix_mask: torch.Tensor,
         suffix_max_tokens: int,
         temperature: float,
         top_p: float,
+        student_tokenizer,
     ) -> None:
-        if not hasattr(self, "handoff_teacher_rollout"):
-            self._build_handoff_teacher_rollout(data, suffix_max_tokens, temperature, top_p)
+        if selected.numel() == 0:
+            return
 
-        loop = get_event_loop()
-        if self.handoff_teacher_rollout_sleeping:
-            loop.run_until_complete(self.handoff_teacher_rollout.resume(tags=["weights", "kv_cache"]))
-            self.handoff_teacher_rollout_sleeping = False
-
-        try:
-            if selected.numel() == 0:
-                return
-
-            teacher_prompts = DataProto.from_dict(
-                tensors={
-                    "input_ids": data.batch["input_ids"][selected],
-                    "attention_mask": data.batch["attention_mask"][selected],
-                    "position_ids": data.batch["position_ids"][selected],
-                }
+        tokenizers_identical = self._handoff_tokenizers_match(student_tokenizer)
+        selected_indices = selected.detach().cpu().tolist()
+        prompts = self._build_handoff_teacher_prompts(
+            data, selected_indices, valid_lengths, student_tokenizer, tokenizers_identical
+        )
+        max_model_len = int(data.meta_info.get("handoff_teacher_max_model_len", 32768))
+        required_model_len = max(map(len, prompts)) + suffix_max_tokens
+        if required_model_len > max_model_len:
+            raise ValueError(
+                f"Teacher prompt + suffix requires {required_model_len} tokens, but "
+                f"handoff teacher_max_model_len={max_model_len}."
             )
-            teacher_prompts.meta_info.update(
-                {
-                    "eos_token_id": self.tokenizer.eos_token_id,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "do_sample": temperature > 0,
-                    "validate": False,
-                    "max_response_length": suffix_max_tokens,
-                }
+        client = self._get_handoff_teacher_client(data)
+        generated = client.generate(
+            prompts,
+            max_tokens=suffix_max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        if len(generated) != len(selected_indices):
+            raise RuntimeError(
+                f"Teacher vLLM returned {len(generated)} continuations for {len(selected_indices)} prompts."
             )
-            generated = self.handoff_teacher_rollout.generate_sequences(prompts=teacher_prompts)
-            generated_suffixes = generated.batch["responses"]
-            generated_mask = generated.batch["attention_mask"][:, -suffix_max_tokens:]
-            suffixes[selected] = generated_suffixes.to(suffixes.device)
-            suffix_mask[selected] = generated_mask.to(device=suffix_mask.device, dtype=suffix_mask.dtype)
-        finally:
-            loop.run_until_complete(self.handoff_teacher_rollout.release())
-            self.handoff_teacher_rollout_sleeping = True
+
+        for index, output in zip(selected_indices, generated, strict=True):
+            teacher_ids = list(output["token_ids"])
+            if tokenizers_identical:
+                student_ids = teacher_ids
+            else:
+                suffix_text = self.tokenizer.decode(
+                    teacher_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                student_ids = student_tokenizer.encode(suffix_text, add_special_tokens=False)
+                if output.get("finish_reason") == "stop" and student_tokenizer.eos_token_id is not None:
+                    student_ids.append(student_tokenizer.eos_token_id)
+
+            student_ids = student_ids[:suffix_max_tokens]
+            if not student_ids:
+                continue
+            copy_length = len(student_ids)
+            suffixes[index, :copy_length] = torch.tensor(
+                student_ids, dtype=suffixes.dtype, device=suffixes.device
+            )
+            local_mask = torch.ones(copy_length, dtype=suffix_mask.dtype, device=suffix_mask.device)
+            if student_tokenizer.eos_token_id is not None:
+                eos_hits = suffixes[index, :copy_length].eq(student_tokenizer.eos_token_id)
+                eos_seen_before = eos_hits.cumsum(dim=-1) - eos_hits.long()
+                local_mask = eos_seen_before.eq(0).to(dtype=suffix_mask.dtype)
+            suffix_mask[index, :copy_length] = local_mask
 
     def _generate_handoff_with_hf(
         self,
@@ -2106,30 +2155,27 @@ class RewardModelWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="purple")
     def generate_continuations(self, data: DataProto):
-        """Generate teacher suffixes only for unfinished responses at the handoff boundary.
+        """Generate Teacher suffixes on Reward workers."""
 
-        vLLM is the default backend.  It is colocated with the CPU-offloaded
-        FSDP teacher and performs continuously batched, paged-KV generation.
-        The old HuggingFace path remains available as an explicit fallback.
-        """
-
-        if not isinstance(self.reward_module, FSDP):
-            raise NotImplementedError("Teacher continuation currently requires reward_model.strategy=fsdp.")
-
+        teacher_backend = str(data.meta_info.get("handoff_teacher_backend", "vllm")).lower()
+        if teacher_backend == "hf" and not isinstance(self.reward_module, FSDP):
+            raise NotImplementedError(
+                "The HuggingFace Teacher continuation fallback requires reward_model.strategy=fsdp."
+            )
         data = data.to(get_device_id())
         cutoff = int(data.meta_info["handoff_cutoff"])
         suffix_max_tokens = int(data.meta_info["handoff_suffix_max_tokens"])
         temperature = float(data.meta_info.get("handoff_teacher_temperature", 1.0))
         top_p = float(data.meta_info.get("handoff_teacher_top_p", 0.95))
-        teacher_backend = str(data.meta_info.get("handoff_teacher_backend", "vllm")).lower()
-
         responses = data.batch["responses"]
         if responses.shape[-1] != cutoff:
             raise ValueError(f"Expected student response width {cutoff}, got {responses.shape[-1]}.")
 
         response_attention = data.batch["attention_mask"][:, -cutoff:].bool()
         valid_lengths = response_attention.sum(dim=-1)
-        eos_token_id = self.tokenizer.eos_token_id
+        student_tokenizer = self._get_handoff_student_tokenizer(data)
+        tokenizers_identical = self._handoff_tokenizers_match(student_tokenizer)
+        eos_token_id = student_tokenizer.eos_token_id
         last_indices = (valid_lengths - 1).clamp_min(0).long()
         last_tokens = responses.gather(1, last_indices.unsqueeze(-1)).squeeze(-1)
         handoff_mask = (valid_lengths == cutoff) & (last_tokens != eos_token_id)
@@ -2137,23 +2183,36 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         batch_size = responses.shape[0]
         suffixes = torch.full(
             (batch_size, suffix_max_tokens),
-            self.tokenizer.pad_token_id,
+            student_tokenizer.pad_token_id,
             dtype=responses.dtype,
             device=responses.device,
         )
         suffix_mask = torch.zeros((batch_size, suffix_max_tokens), dtype=torch.long, device=responses.device)
         selected = torch.nonzero(handoff_mask, as_tuple=False).squeeze(-1)
 
-        if teacher_backend == "vllm":
-            self._generate_handoff_with_vllm(
-                data, selected, suffixes, suffix_mask, suffix_max_tokens, temperature, top_p
-            )
-        elif teacher_backend == "hf":
+        if teacher_backend == "hf":
+            if not tokenizers_identical:
+                raise ValueError(
+                    "handoff_opd teacher_backend=hf requires identical Student and Teacher tokenizers. "
+                    "Use teacher_backend=vllm for the text/tokenizer bridge."
+                )
             self._generate_handoff_with_hf(
                 data, selected, suffixes, suffix_mask, suffix_max_tokens, temperature, top_p
             )
+        elif teacher_backend == "vllm":
+            self._generate_handoff_with_vllm(
+                data,
+                selected,
+                valid_lengths,
+                suffixes,
+                suffix_mask,
+                suffix_max_tokens,
+                temperature,
+                top_p,
+                student_tokenizer,
+            )
         else:
-            raise ValueError(f"Unsupported handoff teacher backend: {teacher_backend!r}.")
+            raise ValueError(f"Unknown handoff Teacher backend: {teacher_backend!r}.")
 
         get_torch_device().empty_cache()
         return DataProto.from_dict(

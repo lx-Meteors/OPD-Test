@@ -116,19 +116,13 @@ handoff_opd:
   # HuggingFace fallback generation micro-batch size.
   teacher_micro_batch_size: 1
 
-  # Teacher vLLM inference dtype.
+  # Settings for the standalone Teacher vLLM process. It time-shares each GPU
+  # with the sleeping Student rollout engine and supports a different model architecture.
   teacher_dtype: bfloat16
-
-  # Fraction of each GPU available to the colocated Teacher vLLM engine.
   teacher_gpu_memory_utilization: 0.4
-
-  # Maximum number of tokens scheduled in one Teacher vLLM iteration.
+  teacher_max_model_len: 32768
   teacher_max_num_batched_tokens: 32768
-
-  # Maximum number of concurrent Teacher vLLM sequences per GPU.
   teacher_max_num_seqs: 64
-
-  # Disable CUDA graphs when true; false is faster after engine warmup.
   teacher_enforce_eager: false
 
 # disable logging statistics

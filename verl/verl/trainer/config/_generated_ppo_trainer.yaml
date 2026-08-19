@@ -201,6 +201,7 @@ actor_rollout_ref:
       teacher_micro_batch_size: 1
       teacher_dtype: bfloat16
       teacher_gpu_memory_utilization: 0.4
+      teacher_max_model_len: 32768
       teacher_max_num_batched_tokens: 32768
       teacher_max_num_seqs: 64
       teacher_enforce_eager: false

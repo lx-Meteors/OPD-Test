@@ -421,21 +421,20 @@ class RayPPOTrainer:
                 "handoff_teacher_top_p": float(self.handoff_opd_cfg.get("teacher_top_p", 0.95)),
                 "handoff_teacher_micro_batch_size": int(self.handoff_opd_cfg.get("teacher_micro_batch_size", 1)),
                 "handoff_teacher_backend": str(self.handoff_opd_cfg.get("teacher_backend", "vllm")).lower(),
+                "handoff_teacher_model_path": str(self.config.reward_model.model.path),
+                "handoff_student_model_path": str(self.config.actor_rollout_ref.model.path),
                 "handoff_teacher_dtype": str(self.handoff_opd_cfg.get("teacher_dtype", "bfloat16")),
                 "handoff_teacher_gpu_memory_utilization": float(
                     self.handoff_opd_cfg.get("teacher_gpu_memory_utilization", 0.4)
+                ),
+                "handoff_teacher_max_model_len": int(
+                    self.handoff_opd_cfg.get("teacher_max_model_len", 32768)
                 ),
                 "handoff_teacher_max_num_batched_tokens": int(
                     self.handoff_opd_cfg.get("teacher_max_num_batched_tokens", 32768)
                 ),
                 "handoff_teacher_max_num_seqs": int(self.handoff_opd_cfg.get("teacher_max_num_seqs", 64)),
-                "handoff_teacher_enforce_eager": bool(
-                    self.handoff_opd_cfg.get("teacher_enforce_eager", False)
-                ),
-                "handoff_teacher_max_model_len": int(
-                    self.config.actor_rollout_ref.rollout.get("max_model_len")
-                    or (int(self.config.data.max_prompt_length) + total_length)
-                ),
+                "handoff_teacher_enforce_eager": bool(self.handoff_opd_cfg.get("teacher_enforce_eager", False)),
             }
         )
         with marked_timer("teacher_continuation", timing_raw, color="purple"):
