@@ -31,7 +31,8 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-from verl.utils.detemper_reward import compute_rkl_dt_scores
+from verl.utils.detemper_reward import compute_fkl_scores, compute_rkl_cdt_scores, compute_rkl_dt_scores
+from verl.utils.fq_reward import compute_fq_scores
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.sdt_reward import compute_rkl_sdt_scores, compute_rkl_sdtw_scores
@@ -470,11 +471,23 @@ class DataParallelPPOActor(BasePPOActor):
         # cell rewards), "rkl_dt" (baseline -p*(logp-logq) against a one-sided
         # entropy-detempered teacher), "rkl_sdt" (rKL at the entropy-matched
         # point of the student's temperature family, scaled by the 1/mu Jacobian;
-        # teacher untouched), or "rkl_sdtw" (baseline field reweighted per cell
+        # teacher untouched), "rkl_sdtw" (baseline field reweighted per cell
         # by the entropy-matched p~ = p^mu with H(p~) = H(q); two-sided,
-        # clamp-free). "tri"/"rkl_dt"/"rkl_sdt"/"rkl_sdtw": only_stu only.
+        # clamp-free), "rkl_cdt" (rkl_dt's force form with the entropy
+        # bisection replaced by the closed-form contrast gauge: the target is
+        # the teacher's structure at the student's log-prob spread,
+        # log q~ = log_softmax(sigma_p * z(logq)); two-sided, no gate),
+        # "fq" (fiber quotient by z-score matching: r = z(logq) - z(logp);
+        # the z-score is the complete invariant of the tempering group, so
+        # this distills structure modulo temperature; closed form, no
+        # bisection, no gates), or "fkl" (forward-KL transport r = q - p,
+        # the exact logit gradient of -KL(q||p): zero-sum, |r|<=1, convex
+        # in the student logits; cells the teacher endorses but the student
+        # starves get the full mass difference - the lesion triage embedded
+        # in one formula).
+        # "tri"/"rkl_dt"/"rkl_cdt"/"rkl_sdt"/"rkl_sdtw"/"fq"/"fkl": only_stu only.
         reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")
-        if reward_weight_mode in ("tri", "rkl_dt", "rkl_sdt", "rkl_sdtw") and strategy != "only_stu":
+        if reward_weight_mode in ("tri", "rkl_dt", "rkl_cdt", "rkl_sdt", "rkl_sdtw", "fq", "fkl") and strategy != "only_stu":
             raise ValueError(
                 f"reward_weight_mode='{reward_weight_mode}' is only validated with top_k_strategy='only_stu', got '{strategy}'"
             )
@@ -577,8 +590,15 @@ class DataParallelPPOActor(BasePPOActor):
             valid_mask = torch.ones_like(S_logp, dtype=torch.bool)
             if reward_weight_mode == "tri":
                 rm_scores = compute_tri_scores(S_logp, T_on_S, valid_mask)
+            elif reward_weight_mode == "fq":
+                rm_scores, fq_aux = compute_fq_scores(S_logp, T_on_S, valid_mask, return_aux=True)
+                res_tensors.update(fq_aux)
             elif reward_weight_mode == "rkl_dt":
                 rm_scores = compute_rkl_dt_scores(S_logp, T_on_S, valid_mask)
+            elif reward_weight_mode == "rkl_cdt":
+                rm_scores = compute_rkl_cdt_scores(S_logp, T_on_S, valid_mask)
+            elif reward_weight_mode == "fkl":
+                rm_scores = compute_fkl_scores(S_logp, T_on_S, valid_mask)
             elif reward_weight_mode == "rkl_sdt":
                 rm_scores = compute_rkl_sdt_scores(S_logp, T_on_S, valid_mask)
             elif reward_weight_mode == "rkl_sdtw":
