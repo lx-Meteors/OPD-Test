@@ -74,6 +74,24 @@ loss_agg_mode: token-mean
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Whether OPD is an adaptive prefix constraint while GRPO remains full-trajectory
+opd_constraint_enable: false
+
+# Number of response tokens supervised by the OPD constraint
+opd_constraint_prefix_tokens: 5000
+
+# Target mean Top-K Teacher-Student divergence on the constrained prefix
+opd_constraint_target: 0.02
+
+# Initial Lagrange multiplier for the OPD constraint
+opd_constraint_init_coef: 1.0
+
+# Additive dual-ascent learning rate for the multiplier
+opd_constraint_dual_lr: 1.0
+
+# Maximum value of the Lagrange multiplier
+opd_constraint_max_coef: 2.0
+
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
