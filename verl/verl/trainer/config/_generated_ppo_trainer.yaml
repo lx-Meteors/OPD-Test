@@ -195,9 +195,15 @@ actor_rollout_ref:
     handoff_opd:
       enable: false
       cutoff: 4096
+      teacher_backend: vllm
       teacher_temperature: 1.0
       teacher_top_p: 0.95
       teacher_micro_batch_size: 1
+      teacher_dtype: bfloat16
+      teacher_gpu_memory_utilization: 0.4
+      teacher_max_num_batched_tokens: 32768
+      teacher_max_num_seqs: 64
+      teacher_enforce_eager: false
     disable_log_stats: true
     do_sample: true
     'n': 1
