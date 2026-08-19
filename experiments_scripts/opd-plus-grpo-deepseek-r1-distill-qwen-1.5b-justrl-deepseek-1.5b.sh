@@ -27,12 +27,6 @@ export GRPO_OUTCOME_WEIGHT="${GRPO_OUTCOME_WEIGHT:-1.0}"
 export N_RESPONSES="${N_RESPONSES:-4}"
 export TRAIN_TEACHER=False
 
-export OPD_PREFIX_TOKENS="${OPD_PREFIX_TOKENS:-5000}"
-export OPD_CONSTRAINT_TARGET="${OPD_CONSTRAINT_TARGET:-0.02}"
-export OPD_CONSTRAINT_INIT_COEF="${OPD_CONSTRAINT_INIT_COEF:-1.0}"
-export OPD_CONSTRAINT_DUAL_LR="${OPD_CONSTRAINT_DUAL_LR:-1.0}"
-export OPD_CONSTRAINT_MAX_COEF="${OPD_CONSTRAINT_MAX_COEF:-2.0}"
-
 if [[ "${RESUME_FROM_PATH%/}" != */global_step_200 ]]; then
     echo "RESUME_FROM_PATH must point to the global_step_200 directory, not its actor/ subdirectory" >&2
     exit 1
@@ -43,13 +37,7 @@ if [[ ! -d "${RESUME_FROM_PATH}" && "${DRY_RUN:-0}" != "1" ]]; then
     exit 1
 fi
 
-run_opd "grpo-prefix5k-opd-constraint" \
-    "actor_rollout_ref.actor.opd_constraint_enable=True" \
-    "actor_rollout_ref.actor.opd_constraint_prefix_tokens=${OPD_PREFIX_TOKENS}" \
-    "actor_rollout_ref.actor.opd_constraint_target=${OPD_CONSTRAINT_TARGET}" \
-    "actor_rollout_ref.actor.opd_constraint_init_coef=${OPD_CONSTRAINT_INIT_COEF}" \
-    "actor_rollout_ref.actor.opd_constraint_dual_lr=${OPD_CONSTRAINT_DUAL_LR}" \
-    "actor_rollout_ref.actor.opd_constraint_max_coef=${OPD_CONSTRAINT_MAX_COEF}" \
+run_opd "opd-plus-grpo-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b" \
     "trainer.resume_mode=resume_path" \
     "trainer.resume_from_path=${RESUME_FROM_PATH}" \
     "$@"
