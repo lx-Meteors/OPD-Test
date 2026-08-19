@@ -13,7 +13,7 @@ export REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${MODEL_ROOT}/JustRL-DeepSeek-1.5
 
 # Replace PUT_YOUR_RUN_DIR_HERE with the directory name containing global_step_200.
 # The path must end at global_step_200; do not append /actor.
-export RESUME_FROM_PATH="${RESUME_FROM_PATH:-/ossfs/workspace/OPD-Test/checkpoint/PUT_YOUR_RUN_DIR_HERE/global_step_200}"
+export RESUME_FROM_PATH="${RESUME_FROM_PATH:-/ossfs/workspace/code/Prune-OPD/checkpoint/opd-plus-grpo-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b_token_reward_direct_plus_grpo_DeepSeek-R1-Distill-Qwen-1.5B_JustRL-DeepSeek-1.5B_12288-T_1.0-Tch_1.0-n_4-mbs_64-topk_16-topk_strategy_only_stu-rw_student_p-2026-08-18_21-22-40/global_step_200}"
 
 export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
