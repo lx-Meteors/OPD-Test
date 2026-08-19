@@ -124,6 +124,7 @@ run_opd() {
     export TEST_FREQ="${TEST_FREQ:-20}"
     export SAVE_FREQ="${SAVE_FREQ:-100}"
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
+    export TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
     export TRAIN_TEACHER="${TRAIN_TEACHER:-False}"
     export TEACHER_LORA_RANK="${TEACHER_LORA_RANK:-8}"
     export TEACHER_LORA_ALPHA="${TEACHER_LORA_ALPHA:-16}"
@@ -268,7 +269,7 @@ run_opd() {
         "trainer.save_freq=${SAVE_FREQ}"
         "trainer.test_freq=${TEST_FREQ}"
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
-        "trainer.total_epochs=1"
+        "trainer.total_epochs=${TOTAL_EPOCHS}"
         "trainer.default_local_dir=${ckpt_path}"
         "trainer.is_plot=${IS_PLOT}"
     )

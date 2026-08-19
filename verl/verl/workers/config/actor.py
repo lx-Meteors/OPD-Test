@@ -72,6 +72,12 @@ class ActorConfig(BaseConfig):
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         entropy_coeff (float): Entropy coefficient for regularization.
+        opd_constraint_enable (bool): Use OPD as an adaptive prefix constraint in hybrid OPD+GRPO training.
+        opd_constraint_prefix_tokens (int): Number of response tokens covered by the OPD constraint.
+        opd_constraint_target (float): Target mean prefix Teacher-Student divergence.
+        opd_constraint_init_coef (float): Initial Lagrange multiplier for the OPD constraint.
+        opd_constraint_dual_lr (float): Step size for the multiplier update.
+        opd_constraint_max_coef (float): Upper bound for the multiplier.
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -106,6 +112,12 @@ class ActorConfig(BaseConfig):
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
+    opd_constraint_enable: bool = False
+    opd_constraint_prefix_tokens: int = 5000
+    opd_constraint_target: float = 0.02
+    opd_constraint_init_coef: float = 1.0
+    opd_constraint_dual_lr: float = 1.0
+    opd_constraint_max_coef: float = 2.0
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
@@ -146,6 +158,16 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.opd_constraint_prefix_tokens <= 0:
+            raise ValueError("opd_constraint_prefix_tokens must be positive")
+        if self.opd_constraint_target <= 0:
+            raise ValueError("opd_constraint_target must be positive")
+        if self.opd_constraint_init_coef < 0:
+            raise ValueError("opd_constraint_init_coef must be non-negative")
+        if self.opd_constraint_dual_lr < 0:
+            raise ValueError("opd_constraint_dual_lr must be non-negative")
+        if self.opd_constraint_max_coef < self.opd_constraint_init_coef:
+            raise ValueError("opd_constraint_max_coef must be >= opd_constraint_init_coef")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
