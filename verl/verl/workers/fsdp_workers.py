@@ -2179,6 +2179,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         last_indices = (valid_lengths - 1).clamp_min(0).long()
         last_tokens = responses.gather(1, last_indices.unsqueeze(-1)).squeeze(-1)
         handoff_mask = (valid_lengths == cutoff) & (last_tokens != eos_token_id)
+        if "handoff_candidate_active" in data.batch:
+            handoff_mask &= data.batch["handoff_candidate_active"].bool()
 
         batch_size = responses.shape[0]
         suffixes = torch.full(

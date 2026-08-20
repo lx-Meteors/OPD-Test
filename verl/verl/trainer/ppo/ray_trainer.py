@@ -422,11 +422,14 @@ class RayPPOTrainer:
             return student_output
 
         total_length = int(self.config.actor_rollout_ref.rollout.response_length)
+        reward_sp_size = int(self.config.reward_model.get("ulysses_sequence_parallel_size", 1))
+        reward_dispatch_size = self.rm_wg.world_size // reward_sp_size
         student_output = expand_handoff_candidates(
             student_output,
             cutoff=self.handoff_opd_cutoff,
             eos_token_id=self.tokenizer.eos_token_id,
             num_teacher_samples=self.handoff_teacher_num_samples,
+            dispatch_size=reward_dispatch_size,
         )
         student_output.meta_info.update(
             {

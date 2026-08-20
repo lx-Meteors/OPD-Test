@@ -24,6 +24,7 @@ def expand_handoff_candidates(
     cutoff: int,
     eos_token_id: int | None,
     num_teacher_samples: int,
+    dispatch_size: int,
 ) -> DataProto:
     """Repeat only handoff-eligible Student prefixes for Teacher sampling.
 
@@ -35,6 +36,8 @@ def expand_handoff_candidates(
 
     if num_teacher_samples <= 1:
         return student_output
+    if dispatch_size <= 0:
+        raise ValueError("dispatch_size must be positive.")
 
     responses = student_output.batch["responses"]
     if responses.shape[-1] != cutoff:
@@ -56,17 +59,32 @@ def expand_handoff_candidates(
     parent_indices = torch.repeat_interleave(
         torch.arange(responses.shape[0], device=responses.device), repeat_counts
     )
-    expanded = student_output.select_idxs(parent_indices)
-
     prefix_loss_rows = torch.ones(parent_indices.shape[0], dtype=torch.bool, device=responses.device)
+    candidate_active = torch.ones(parent_indices.shape[0], dtype=torch.bool, device=responses.device)
     row_start = 0
     for repeat_count in repeat_counts.detach().cpu().tolist():
         if repeat_count > 1:
             prefix_loss_rows[row_start + 1 : row_start + repeat_count] = False
         row_start += repeat_count
 
+    # Reward-worker dispatch requires equal chunks.  Pad with inactive copies
+    # rather than duplicating real loss-bearing candidates.
+    padding = (-parent_indices.shape[0]) % dispatch_size
+    if padding:
+        padding_parents = parent_indices.new_zeros(padding)
+        parent_indices = torch.cat((parent_indices, padding_parents), dim=0)
+        prefix_loss_rows = torch.cat(
+            (prefix_loss_rows, torch.zeros(padding, dtype=torch.bool, device=responses.device)), dim=0
+        )
+        candidate_active = torch.cat(
+            (candidate_active, torch.zeros(padding, dtype=torch.bool, device=responses.device)), dim=0
+        )
+
+    expanded = student_output.select_idxs(parent_indices)
+
     expanded.batch["handoff_parent_index"] = parent_indices
     expanded.batch["handoff_prefix_loss_row"] = prefix_loss_rows
+    expanded.batch["handoff_candidate_active"] = candidate_active
     return expanded
 
 
@@ -108,6 +126,8 @@ def attach_teacher_continuations(student_output: DataProto, teacher_output: Data
     prefix_loss_row = None
     if "handoff_prefix_loss_row" in student_output.batch:
         prefix_loss_row = student_output.batch.pop("handoff_prefix_loss_row")
+    if "handoff_candidate_active" in student_output.batch:
+        student_output.batch.pop("handoff_candidate_active")
     if prefix_loss_row is not None:
         student_response_mask = student_response_mask * prefix_loss_row.unsqueeze(-1).to(student_response_mask.dtype)
     student_output.batch["handoff_opd_mask"] = torch.cat((student_response_mask, suffix_zeros), dim=-1)
