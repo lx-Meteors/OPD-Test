@@ -44,7 +44,11 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.handoff_opd import attach_teacher_continuations
+from verl.trainer.ppo.handoff_opd import (
+    attach_teacher_continuations,
+    expand_handoff_candidates,
+    gate_teacher_suffix_sft_by_reward,
+)
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -381,6 +385,11 @@ class RayPPOTrainer:
         if cutoff <= 0 or cutoff >= total_length:
             raise ValueError(f"handoff_opd cutoff must be in (0, {total_length}), got {cutoff}.")
         self.handoff_opd_cutoff = cutoff
+        self.handoff_teacher_num_samples = int(handoff_cfg.get("teacher_num_samples", 1))
+        if self.handoff_teacher_num_samples <= 0:
+            raise ValueError("handoff_opd teacher_num_samples must be positive.")
+        self.handoff_verified_suffix_only = bool(handoff_cfg.get("verified_suffix_only", False))
+        self.handoff_correct_threshold = float(handoff_cfg.get("correct_threshold", 0.5))
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -413,6 +422,12 @@ class RayPPOTrainer:
             return student_output
 
         total_length = int(self.config.actor_rollout_ref.rollout.response_length)
+        student_output = expand_handoff_candidates(
+            student_output,
+            cutoff=self.handoff_opd_cutoff,
+            eos_token_id=self.tokenizer.eos_token_id,
+            num_teacher_samples=self.handoff_teacher_num_samples,
+        )
         student_output.meta_info.update(
             {
                 "handoff_cutoff": self.handoff_opd_cutoff,
@@ -1314,6 +1329,10 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if "handoff_parent_index" in gen_batch_output.batch:
+                        parent_index_data = gen_batch_output.pop(batch_keys=["handoff_parent_index"])
+                        parent_indices = parent_index_data.batch["handoff_parent_index"]
+                        batch = batch.select_idxs(parent_indices)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1697,6 +1716,30 @@ class RayPPOTrainer:
                                 )
                         else:
                             batch.batch["true_reward_score"] = reward_tensor
+
+                        if self.handoff_opd_enabled and self.handoff_verified_suffix_only:
+                            if "true_reward_score" not in reward_extra_infos_dict:
+                                raise RuntimeError(
+                                    "Verified suffix SFT requires the reward manager to return true_reward_score; "
+                                    "distillation rm_scores cannot be used as a correctness label."
+                                )
+                            accepted_handoff = gate_teacher_suffix_sft_by_reward(
+                                batch,
+                                reward_scores=batch.batch["true_reward_score"],
+                                correct_threshold=self.handoff_correct_threshold,
+                            )
+                            handoff_mask = batch.batch["handoff_mask"].to(
+                                device=accepted_handoff.device, dtype=torch.bool
+                            )
+                            handoff_count = handoff_mask.sum()
+                            accepted_count = accepted_handoff.sum()
+                            metrics["handoff/teacher_suffix_correct_count"] = accepted_count.item()
+                            metrics["handoff/teacher_suffix_correct_ratio"] = (
+                                accepted_count.float() / handoff_count.clamp_min(1)
+                            ).item()
+                            metrics["handoff/verified_suffix_tokens"] = (
+                                batch.batch["handoff_ce_mask"].float().sum().item()
+                            )
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

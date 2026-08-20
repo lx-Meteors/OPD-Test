@@ -204,6 +204,9 @@ actor_rollout_ref:
     handoff_opd:
       enable: false
       cutoff: 4096
+      teacher_num_samples: 1
+      verified_suffix_only: false
+      correct_threshold: 0.5
       teacher_backend: vllm
       teacher_temperature: 1.0
       teacher_top_p: 0.95
