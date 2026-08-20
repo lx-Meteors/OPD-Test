@@ -31,4 +31,4 @@ export HANDOFF_TEACHER_MAX_NUM_BATCHED_TOKENS="${HANDOFF_TEACHER_MAX_NUM_BATCHED
 export HANDOFF_TEACHER_MAX_NUM_SEQS="${HANDOFF_TEACHER_MAX_NUM_SEQS:-64}"
 export HANDOFF_TEACHER_ENFORCE_EAGER="${HANDOFF_TEACHER_ENFORCE_EAGER:-False}"
 
-run_opd "opd-4k-handoff-sft-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b" "$@"
+run_opd "opd-4k-verified-handoff-sft-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b" "$@"
