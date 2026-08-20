@@ -197,6 +197,7 @@ actor_rollout_ref:
       cutoff: 4096
       teacher_num_samples: 1
       verified_suffix_only: false
+      select_best_verified_suffix: false
       correct_threshold: 0.5
       teacher_backend: vllm
       teacher_temperature: 1.0

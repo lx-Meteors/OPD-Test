@@ -35,6 +35,9 @@ def expand_handoff_candidates(
     """
 
     if num_teacher_samples <= 1:
+        student_output.batch["handoff_parent_index"] = torch.arange(
+            len(student_output), device=student_output.batch.device, dtype=torch.long
+        )
         return student_output
     if dispatch_size <= 0:
         raise ValueError("dispatch_size must be positive.")
@@ -176,3 +179,95 @@ def gate_teacher_suffix_sft_by_reward(
 
     data.batch["handoff_ce_mask"] = ce_mask * accepted_mask.unsqueeze(-1).to(ce_mask.dtype)
     return accepted_mask
+
+
+def select_best_verified_handoff_candidate(
+    data: DataProto,
+    reward_scores: torch.Tensor,
+    correct_threshold: float = 0.5,
+) -> tuple[DataProto, dict[str, int]]:
+    """Collapse Best-of-N Teacher suffixes to one Actor-training row per Student rollout.
+
+    Teacher generation and verifier scoring still use every sampled suffix.  Before
+    computing advantages and updating the Actor, this function keeps the
+    highest-scoring correct suffix for each Student prefix.  If no suffix is
+    correct, it keeps the canonical row that owns the prefix OPD mask and leaves
+    its suffix CE mask empty.
+
+    Moving the canonical OPD mask to a selected non-canonical candidate preserves
+    exactly one copy of prefix OPD supervision per Student rollout.  Collapsing
+    the rows restores the Actor batch size (and therefore its optimizer-step
+    count) to the ordinary OPD budget.
+    """
+
+    required_keys = {
+        "handoff_parent_index",
+        "handoff_opd_mask",
+        "handoff_ce_mask",
+        "handoff_mask",
+    }
+    missing_keys = required_keys.difference(data.batch.keys())
+    if missing_keys:
+        raise KeyError(f"Best-of-N handoff selection is missing batch keys: {sorted(missing_keys)}")
+
+    accepted_mask = gate_teacher_suffix_sft_by_reward(
+        data,
+        reward_scores=reward_scores,
+        correct_threshold=correct_threshold,
+    )
+
+    if reward_scores.ndim == 1:
+        trajectory_scores = reward_scores
+    else:
+        trajectory_scores = reward_scores.reshape(reward_scores.shape[0], -1).sum(dim=-1)
+
+    parent_indices = data.batch["handoff_parent_index"].long()
+    opd_mask = data.batch["handoff_opd_mask"]
+    handoff_mask = data.batch["handoff_mask"].bool()
+    trajectory_scores = trajectory_scores.to(parent_indices.device)
+    accepted_mask = accepted_mask.to(parent_indices.device)
+
+    selected_rows: list[torch.Tensor] = []
+    handoff_parent_count = 0
+    selected_correct_count = 0
+
+    for parent_index in torch.unique(parent_indices, sorted=True):
+        group_rows = torch.nonzero(parent_indices == parent_index, as_tuple=False).squeeze(-1)
+
+        # Exactly one real row owns prefix OPD.  Padded dispatch rows and the
+        # extra Teacher candidates have an all-zero prefix mask.
+        opd_token_counts = opd_mask[group_rows].reshape(group_rows.numel(), -1).sum(dim=-1)
+        canonical_row = group_rows[torch.argmax(opd_token_counts)]
+
+        group_handoff_mask = handoff_mask[group_rows]
+        if group_handoff_mask.any():
+            handoff_parent_count += 1
+
+        correct_rows = group_rows[accepted_mask[group_rows]]
+        if correct_rows.numel() > 0:
+            candidate_scores = torch.nan_to_num(
+                trajectory_scores[correct_rows], nan=-torch.inf, neginf=-torch.inf
+            )
+            selected_row = correct_rows[torch.argmax(candidate_scores)]
+            selected_correct_count += 1
+        else:
+            selected_row = canonical_row
+
+        if selected_row.item() != canonical_row.item():
+            opd_mask[selected_row] = opd_mask[canonical_row].clone()
+        selected_rows.append(selected_row)
+
+    selected_indices = torch.stack(selected_rows)
+    selected_data = data.select_idxs(selected_indices)
+    selected_data.batch.pop("handoff_parent_index")
+
+    candidate_handoff_count = int(handoff_mask.sum().item())
+    candidate_correct_count = int(accepted_mask.sum().item())
+    stats = {
+        "parent_count": len(selected_rows),
+        "handoff_parent_count": handoff_parent_count,
+        "candidate_handoff_count": candidate_handoff_count,
+        "candidate_correct_count": candidate_correct_count,
+        "selected_correct_count": selected_correct_count,
+    }
+    return selected_data, stats

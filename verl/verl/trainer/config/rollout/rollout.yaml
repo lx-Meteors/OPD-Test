@@ -111,6 +111,10 @@ handoff_opd:
   # Student-prefix + Teacher-suffix response as correct.
   verified_suffix_only: false
 
+  # After verifier scoring, keep only the highest-scoring correct Teacher
+  # suffix per Student rollout before updating the Actor.
+  select_best_verified_suffix: false
+
   # Minimum trajectory-level verifier score considered correct.
   correct_threshold: 0.5
 
