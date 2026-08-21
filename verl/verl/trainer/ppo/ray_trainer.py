@@ -1126,6 +1126,99 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _apply_occupancy_replay(self, batch: DataProto) -> tuple[DataProto, dict[str, float]]:
+        """Replace part of a fresh batch with historical student-visited states.
+
+        The replay buffer contains only tokenized trajectories on CPU. Student
+        candidates/log-probabilities and teacher scores are recomputed after the
+        mix, so no stale distillation signal is reused. Replacing samples keeps
+        the batch size and optimizer-update budget identical to vanilla OPD.
+        """
+        cfg = self.config.algorithm.get("occupancy_replay", None)
+        if cfg is None or not cfg.get("enable", False):
+            return batch, {}
+
+        ratio = float(cfg.get("ratio", 0.2))
+        capacity = int(cfg.get("capacity", 1024))
+        warmup_steps = int(cfg.get("warmup_steps", 2))
+        insert_samples = int(cfg.get("insert_samples", 64))
+        seed = int(cfg.get("seed", 2026))
+
+        if not 0.0 <= ratio < 1.0:
+            raise ValueError(f"algorithm.occupancy_replay.ratio must be in [0, 1), got {ratio}")
+        if capacity <= 0:
+            raise ValueError(f"algorithm.occupancy_replay.capacity must be positive, got {capacity}")
+        if insert_samples <= 0:
+            raise ValueError(
+                f"algorithm.occupancy_replay.insert_samples must be positive, got {insert_samples}"
+            )
+
+        # Capture the genuinely fresh rollout before any replacement. Insert it
+        # only after replay sampling so a batch cannot immediately replay itself.
+        fresh_snapshot = deepcopy(batch).to("cpu")
+        rng = np.random.default_rng(seed + self.global_steps)
+
+        replay_count = 0
+        buffer_size_before = 0 if self._occupancy_replay_buffer is None else len(self._occupancy_replay_buffer)
+        mixed_batch = batch
+        if (
+            ratio > 0.0
+            and self.global_steps > warmup_steps
+            and self._occupancy_replay_buffer is not None
+            and len(self._occupancy_replay_buffer) > 0
+        ):
+            replay_count = min(len(batch) - 1, int(round(len(batch) * ratio)))
+            if replay_count > 0:
+                fresh_count = len(batch) - replay_count
+                fresh_indices = rng.choice(len(batch), size=fresh_count, replace=False)
+                replay_indices = rng.choice(
+                    len(self._occupancy_replay_buffer),
+                    size=replay_count,
+                    replace=replay_count > len(self._occupancy_replay_buffer),
+                )
+
+                fresh_part = batch.select_idxs(fresh_indices)
+                replay_part = self._occupancy_replay_buffer.select_idxs(replay_indices)
+                # Runtime metadata must come from the current generation step.
+                replay_part.meta_info = deepcopy(fresh_part.meta_info)
+                if "uid" in replay_part.non_tensor_batch:
+                    replay_part.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(replay_count)], dtype=object
+                    )
+
+                mixed_batch = DataProto.concat([fresh_part, replay_part])
+                mixed_batch.meta_info = deepcopy(batch.meta_info)
+                mask_device = mixed_batch.batch.device
+                mixed_batch.batch["occupancy_replay_mask"] = torch.cat(
+                    [
+                        torch.zeros(fresh_count, dtype=torch.bool, device=mask_device),
+                        torch.ones(replay_count, dtype=torch.bool, device=mask_device),
+                    ],
+                    dim=0,
+                )
+
+        # Bounded FIFO retention gives a moving union of recent occupancy
+        # measures without allowing very stale initial trajectories to dominate.
+        add_count = min(insert_samples, len(fresh_snapshot), capacity)
+        add_indices = rng.choice(len(fresh_snapshot), size=add_count, replace=False)
+        to_add = fresh_snapshot.select_idxs(add_indices)
+        to_add.meta_info = {}
+        if self._occupancy_replay_buffer is None:
+            self._occupancy_replay_buffer = to_add
+        else:
+            self._occupancy_replay_buffer.meta_info = {}
+            combined = DataProto.concat([self._occupancy_replay_buffer, to_add])
+            self._occupancy_replay_buffer = combined[-capacity:] if len(combined) > capacity else combined
+        self._occupancy_replay_buffer.to("cpu")
+
+        effective_ratio = replay_count / max(len(mixed_batch), 1)
+        return mixed_batch, {
+            "occupancy_replay/replay_samples": float(replay_count),
+            "occupancy_replay/effective_ratio": float(effective_ratio),
+            "occupancy_replay/buffer_size_before": float(buffer_size_before),
+            "occupancy_replay/buffer_size": float(len(self._occupancy_replay_buffer)),
+        }
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1145,6 +1238,12 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+
+        # Occupancy replay stores only tokenized student trajectories on CPU.  It
+        # deliberately does not keep model checkpoints or teacher/student logits:
+        # both distributions are recomputed under the current models when a
+        # historical trajectory is replayed.
+        self._occupancy_replay_buffer = None
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1255,6 +1354,14 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Replace a fixed fraction of fresh trajectories with states
+                    # visited by earlier student policies.  The total batch size
+                    # and number of actor updates remain unchanged.  This must run
+                    # before compute_log_prob/compute_rm_score so stale logits are
+                    # never reused.
+                    batch, occupancy_replay_metrics = self._apply_occupancy_replay(batch)
+                    metrics.update(occupancy_replay_metrics)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

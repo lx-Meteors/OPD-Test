@@ -73,7 +73,7 @@ setup_tracking() {
     export WANDB_MODE="${WANDB_MODE:-online}"
     export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/logs/wandb}"
     export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${REPO_ROOT}/.cache/wandb}"
-    export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console]}"
+    export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[console,wandb]}"
 
     mkdir -p "${WANDB_DIR}" "${WANDB_CACHE_DIR}"
 }
@@ -124,6 +124,12 @@ run_opd() {
     export TEST_FREQ="${TEST_FREQ:-20}"
     export SAVE_FREQ="${SAVE_FREQ:-100}"
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
+    export OCCUPANCY_REPLAY_ENABLE="${OCCUPANCY_REPLAY_ENABLE:-False}"
+    export OCCUPANCY_REPLAY_RATIO="${OCCUPANCY_REPLAY_RATIO:-0.2}"
+    export OCCUPANCY_REPLAY_CAPACITY="${OCCUPANCY_REPLAY_CAPACITY:-1024}"
+    export OCCUPANCY_REPLAY_WARMUP_STEPS="${OCCUPANCY_REPLAY_WARMUP_STEPS:-2}"
+    export OCCUPANCY_REPLAY_INSERT_SAMPLES="${OCCUPANCY_REPLAY_INSERT_SAMPLES:-64}"
+    export OCCUPANCY_REPLAY_SEED="${OCCUPANCY_REPLAY_SEED:-2026}"
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
     require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
@@ -184,6 +190,7 @@ run_opd() {
     echo "Eval frequency: ${TEST_FREQ}"
     echo "Save frequency: ${SAVE_FREQ}"
     echo "Total training steps: ${TOTAL_TRAINING_STEPS}"
+    echo "Occupancy replay: ${OCCUPANCY_REPLAY_ENABLE} (ratio=${OCCUPANCY_REPLAY_RATIO}, capacity=${OCCUPANCY_REPLAY_CAPACITY})"
     echo "Thinking override: ${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-<default>}"
     echo "Experiment name: ${experiment_name}"
     echo "Checkpoint dir: ${ckpt_path}"
@@ -194,6 +201,12 @@ run_opd() {
         python -m verl.trainer.main_ppo
         "algorithm.adv_estimator=${ADV_ESTIMATOR}"
         "algorithm.grpo_outcome_weight=${GRPO_OUTCOME_WEIGHT}"
+        "+algorithm.occupancy_replay.enable=${OCCUPANCY_REPLAY_ENABLE}"
+        "+algorithm.occupancy_replay.ratio=${OCCUPANCY_REPLAY_RATIO}"
+        "+algorithm.occupancy_replay.capacity=${OCCUPANCY_REPLAY_CAPACITY}"
+        "+algorithm.occupancy_replay.warmup_steps=${OCCUPANCY_REPLAY_WARMUP_STEPS}"
+        "+algorithm.occupancy_replay.insert_samples=${OCCUPANCY_REPLAY_INSERT_SAMPLES}"
+        "+algorithm.occupancy_replay.seed=${OCCUPANCY_REPLAY_SEED}"
         "data.shuffle=${DATA_SHUFFLE}"
         "data.train_files=${TRAIN_DATASET}"
         "data.val_files=${TEST_DATASET}"
