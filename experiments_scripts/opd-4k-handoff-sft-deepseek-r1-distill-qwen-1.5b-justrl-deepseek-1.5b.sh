@@ -8,8 +8,9 @@ source "${SCRIPT_DIR}/common.sh"
 
 export MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/models}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
-export ACTOR_MODEL_PATH="${ACTOR_MODEL_PATH:-${MODEL_ROOT}/DeepSeek-R1-Distill-Qwen-1.5B}"
-export REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${MODEL_ROOT}/JustRL-DeepSeek-1.5B}"
+export ACTOR_MODEL_PATH="${ACTOR_MODEL_PATH:-${MODEL_ROOT}/Qwen3-4B}"
+export REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${MODEL_ROOT}/Qwen3-4B-Non-Thinking-RL-Math-Step1200}"
+export APPLY_CHAT_TEMPLATE_ENABLE_THINKING="${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-False}"
 
 # Total hybrid response budget. Student generates at most the first 4096
 # response tokens; the teacher may use the remaining budget.
@@ -32,4 +33,4 @@ export HANDOFF_TEACHER_MAX_NUM_BATCHED_TOKENS="${HANDOFF_TEACHER_MAX_NUM_BATCHED
 export HANDOFF_TEACHER_MAX_NUM_SEQS="${HANDOFF_TEACHER_MAX_NUM_SEQS:-64}"
 export HANDOFF_TEACHER_ENFORCE_EAGER="${HANDOFF_TEACHER_ENFORCE_EAGER:-False}"
 
-run_opd "opd-4k-handoff-sft-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b" "$@"
+run_opd "opd-4k-handoff-sft-qwen3-4b-qwen3-4b-nonthinking-step1200" "$@"
