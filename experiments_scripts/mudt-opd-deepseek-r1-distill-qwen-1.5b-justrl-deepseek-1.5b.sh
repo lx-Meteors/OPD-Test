@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # mu-dt OPD: baseline's own force r = -p*(logp - logq~) with the target moved
 # to the mu-detempered teacher,  q~ = q^(1/sqrt(mu)) / Z,
 # mu = KL(q||u)/KL(p||u) = (logK - H(q))/(logK - H(p)),  u uniform on the
@@ -15,7 +14,6 @@
 # class, fork alt-force keep 0.991, equal-budget overshoot 41.4% -> 36.9%.
 
 set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/common.sh"
