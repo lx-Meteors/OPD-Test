@@ -33,4 +33,4 @@ export HANDOFF_TEACHER_MAX_NUM_BATCHED_TOKENS="${HANDOFF_TEACHER_MAX_NUM_BATCHED
 export HANDOFF_TEACHER_MAX_NUM_SEQS="${HANDOFF_TEACHER_MAX_NUM_SEQS:-64}"
 export HANDOFF_TEACHER_ENFORCE_EAGER="${HANDOFF_TEACHER_ENFORCE_EAGER:-False}"
 
-run_opd "opd-4k-handoff-sft-qwen3-4b-qwen3-4b-nonthinking-step1200" "$@"
+run_opd "opd-4k-qwen-sft-handoff-sft-qwen3-4b-qwen3-4b-nonthinking-step1200" "$@"
