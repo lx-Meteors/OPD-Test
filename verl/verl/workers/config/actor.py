@@ -41,6 +41,8 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        only_reverse_kl_advantages (bool): Whether to replace rollout advantages with the G-OPD token signal.
+        lambda_vals (float): G-OPD reward scaling factor. A value of 1.0 recovers standard OPD.
     """
 
     loss_mode: str = "vanilla"
@@ -49,6 +51,8 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    only_reverse_kl_advantages: bool = False
+    lambda_vals: float = 1.0
 
 
 @dataclass

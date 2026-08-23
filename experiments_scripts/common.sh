@@ -106,7 +106,9 @@ run_opd() {
     export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
     export MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-64}"
     export DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
+    export DATA_SEED="${DATA_SEED:-42}"
     export TEMPERATURE="${TEMPERATURE:-1.0}"
+    export TOP_P="${TOP_P:-1.0}"
     export TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-1.0}"
     export REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
     export N_RESPONSES="${N_RESPONSES:-4}"
@@ -119,11 +121,48 @@ run_opd() {
     export IS_PLOT="${IS_PLOT:-False}"
     export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
     export PARALLEL_SIZE="${PARALLEL_SIZE:-1}"
+    export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-$((MINI_BATCH_SIZE * PARALLEL_SIZE))}"
+    export TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-${PARALLEL_SIZE}}"
+    export ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-${PARALLEL_SIZE}}"
+    export ACTOR_LR="${ACTOR_LR:-1e-6}"
+    export LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.0}"
+    export ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-True}"
+    export ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ="${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ:-True}"
+    export REF_LOG_PROB_USE_DYNAMIC_BSZ="${REF_LOG_PROB_USE_DYNAMIC_BSZ:-True}"
+    export ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
+    export REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
+    export TEACHER_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${TEACHER_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-24}"
+    export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
+    export ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-True}"
+    export FSDP_FORWARD_PREFETCH="${FSDP_FORWARD_PREFETCH:-True}"
+    export REFERENCE_PARAM_OFFLOAD="${REFERENCE_PARAM_OFFLOAD:-True}"
+    export TEACHER_PARAM_OFFLOAD="${TEACHER_PARAM_OFFLOAD:-False}"
+    export ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+    export KL_COEF="${KL_COEF:-0.005}"
+    export KL_TYPE="${KL_TYPE:-low_var_kl}"
+    export GOPD_ENABLE="${GOPD_ENABLE:-False}"
+    export GOPD_LAMBDA="${GOPD_LAMBDA:-1.0}"
+    export ROLLOUT_IS="${ROLLOUT_IS:-null}"
+    export ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
+    export ROLLOUT_RS="${ROLLOUT_RS:-null}"
+    export ROLLOUT_BYPASS_OLD_LOGPROB="${ROLLOUT_BYPASS_OLD_LOGPROB:-False}"
     export VAL_TEMPERATURE="${VAL_TEMPERATURE:-1.0}"
     export VAL_TOP_P="${VAL_TOP_P:-0.95}"
+    export VAL_N_RESPONSES="${VAL_N_RESPONSES:-16}"
+    export LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-2}"
     export TEST_FREQ="${TEST_FREQ:-20}"
     export SAVE_FREQ="${SAVE_FREQ:-100}"
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
+    export TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+
+    if [[ "${GOPD_ENABLE}" == "True" ]]; then
+        : "${REFERENCE_MODEL_PATH:?REFERENCE_MODEL_PATH must be set when GOPD_ENABLE=True}"
+        require_model_if_local_path "${REFERENCE_MODEL_PATH}"
+        if [[ "${USE_KL}" != "True" ]]; then
+            echo "G-OPD requires USE_KL=True so the fixed reference worker is instantiated." >&2
+            exit 1
+        fi
+    fi
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
     require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
@@ -155,7 +194,9 @@ run_opd() {
     local max_model_len
     max_model_len=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
     local ppo_max_token_len_per_gpu
-    ppo_max_token_len_per_gpu=$(( ((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) > 32768) ? (MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) : 32768 ))
+    ppo_max_token_len_per_gpu="${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( ((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) > 32768) ? (MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) : 32768 ))}"
+    local rollout_max_num_batched_tokens
+    rollout_max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${ppo_max_token_len_per_gpu}}"
 
     local experiment_name
     experiment_name="${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-${timestamp}"
@@ -177,7 +218,12 @@ run_opd() {
     else
         echo "Teacher: <disabled>"
     fi
+    if [[ "${GOPD_ENABLE}" == "True" ]]; then
+        echo "Reference: ${REFERENCE_MODEL_PATH}"
+        echo "G-OPD lambda: ${GOPD_LAMBDA}"
+    fi
     echo "Train dataset: ${TRAIN_DATASET}"
+    echo "Train batch size: ${TRAIN_BATCH_SIZE}"
     echo "Train shuffle: ${DATA_SHUFFLE}"
     echo "Max response length: ${MAX_RESP_LENGTH}"
     echo "Validation max response length: ${MAX_VAL_RESP_LENGTH}"
@@ -194,10 +240,16 @@ run_opd() {
         python -m verl.trainer.main_ppo
         "algorithm.adv_estimator=${ADV_ESTIMATOR}"
         "algorithm.grpo_outcome_weight=${GRPO_OUTCOME_WEIGHT}"
+        "algorithm.rollout_correction.rollout_is=${ROLLOUT_IS}"
+        "algorithm.rollout_correction.rollout_is_threshold=${ROLLOUT_IS_THRESHOLD}"
+        "algorithm.rollout_correction.rollout_rs=${ROLLOUT_RS}"
+        "algorithm.rollout_correction.bypass_old_logprob_for_rollout=${ROLLOUT_BYPASS_OLD_LOGPROB}"
+        "algorithm.use_kl_in_reward=False"
         "data.shuffle=${DATA_SHUFFLE}"
+        "data.seed=${DATA_SEED}"
         "data.train_files=${TRAIN_DATASET}"
         "data.val_files=${TEST_DATASET}"
-        "data.train_batch_size=$((MINI_BATCH_SIZE * PARALLEL_SIZE))"
+        "data.train_batch_size=${TRAIN_BATCH_SIZE}"
         "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
         "data.max_response_length=${MAX_RESP_LENGTH}"
         "data.filter_overlong_prompts=True"
@@ -205,48 +257,52 @@ run_opd() {
         "data.return_raw_chat=True"
         "actor_rollout_ref.model.path=${ACTOR_MODEL_PATH}"
         "actor_rollout_ref.model.use_remove_padding=True"
-        "actor_rollout_ref.model.enable_activation_offload=True"
+        "actor_rollout_ref.model.enable_activation_offload=${ENABLE_ACTIVATION_OFFLOAD}"
         "actor_rollout_ref.model.enable_gradient_checkpointing=True"
-        "actor_rollout_ref.actor.optim.lr=1e-6"
+        "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}"
+        "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=${LR_WARMUP_STEPS_RATIO}"
         "actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE}"
-        "actor_rollout_ref.actor.use_dynamic_bsz=True"
+        "actor_rollout_ref.actor.use_dynamic_bsz=${ACTOR_USE_DYNAMIC_BSZ}"
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1"
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}"
-        "actor_rollout_ref.actor.ulysses_sequence_parallel_size=${PARALLEL_SIZE}"
+        "actor_rollout_ref.actor.ulysses_sequence_parallel_size=${ULYSSES_SEQUENCE_PARALLEL_SIZE}"
         "actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE}"
+        "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}"
         "actor_rollout_ref.actor.fsdp_config.param_offload=False"
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False"
-        "actor_rollout_ref.actor.fsdp_config.forward_prefetch=True"
+        "actor_rollout_ref.actor.fsdp_config.forward_prefetch=${FSDP_FORWARD_PREFETCH}"
         "actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE}"
-        "actor_rollout_ref.rollout.max_num_batched_tokens=${ppo_max_token_len_per_gpu}"
-        "actor_rollout_ref.ref.fsdp_config.param_offload=True"
+        "actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}"
+        "actor_rollout_ref.ref.fsdp_config.param_offload=${REFERENCE_PARAM_OFFLOAD}"
         "actor_rollout_ref.ref.fsdp_config.model_dtype=${MODEL_DTYPE}"
-        "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True"
+        "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${REF_LOG_PROB_USE_DYNAMIC_BSZ}"
         "actor_rollout_ref.rollout.name=vllm"
         "actor_rollout_ref.rollout.temperature=${TEMPERATURE}"
-        "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
+        "actor_rollout_ref.rollout.top_p=${TOP_P}"
+        "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ}"
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
         "+actor_rollout_ref.rollout.log_prob_top_k=${LOG_PROB_TOP_K}"
         "+actor_rollout_ref.rollout.top_k_strategy=${TOP_K_STRATEGY}"
         "+actor_rollout_ref.rollout.reward_weight_mode=${REWARD_WEIGHT_MODE}"
         "+actor_rollout_ref.rollout.teacher_temperature=${TEACHER_TEMPERATURE}"
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=${PARALLEL_SIZE}"
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.8"
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE}"
+        "actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
         "actor_rollout_ref.rollout.max_model_len=${max_model_len}"
         "actor_rollout_ref.rollout.n=${N_RESPONSES}"
         "actor_rollout_ref.rollout.val_kwargs.do_sample=True"
         "+actor_rollout_ref.rollout.val_kwargs.max_tokens=${MAX_VAL_RESP_LENGTH}"
-        "actor_rollout_ref.rollout.val_kwargs.n=16"
+        "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N_RESPONSES}"
         "actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}"
         "actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}"
         "actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY}"
         "actor_rollout_ref.rollout.calculate_log_probs=True"
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1"
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
         "reward_model.enable=${REWARD_MODEL_ENABLE}"
         "+reward_model.reward_kwargs.enable_format_reward=${ENABLE_FORMAT_REWARD}"
         "custom_reward_function.path=${REPO_ROOT}/verl/verl/utils/reward_score/ttrl_math/__init__.py"
         "custom_reward_function.name=reward_func"
         "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
-        "trainer.log_val_generations=2"
+        "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
         "trainer.logger=${TRACKING_BACKENDS}"
         "trainer.project_name=${PROJECT_NAME}"
         "trainer.experiment_name=${experiment_name}"
@@ -256,7 +312,7 @@ run_opd() {
         "trainer.save_freq=${SAVE_FREQ}"
         "trainer.test_freq=${TEST_FREQ}"
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
-        "trainer.total_epochs=1"
+        "trainer.total_epochs=${TOTAL_EPOCHS}"
         "trainer.default_local_dir=${ckpt_path}"
         "trainer.is_plot=${IS_PLOT}"
     )
@@ -266,17 +322,25 @@ run_opd() {
             "reward_model.model.path=${REWARD_MODEL_PATH}"
             "reward_model.model.input_tokenizer=null"
             "reward_model.model.use_remove_padding=True"
-            "reward_model.model.fsdp_config.param_offload=False"
+            "reward_model.model.fsdp_config.param_offload=${TEACHER_PARAM_OFFLOAD}"
             "+reward_model.model.dtype=${MODEL_DTYPE}"
-            "reward_model.micro_batch_size_per_gpu=24"
+            "reward_model.micro_batch_size_per_gpu=${TEACHER_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
+        )
+    fi
+
+    if [[ "${GOPD_ENABLE}" == "True" ]]; then
+        cmd+=(
+            "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
+            "actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
+            "actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
         )
     fi
 
     if [[ "${USE_KL}" == "True" ]]; then
         cmd+=(
             "actor_rollout_ref.actor.use_kl_loss=True"
-            "actor_rollout_ref.actor.kl_loss_coef=0.005"
-            "actor_rollout_ref.actor.kl_loss_type=low_var_kl"
+            "actor_rollout_ref.actor.kl_loss_coef=${KL_COEF}"
+            "actor_rollout_ref.actor.kl_loss_type=${KL_TYPE}"
         )
     else
         cmd+=("actor_rollout_ref.actor.use_kl_loss=False")

@@ -761,6 +761,12 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if self.config.policy_loss.only_reverse_kl_advantages:
+            for key in ("ref_log_prob", "teacher_log_probs"):
+                if key not in data.batch:
+                    raise ValueError(f"G-OPD requires '{key}' in the actor batch")
+                if key not in select_keys:
+                    select_keys.append(key)
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -888,6 +894,22 @@ class DataParallelPPOActor(BasePPOActor):
                                     old_log_prob = model_inputs["old_log_probs"]
                             else:
                                 old_log_prob = model_inputs["old_log_probs"]
+
+                    if self.config.policy_loss.only_reverse_kl_advantages:
+                        lambda_value = self.config.policy_loss.lambda_vals
+                        ref_log_prob = model_inputs["ref_log_prob"]
+                        teacher_log_prob = model_inputs["teacher_log_probs"]
+                        with torch.no_grad():
+                            # G-OPD cost: (log S - log R) - lambda * (log T - log R).
+                            # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
+                            reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
+                                teacher_log_prob - ref_log_prob
+                            )
+                            advantages = -reverse_kl
+                        micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
+                        micro_batch_metrics["actor/gopd_adv_mean"] = (
+                            verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
+                        )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

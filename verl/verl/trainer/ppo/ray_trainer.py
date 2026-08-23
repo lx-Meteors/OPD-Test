@@ -2549,7 +2549,6 @@ class RayPPOTrainer:
                     # Pop unused keys to save memory before PPO update
                     keys_to_pop = [
                         "teacher_on_student_log_probs",
-                        "teacher_log_probs",
                         "teacher_top_k_ids",
                         "teacher_top_k_log_probs",
                         "teacher_entropy",
@@ -2557,6 +2556,8 @@ class RayPPOTrainer:
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
                     ]
+                    if not self.config.actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages:
+                        keys_to_pop.append("teacher_log_probs")
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
                             batch.batch.pop(key)
