@@ -2550,6 +2550,125 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         return DataProto.from_dict(rm_inputs)
 
+    def _teacher_forward_batch(self, batch_td, top_k, strategy, teacher_temperature, compute_entropy):
+        """Micro-batch and run the teacher over one homogeneous batch.
+
+        Returns the same 8-tuple as ``_forward_micro_batch``, concatenated over
+        micro batches and restored to the incoming row order.
+        """
+        import itertools
+
+        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+
+        if self.config.use_dynamic_bsz:
+            max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+            micro_batches, indices = rearrange_micro_batches(batch=batch_td, max_token_len=max_token_len)
+        else:
+            micro_batches = batch_td.split(self.config.micro_batch_size_per_gpu)
+            indices = None
+
+        collected = [[] for _ in range(8)]
+        for micro_batch in micro_batches:
+            if hasattr(micro_batch, "batch") and isinstance(micro_batch.batch, TensorDict):
+                mb_top_k_ids = micro_batch.batch.get("student_top_k_ids", None)
+            elif isinstance(micro_batch, TensorDict):
+                mb_top_k_ids = micro_batch.get("student_top_k_ids", None)
+            else:
+                mb_top_k_ids = micro_batch.get("student_top_k_ids", None) if hasattr(micro_batch, "get") else None
+
+            outs = self._forward_micro_batch(
+                micro_batch,
+                student_top_k_ids=mb_top_k_ids,
+                compute_entropy=compute_entropy,
+                top_k=top_k,
+                strategy=strategy,
+                teacher_temperature=teacher_temperature,
+            )
+            for slot, val in zip(collected, outs):
+                if val is not None:
+                    slot.append(val)
+
+        merged = [torch.cat(s, dim=0) if len(s) > 0 else None for s in collected]
+        if indices is not None:
+            flat = list(itertools.chain.from_iterable(indices))
+            assert len(flat) == merged[0].size(0), f"{len(flat)} vs. {merged[0].size(0)}"
+            revert_indices = torch.tensor(get_reverse_idx(flat), dtype=torch.long, device=merged[0].device)
+            merged = [m[revert_indices] if m is not None else None for m in merged]
+        return tuple(merged)
+
+    def _teacher_forward_windowed(
+        self, batch_td, top_k, strategy, teacher_temperature, compute_entropy, window, segment
+    ):
+        """Run the teacher on a truncated view of the student prefix.
+
+        For a response segment starting at ``s`` the teacher conditions on
+
+            [prompt] + response[max(0, s - window) : s] + response[s : s + segment]
+
+        with position ids restarted from zero, and the read-out is kept only for
+        the segment. The student's trajectory is never modified -- the student
+        still generates and scores under the full context; only the teacher's
+        conditioning is truncated. Positions with depth <= ``window`` keep the
+        whole prefix, so shallow positions are bit-exact with the plain path.
+
+        Because the context is amortized over a whole segment, every position
+        sees at least ``window`` tokens of prefix and the last position of a
+        segment sees up to ``window + segment``. The slack is on the safe side
+        (more context, closer to the untruncated teacher).
+        """
+        from verl.utils.model import compute_position_id_with_mask
+
+        responses = batch_td["responses"]
+        input_ids = batch_td["input_ids"]
+        attn = batch_td["attention_mask"]
+        bsz, resp_len = responses.shape
+        prompt_len = input_ids.size(1) - resp_len
+        prompt_ids, prompt_mask = input_ids[:, :prompt_len], attn[:, :prompt_len]
+        resp_mask = attn[:, prompt_len:]
+        stu_ids = batch_td.get("student_top_k_ids", None)
+        segment = resp_len if segment is None or segment <= 0 else segment
+
+        # The first `window` positions need the full prefix anyway, so take them
+        # in a single pass instead of splitting them into windowless segments.
+        spans, cur = [], min(window, resp_len)
+        if cur > 0:
+            spans.append((0, cur))
+        while cur < resp_len:
+            spans.append((cur, min(cur + segment, resp_len)))
+            cur += segment
+
+        out = [None] * 8
+        for start, end in spans:
+            keep = resp_mask[:, start].bool()
+            if not bool(keep.any()):
+                continue
+            rows = keep.nonzero(as_tuple=True)[0]
+            ctx_start = max(0, start - window)
+            seg = {
+                "input_ids": torch.cat([prompt_ids[rows], responses[rows, ctx_start:end]], dim=1),
+                "attention_mask": torch.cat([prompt_mask[rows], resp_mask[rows, ctx_start:end]], dim=1),
+                "responses": responses[rows, start:end],
+            }
+            seg["position_ids"] = compute_position_id_with_mask(seg["attention_mask"])
+            if stu_ids is not None:
+                seg["student_top_k_ids"] = stu_ids[rows, start:end]
+            res = self._teacher_forward_batch(
+                TensorDict(seg, batch_size=rows.numel()),
+                top_k,
+                strategy,
+                teacher_temperature,
+                compute_entropy,
+            )
+            for i, v in enumerate(res):
+                if v is None:
+                    continue
+                if out[i] is None:
+                    out[i] = torch.zeros(
+                        (bsz, resp_len) + tuple(v.shape[2:]), dtype=v.dtype, device=v.device
+                    )
+                out[i][rows, start:end] = v
+        return tuple(out)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
     def compute_rm_score(self, data: DataProto, kl_estimator="k1"):
@@ -2600,114 +2719,40 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         # perform forward computation
         with self.ulysses_sharding_manager:
-            use_dynamic_bsz = self.config.use_dynamic_bsz
-            if use_dynamic_bsz:
-                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
-            else:
-                micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+            ctx_window = data.meta_info.get("teacher_ctx_window", self.config.get("teacher_ctx_window", 0))
+            ctx_segment = data.meta_info.get("teacher_ctx_segment", self.config.get("teacher_ctx_segment", 2048))
             
             # Get Top-K and Top-P from config
             top_k = data.meta_info.get("log_prob_top_k", self.config.get("log_prob_top_k", 0))
             top_k_strategy = data.meta_info.get("top_k_strategy", self.config.get("top_k_strategy", "only_stu"))
             teacher_temperature = data.meta_info.get("teacher_temperature", self.config.get("teacher_temperature", 1.0))
             
-            output_logp = []
-            output_on_student_logp = []
-            output_teacher_top_k_ids = []
-            output_teacher_top_k_logp = []
-            output_entropy = []
-            output_valid_counts = []
-            output_overlap_counts = []
-            output_teacher_in_student = []  # For union strategy: T_in_S computed in chunks
-            
-            for micro_batch in micro_batches:
-                # micro_batch is a DataProto or DataProtoItem.
-                # If it's a DataProto, it has .batch (TensorDict).
-                # If it's a TensorDict (from .split()), it behaves like a dict.
-                
-                # Check if micro_batch is a DataProto or DataProtoItem
-                if hasattr(micro_batch, 'batch') and isinstance(micro_batch.batch, TensorDict):
-                    mb_top_k_ids = micro_batch.batch.get("student_top_k_ids", None)
-                elif isinstance(micro_batch, TensorDict):
-                    # Direct TensorDict
-                    mb_top_k_ids = micro_batch.get("student_top_k_ids", None)
-                else:
-                    # Fallback for other types (e.g. dict) if split behaves differently
-                    mb_top_k_ids = micro_batch.get("student_top_k_ids", None) if hasattr(micro_batch, "get") else None
-
-                teacher_logp_batch, teacher_on_student_logp_batch, teacher_top_k_ids_batch, teacher_top_k_logp_teacher_batch, teacher_entropy_batch, teacher_valid_counts_batch, teacher_overlap_mask_batch, teacher_in_student_mask_batch = self._forward_micro_batch(
-                    micro_batch, 
-                    student_top_k_ids=mb_top_k_ids,
-                    compute_entropy=compute_entropy,
-                    top_k=top_k,
-                    strategy=top_k_strategy,
-                    teacher_temperature=teacher_temperature
+            if ctx_window and ctx_window > 0:
+                if self.rank == 0:
+                    print(f"Teacher context window ENABLED: last {ctx_window} tokens, segment {ctx_segment}")
+                forward_out = self._teacher_forward_windowed(
+                    rm_data.batch,
+                    top_k,
+                    top_k_strategy,
+                    teacher_temperature,
+                    compute_entropy,
+                    ctx_window,
+                    ctx_segment,
                 )
-                output_logp.append(teacher_logp_batch)
-                if teacher_on_student_logp_batch is not None:
-                    output_on_student_logp.append(teacher_on_student_logp_batch)
-                if teacher_top_k_ids_batch is not None:
-                    output_teacher_top_k_ids.append(teacher_top_k_ids_batch)
-                if teacher_top_k_logp_teacher_batch is not None:
-                    output_teacher_top_k_logp.append(teacher_top_k_logp_teacher_batch)
-                if teacher_entropy_batch is not None:
-                    output_entropy.append(teacher_entropy_batch)
-                if teacher_valid_counts_batch is not None:
-                    output_valid_counts.append(teacher_valid_counts_batch)
-                if teacher_overlap_mask_batch is not None:
-                    output_overlap_counts.append(teacher_overlap_mask_batch)
-                if teacher_in_student_mask_batch is not None:
-                    output_teacher_in_student.append(teacher_in_student_mask_batch)
-                    
-            teacher_logp = torch.cat(output_logp, dim=0)
-            teacher_on_student_logp = None
-            if len(output_on_student_logp) > 0:
-                teacher_on_student_logp = torch.cat(output_on_student_logp, dim=0)
-            
-            teacher_top_k_ids = None
-            if len(output_teacher_top_k_ids) > 0:
-                teacher_top_k_ids = torch.cat(output_teacher_top_k_ids, dim=0)
-
-            teacher_top_k_logp = None
-            if len(output_teacher_top_k_logp) > 0:
-                teacher_top_k_logp = torch.cat(output_teacher_top_k_logp, dim=0)
-            
-            teacher_entropy = None
-            if len(output_entropy) > 0:
-                teacher_entropy = torch.cat(output_entropy, dim=0)
-
-            teacher_valid_counts = None
-            if len(output_valid_counts) > 0:
-                teacher_valid_counts = torch.cat(output_valid_counts, dim=0)
-
-            teacher_overlap_mask = None
-            if len(output_overlap_counts) > 0:
-                teacher_overlap_mask = torch.cat(output_overlap_counts, dim=0)
-
-            teacher_in_student_mask = None
-            if len(output_teacher_in_student) > 0:
-                teacher_in_student_mask = torch.cat(output_teacher_in_student, dim=0)
-
-            if use_dynamic_bsz:
-                indices = list(itertools.chain.from_iterable(indices))
-                assert len(indices) == teacher_logp.size(0), f"{len(indices)} vs. {teacher_logp.size(0)}"
-                revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long, device=teacher_logp.device)
-                teacher_logp = teacher_logp[revert_indices]
-                if teacher_on_student_logp is not None:
-                    teacher_on_student_logp = teacher_on_student_logp[revert_indices]
-                if teacher_top_k_ids is not None:
-                    teacher_top_k_ids = teacher_top_k_ids[revert_indices]
-                if teacher_top_k_logp is not None:
-                    teacher_top_k_logp = teacher_top_k_logp[revert_indices]
-                if teacher_entropy is not None:
-                    teacher_entropy = teacher_entropy[revert_indices]
-                if teacher_valid_counts is not None:
-                    teacher_valid_counts = teacher_valid_counts[revert_indices]
-                if teacher_overlap_mask is not None:
-                    teacher_overlap_mask = teacher_overlap_mask[revert_indices]
-                if teacher_in_student_mask is not None:
-                    teacher_in_student_mask = teacher_in_student_mask[revert_indices]
+            else:
+                forward_out = self._teacher_forward_batch(
+                    rm_data.batch, top_k, top_k_strategy, teacher_temperature, compute_entropy
+                )
+            (
+                teacher_logp,
+                teacher_on_student_logp,
+                teacher_top_k_ids,
+                teacher_top_k_logp,
+                teacher_entropy,
+                teacher_valid_counts,
+                teacher_overlap_mask,
+                teacher_in_student_mask,
+            ) = forward_out
 
             if top_k > 0:
                 # Reward calculation is moved to ray_trainer for top_k > 0

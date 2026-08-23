@@ -143,6 +143,15 @@ class RolloutConfig(BaseConfig):
     top_k_strategy: str = "only_stu"  # "only_stu", "only_tch", "intersection", or "union"
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", "none", "tri" (signed triangular discrimination), "rkl_dt" (RKL vs entropy-detempered teacher), "rkl_cdt" (RKL vs contrast-detempered teacher: log q~ = log_softmax(sigma_p * z(logq)); closed form, two-sided, no bisection), "rkl_sdt" (rKL at entropy-matched student point, 1/mu Jacobian gain), "rkl_sdtw" (baseline rKL field reweighted by entropy-matched p~, two-sided, clamp-free), "fq" (fiber quotient by z-score matching: r = z(logq) - z(logp); distills structure modulo temperature, closed form, no bisection), "fkl" (forward-KL transport r = q - p, exact logit gradient of -KL(q||p); zero-sum, |r|<=1, convex in student logits, lesion triage embedded in the mass difference), or "mu_dt" (baseline RKL vs the mu-detempered teacher q~ = q^(1/sqrt(mu)), mu = KL(q||u)/KL(p||u) = (logK-H(q))/(logK-H(p)); closed-form knowledge-radius match, two-sided, clamp-free, hyperparameter-free, reduces to baseline at H(p)=H(q))
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
+    # Truncate the teacher's view of the student prefix to [prompt] + last N response
+    # tokens, with position ids restarted from zero. 0 disables (teacher sees the full
+    # prefix). The student trajectory is unaffected; only the teacher's conditioning
+    # changes. Off-policy prefixes inflate the teacher's entropy monotonically with
+    # their length, so a bounded window keeps the teacher near the manifold it was
+    # trained on. 4096 measured best; windows below ~1024 make the teacher confidently
+    # misaligned instead.
+    teacher_ctx_window: int = 0
+    teacher_ctx_segment: int = 2048  # read-out chunk size for the windowed teacher pass
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
