@@ -240,10 +240,10 @@ run_opd() {
         python -m verl.trainer.main_ppo
         "algorithm.adv_estimator=${ADV_ESTIMATOR}"
         "algorithm.grpo_outcome_weight=${GRPO_OUTCOME_WEIGHT}"
-        "algorithm.rollout_correction.rollout_is=${ROLLOUT_IS}"
-        "algorithm.rollout_correction.rollout_is_threshold=${ROLLOUT_IS_THRESHOLD}"
-        "algorithm.rollout_correction.rollout_rs=${ROLLOUT_RS}"
-        "algorithm.rollout_correction.bypass_old_logprob_for_rollout=${ROLLOUT_BYPASS_OLD_LOGPROB}"
+        "++algorithm.rollout_correction.rollout_is=${ROLLOUT_IS}"
+        "++algorithm.rollout_correction.rollout_is_threshold=${ROLLOUT_IS_THRESHOLD}"
+        "++algorithm.rollout_correction.rollout_rs=${ROLLOUT_RS}"
+        "++algorithm.rollout_correction.bypass_old_logprob_for_rollout=${ROLLOUT_BYPASS_OLD_LOGPROB}"
         "algorithm.use_kl_in_reward=False"
         "data.shuffle=${DATA_SHUFFLE}"
         "data.seed=${DATA_SEED}"
@@ -331,8 +331,8 @@ run_opd() {
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         cmd+=(
             "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
-            "actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
-            "actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
+            "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
+            "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
         )
     fi
 
