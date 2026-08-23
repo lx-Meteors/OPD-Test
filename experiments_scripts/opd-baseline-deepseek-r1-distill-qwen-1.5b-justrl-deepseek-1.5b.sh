@@ -13,4 +13,4 @@ export REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${MODEL_ROOT}/JustRL-DeepSeek-1.5
 export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
 
-run_opd "opd-baseline-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b" "$@"
+run_opd "opd-baseline-deepseek-1.5" "$@"
