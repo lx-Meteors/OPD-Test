@@ -52,6 +52,79 @@ require_model_if_local_path() {
     fi
 }
 
+is_hf_model_dir() {
+    local path="$1"
+    [[ -f "${path}/config.json" ]] || return 1
+    compgen -G "${path}/*.safetensors" >/dev/null \
+        || compgen -G "${path}/pytorch_model*.bin" >/dev/null
+}
+
+resolve_teacher_checkpoint() {
+    local requested_path="${TEACHER_CHECKPOINT_PATH:-}"
+    if [[ -z "${requested_path}" ]]; then
+        return 0
+    fi
+
+    requested_path="$(resolve_path "${requested_path}")"
+    require_path "${requested_path}"
+
+    if is_hf_model_dir "${requested_path}"; then
+        export REWARD_MODEL_PATH="${requested_path}"
+        export REWARD_MODEL_LABEL="${REWARD_MODEL_LABEL:-opd-student-$(basename "${requested_path%/}")}"
+        echo "Teacher checkpoint is already a HuggingFace model: ${REWARD_MODEL_PATH}"
+        return 0
+    fi
+
+    local actor_checkpoint_dir
+    local global_step_dir
+    if [[ -d "${requested_path}/actor" ]]; then
+        global_step_dir="${requested_path}"
+        actor_checkpoint_dir="${requested_path}/actor"
+    elif [[ "$(basename "${requested_path%/}")" == "actor" ]]; then
+        actor_checkpoint_dir="${requested_path}"
+        global_step_dir="$(dirname "${requested_path}")"
+    else
+        echo "TEACHER_CHECKPOINT_PATH must point to a merged HuggingFace model, global_step_N, or global_step_N/actor: ${requested_path}" >&2
+        exit 1
+    fi
+
+    if [[ ! "$(basename "${global_step_dir%/}")" =~ ^global_step_[0-9]+$ ]]; then
+        echo "Cannot identify global step from Teacher checkpoint: ${global_step_dir}" >&2
+        exit 1
+    fi
+
+    if is_hf_model_dir "${actor_checkpoint_dir}/huggingface"; then
+        export REWARD_MODEL_PATH="${actor_checkpoint_dir}/huggingface"
+        export REWARD_MODEL_LABEL="${REWARD_MODEL_LABEL:-opd-student-$(basename "${global_step_dir}")}"
+        echo "Using HuggingFace Teacher weights saved inside checkpoint: ${REWARD_MODEL_PATH}"
+        return 0
+    fi
+
+    local merged_model_path="${TEACHER_MERGED_MODEL_PATH:-${global_step_dir}/merged_hf_model}"
+    merged_model_path="$(resolve_path "${merged_model_path}")"
+    if ! is_hf_model_dir "${merged_model_path}"; then
+        local checkpoint_backend="${TEACHER_CHECKPOINT_BACKEND:-fsdp}"
+        echo "Merging ${checkpoint_backend} Teacher checkpoint into HuggingFace format:"
+        echo "  source: ${actor_checkpoint_dir}"
+        echo "  target: ${merged_model_path}"
+        PYTHONPATH="${REPO_ROOT}/verl${PYTHONPATH:+:${PYTHONPATH}}" \
+            python -m verl.model_merger merge \
+            --backend "${checkpoint_backend}" \
+            --local_dir "${actor_checkpoint_dir}" \
+            --target_dir "${merged_model_path}"
+    else
+        echo "Reusing merged Teacher checkpoint: ${merged_model_path}"
+    fi
+
+    if ! is_hf_model_dir "${merged_model_path}"; then
+        echo "Merged Teacher model is incomplete or not HuggingFace-loadable: ${merged_model_path}" >&2
+        exit 1
+    fi
+
+    export REWARD_MODEL_PATH="${merged_model_path}"
+    export REWARD_MODEL_LABEL="${REWARD_MODEL_LABEL:-opd-student-$(basename "${global_step_dir}")}"
+}
+
 setup_logging() {
     local experiment_name="$1"
     local log_dir="${LOG_DIR:-${REPO_ROOT}/logs/opd}"
@@ -87,6 +160,10 @@ run_opd() {
 
     : "${ACTOR_MODEL_PATH:?ACTOR_MODEL_PATH must be set}"
     export REWARD_MODEL_ENABLE="${REWARD_MODEL_ENABLE:-True}"
+
+    if [[ "${REWARD_MODEL_ENABLE}" == "True" ]]; then
+        resolve_teacher_checkpoint
+    fi
 
     require_model_if_local_path "${ACTOR_MODEL_PATH}"
     if [[ "${REWARD_MODEL_ENABLE}" == "True" ]]; then
@@ -148,7 +225,7 @@ run_opd() {
     local reward_model_name
     reward_model_name="reward_disabled"
     if [[ "${REWARD_MODEL_ENABLE}" == "True" ]]; then
-        reward_model_name="$(basename "${REWARD_MODEL_PATH%/}")"
+        reward_model_name="${REWARD_MODEL_LABEL:-$(basename "${REWARD_MODEL_PATH%/}")}"
     fi
     local timestamp
     timestamp="$(date +%Y-%m-%d_%H-%M-%S)"
@@ -187,6 +264,10 @@ run_opd() {
     echo "Thinking override: ${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-<default>}"
     echo "Experiment name: ${experiment_name}"
     echo "Checkpoint dir: ${ckpt_path}"
+    if [[ -n "${TEACHER_CHECKPOINT_PATH:-}" ]]; then
+        echo "Teacher source checkpoint: ${TEACHER_CHECKPOINT_PATH}"
+        echo "Teacher loadable model: ${REWARD_MODEL_PATH}"
+    fi
     echo "Tracking backends: ${TRACKING_BACKENDS}"
     echo "W&B dir: ${WANDB_DIR}"
 
