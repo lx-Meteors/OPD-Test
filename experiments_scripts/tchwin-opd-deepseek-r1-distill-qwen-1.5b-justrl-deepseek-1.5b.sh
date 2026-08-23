@@ -21,8 +21,13 @@
 # Windows below ~1024 make the teacher confidently misaligned instead (at 256:
 # entropy falls but overlap drops to 59.9% and KL(p||q) does not improve), so
 # 4096 is the operating point and shallow positions are never truncated.
-# Costs ~2-2.5x teacher forward: the linear layers scale with the extra tokens
-# while the quadratic attention term actually shrinks under chunking.
+#
+# The window is amortized over a read-out chunk, so a position sees between 4096
+# and 8191 tokens of prefix rather than exactly 4096; pinning it exactly would
+# need one forward per position, 2797x the plain teacher pass. As implemented it
+# costs ~1.7x in tokens and ~1.0x in attention, since the quadratic term shrinks
+# under chunking. The slack is on the safe side -- more context, i.e. closer to
+# the untruncated teacher.
 #
 # Note this cannot be done with sliding-window attention in a single pass. Over
 # 28 layers a banded mask has a receptive field of 28*(W-1), so the prefix still
