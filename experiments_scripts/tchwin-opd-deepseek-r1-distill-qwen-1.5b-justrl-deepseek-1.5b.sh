@@ -23,6 +23,11 @@
 # 4096 is the operating point and shallow positions are never truncated.
 # Costs ~2-2.5x teacher forward: the linear layers scale with the extra tokens
 # while the quadratic attention term actually shrinks under chunking.
+#
+# Note this cannot be done with sliding-window attention in a single pass. Over
+# 28 layers a banded mask has a receptive field of 28*(W-1), so the prefix still
+# reaches the read-out; measured at W=4096 it moves KL(p||q) the wrong way,
+# 0.778 -> 1.049. Re-encoding a truncated context is what produces the effect.
 
 set -euo pipefail
 
@@ -38,6 +43,5 @@ export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-12288}"
 export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
 export REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
 export TEACHER_CTX_WINDOW="${TEACHER_CTX_WINDOW:-4096}"
-export TEACHER_CTX_SEGMENT="${TEACHER_CTX_SEGMENT:-2048}"
 
 run_opd "tchwin-opd-deepseek-r1-distill-qwen-1.5b-justrl-deepseek-1.5b" "$@"

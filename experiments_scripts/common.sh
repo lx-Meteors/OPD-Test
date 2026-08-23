@@ -115,7 +115,6 @@ run_opd() {
     export REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
     # 0 = teacher sees the full student prefix (baseline)
     export TEACHER_CTX_WINDOW="${TEACHER_CTX_WINDOW:-0}"
-    export TEACHER_CTX_SEGMENT="${TEACHER_CTX_SEGMENT:-2048}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
     export MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
@@ -233,7 +232,6 @@ run_opd() {
         "+actor_rollout_ref.rollout.reward_weight_mode=${REWARD_WEIGHT_MODE}"
         "+actor_rollout_ref.rollout.teacher_temperature=${TEACHER_TEMPERATURE}"
         "+actor_rollout_ref.rollout.teacher_ctx_window=${TEACHER_CTX_WINDOW}"
-        "+actor_rollout_ref.rollout.teacher_ctx_segment=${TEACHER_CTX_SEGMENT}"
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${PARALLEL_SIZE}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.8"
         "actor_rollout_ref.rollout.max_model_len=${max_model_len}"

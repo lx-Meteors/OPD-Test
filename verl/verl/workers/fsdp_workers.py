@@ -2596,8 +2596,15 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             merged = [m[revert_indices] if m is not None else None for m in merged]
         return tuple(merged)
 
+    # Read-out chunk size for the windowed teacher pass. Not a modelling knob:
+    # a smaller value pins the effective window closer to exactly `window` but
+    # costs more passes, a larger one is cheaper but lets the window drift up
+    # toward the untruncated prefix. It cannot be eliminated -- see
+    # _teacher_forward_windowed for why one pass cannot do this.
+    _TEACHER_CTX_SEGMENT = 2048
+
     def _teacher_forward_windowed(
-        self, batch_td, top_k, strategy, teacher_temperature, compute_entropy, window, segment
+        self, batch_td, top_k, strategy, teacher_temperature, compute_entropy, window
     ):
         """Run the teacher on a truncated view of the student prefix.
 
@@ -2611,9 +2618,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         conditioning is truncated. Positions with depth <= ``window`` keep the
         whole prefix, so shallow positions are bit-exact with the plain path.
 
-        Because the context is amortized over a whole segment, every position
-        sees at least ``window`` tokens of prefix and the last position of a
-        segment sees up to ``window + segment``. The slack is on the safe side
+        This has to re-encode rather than mask, and therefore has to chunk.
+        Masking the middle of a single fixed context is exactly equivalent to
+        deleting it (verified: KL between the two is ~1e-4 nats), but a
+        per-position band in one pass is a different operation entirely: over L
+        layers a banded mask has a receptive field of L*(window-1), so far-back
+        tokens still reach the read-out through the layer stack. Measured at
+        window 4096 and depth >= 8192, banded attention moves KL(p||q) the wrong
+        way, 0.778 -> 1.049, while re-encoding gives 0.742 -> 0.312.
+
+        Because the context is amortized over a chunk, every position sees at
+        least ``window`` tokens of prefix and the last position of a chunk sees
+        up to ``window + _TEACHER_CTX_SEGMENT``. The slack is on the safe side
         (more context, closer to the untruncated teacher).
         """
         from verl.utils.model import compute_position_id_with_mask
@@ -2626,7 +2642,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         prompt_ids, prompt_mask = input_ids[:, :prompt_len], attn[:, :prompt_len]
         resp_mask = attn[:, prompt_len:]
         stu_ids = batch_td.get("student_top_k_ids", None)
-        segment = resp_len if segment is None or segment <= 0 else segment
+        segment = min(self._TEACHER_CTX_SEGMENT, resp_len)
 
         # The first `window` positions need the full prefix anyway, so take them
         # in a single pass instead of splitting them into windowless segments.
@@ -2720,7 +2736,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # perform forward computation
         with self.ulysses_sharding_manager:
             ctx_window = data.meta_info.get("teacher_ctx_window", self.config.get("teacher_ctx_window", 0))
-            ctx_segment = data.meta_info.get("teacher_ctx_segment", self.config.get("teacher_ctx_segment", 2048))
             
             # Get Top-K and Top-P from config
             top_k = data.meta_info.get("log_prob_top_k", self.config.get("log_prob_top_k", 0))
@@ -2729,7 +2744,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             
             if ctx_window and ctx_window > 0:
                 if self.rank == 0:
-                    print(f"Teacher context window ENABLED: last {ctx_window} tokens, segment {ctx_segment}")
+                    print(f"Teacher context window ENABLED: prompt + last {ctx_window} response tokens")
                 forward_out = self._teacher_forward_windowed(
                     rm_data.batch,
                     top_k,
@@ -2737,7 +2752,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     teacher_temperature,
                     compute_entropy,
                     ctx_window,
-                    ctx_segment,
                 )
             else:
                 forward_out = self._teacher_forward_batch(

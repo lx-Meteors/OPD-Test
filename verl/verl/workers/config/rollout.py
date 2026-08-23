@@ -151,7 +151,6 @@ class RolloutConfig(BaseConfig):
     # trained on. 4096 measured best; windows below ~1024 make the teacher confidently
     # misaligned instead.
     teacher_ctx_window: int = 0
-    teacher_ctx_segment: int = 2048  # read-out chunk size for the windowed teacher pass
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
