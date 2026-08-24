@@ -10,6 +10,79 @@ export MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/models}"
 export DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/datasets}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 
+has_huggingface_model_weights() {
+    local model_dir="$1"
+    [[ -f "${model_dir}/config.json" ]] || return 1
+    compgen -G "${model_dir}/*.safetensors" >/dev/null \
+        || compgen -G "${model_dir}/pytorch_model*.bin" >/dev/null
+}
+
+resolve_reference_checkpoint() {
+    local checkpoint_path="$1"
+    local resolved_path
+    resolved_path="$(resolve_path "${checkpoint_path}")"
+
+    if [[ ! -d "${resolved_path}" ]]; then
+        echo "Reference checkpoint directory does not exist: ${resolved_path}" >&2
+        exit 1
+    fi
+
+    # Accept a directly loadable Hugging Face model directory.
+    if has_huggingface_model_weights "${resolved_path}"; then
+        RESOLVED_REFERENCE_MODEL_PATH="${resolved_path}"
+        return
+    fi
+
+    # Accept either global_step_*/actor/huggingface or actor/huggingface when it contains merged weights.
+    local actor_dir="${resolved_path}"
+    if [[ -d "${resolved_path}/actor" ]]; then
+        actor_dir="${resolved_path}/actor"
+    fi
+    if has_huggingface_model_weights "${actor_dir}/huggingface"; then
+        RESOLVED_REFERENCE_MODEL_PATH="${actor_dir}/huggingface"
+        return
+    fi
+    if has_huggingface_model_weights "${actor_dir}/merged_huggingface"; then
+        RESOLVED_REFERENCE_MODEL_PATH="${actor_dir}/merged_huggingface"
+        return
+    fi
+
+    # Raw VERL checkpoints are sharded and cannot be passed directly to from_pretrained.
+    # Merge them once and reuse the resulting Hugging Face directory on later launches.
+    local backend=""
+    if [[ -f "${actor_dir}/fsdp_config.json" ]]; then
+        backend="fsdp"
+    elif [[ -d "${actor_dir}/dist_ckpt" ]]; then
+        backend="megatron"
+    fi
+
+    if [[ -z "${backend}" ]]; then
+        echo "Unsupported Reference checkpoint layout: ${resolved_path}" >&2
+        echo "Expected a Hugging Face model directory, global_step_*/actor, or a raw VERL actor checkpoint." >&2
+        exit 1
+    fi
+    if [[ "${AUTO_MERGE_REFERENCE_CHECKPOINT:-True}" != "True" ]]; then
+        echo "Reference checkpoint is a raw ${backend} checkpoint and must be merged first: ${actor_dir}" >&2
+        echo "Set AUTO_MERGE_REFERENCE_CHECKPOINT=True or provide its merged Hugging Face directory." >&2
+        exit 1
+    fi
+
+    local merged_dir="${actor_dir}/merged_huggingface"
+    echo "Merging ${backend} Reference checkpoint into Hugging Face format: ${merged_dir}"
+    activate_opd_env
+    PYTHONPATH="${REPO_ROOT}/verl${PYTHONPATH:+:${PYTHONPATH}}" \
+        python -m verl.model_merger merge \
+        --backend "${backend}" \
+        --local_dir "${actor_dir}" \
+        --target_dir "${merged_dir}"
+
+    if ! has_huggingface_model_weights "${merged_dir}"; then
+        echo "Reference checkpoint merge completed without loadable model weights: ${merged_dir}" >&2
+        exit 1
+    fi
+    RESOLVED_REFERENCE_MODEL_PATH="${merged_dir}"
+}
+
 # G-OPD paper main setting: the original non-thinking model is both Student initialization and fixed Reference.
 if [[ -z "${ACTOR_MODEL_PATH:-}" ]]; then
     if [[ -d "${MODEL_ROOT}/Qwen3-4B" ]]; then
@@ -18,7 +91,18 @@ if [[ -z "${ACTOR_MODEL_PATH:-}" ]]; then
         export ACTOR_MODEL_PATH="Qwen/Qwen3-4B"
     fi
 fi
-export REFERENCE_MODEL_PATH="${REFERENCE_MODEL_PATH:-${ACTOR_MODEL_PATH}}"
+
+# Optional: point this at a merged HF checkpoint, global_step_* directory, or its actor directory.
+# Example: /path/to/checkpoint/global_step_50
+export REFERENCE_CHECKPOINT_PATH="${REFERENCE_CHECKPOINT_PATH:-}"
+export AUTO_MERGE_REFERENCE_CHECKPOINT="${AUTO_MERGE_REFERENCE_CHECKPOINT:-True}"
+if [[ -n "${REFERENCE_CHECKPOINT_PATH}" ]]; then
+    RESOLVED_REFERENCE_MODEL_PATH=""
+    resolve_reference_checkpoint "${REFERENCE_CHECKPOINT_PATH}"
+    export REFERENCE_MODEL_PATH="${RESOLVED_REFERENCE_MODEL_PATH}"
+else
+    export REFERENCE_MODEL_PATH="${REFERENCE_MODEL_PATH:-${ACTOR_MODEL_PATH}}"
+fi
 if [[ -z "${REWARD_MODEL_PATH:-}" ]]; then
     if [[ -d "${MODEL_ROOT}/Qwen3-4B-Non-Thinking-RL-Math-Step500" ]]; then
         export REWARD_MODEL_PATH="${MODEL_ROOT}/Qwen3-4B-Non-Thinking-RL-Math-Step500"
@@ -68,7 +152,9 @@ export ACTOR_LR="${ACTOR_LR:-1e-5}"
 export LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.0}"
 export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
 export ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
-export MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
+export MODEL_DTYPE="${MODEL_DTYPE:-bf16}"
+export REFERENCE_MODEL_DTYPE="${REFERENCE_MODEL_DTYPE:-bf16}"
+export TEACHER_MODEL_DTYPE="${TEACHER_MODEL_DTYPE:-bf16}"
 
 export ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-False}"
 export ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ="${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ:-False}"
@@ -84,7 +170,7 @@ export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
 export ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
 export FSDP_FORWARD_PREFETCH="${FSDP_FORWARD_PREFETCH:-False}"
 export REFERENCE_PARAM_OFFLOAD="${REFERENCE_PARAM_OFFLOAD:-True}"
-export TEACHER_PARAM_OFFLOAD="${TEACHER_PARAM_OFFLOAD:-True}"
+export TEACHER_PARAM_OFFLOAD="${TEACHER_PARAM_OFFLOAD:-False}"
 
 export ROLLOUT_IS="${ROLLOUT_IS:-token}"
 export ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-5.0}"
