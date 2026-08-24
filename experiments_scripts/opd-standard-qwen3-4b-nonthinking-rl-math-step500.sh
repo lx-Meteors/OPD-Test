@@ -11,6 +11,7 @@ export GOPD_LAMBDA=1.0
 export USE_KL=False
 export KL_COEF=0.0
 export ADV_ESTIMATOR=token_reward_direct
+export SAVE_FREQ=10
 export OPD_RUN_NAME="opd-standard-qwen3-4b-nonthinking-rl-math-step500-paper-config"
 
 # shellcheck disable=SC1091
