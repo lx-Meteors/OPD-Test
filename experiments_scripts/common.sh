@@ -207,7 +207,11 @@ run_opd() {
 
     export WANDB_PROJECT="${WANDB_PROJECT:-${PROJECT_NAME}}"
     export WANDB_NAME="${WANDB_NAME:-${experiment_name}}"
-    export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-${run_name}}"
+    local wandb_run_group
+    wandb_run_group="${WANDB_RUN_GROUP:-${run_name}}"
+    # W&B rejects GroupName values longer than 128 characters. Keep margin for
+    # backend normalization and protect every launcher, including custom runs.
+    export WANDB_RUN_GROUP="${wandb_run_group:0:120}"
 
     mkdir -p "${ckpt_root}" "${SWANLAB_LOG_DIR}"
     setup_logging "${experiment_name}"

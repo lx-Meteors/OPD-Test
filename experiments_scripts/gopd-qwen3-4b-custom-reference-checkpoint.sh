@@ -28,8 +28,8 @@ reference_step="$(basename "${reference_path}")"
 reference_label="${REFERENCE_RUN_TAG:-${reference_step}}"
 reference_label="${reference_label//[^[:alnum:]._-]/-}"
 reference_label="${reference_label:0:48}"
-export OPD_RUN_NAME="${OPD_RUN_NAME:-gopd-qwen3-4b-step500-teacher-custom-ref-${reference_label}-lambda-${GOPD_LAMBDA}}"
-export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-gopd-custom-ref-${reference_label}-lambda-${GOPD_LAMBDA}}"
+export OPD_RUN_NAME="gopd-qwen3-4b-step500-teacher-custom-ref-${reference_label}-lambda-${GOPD_LAMBDA}"
+export WANDB_RUN_GROUP="gopd-custom-ref-${reference_label}-lambda-${GOPD_LAMBDA}"
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.sh" "$@"
