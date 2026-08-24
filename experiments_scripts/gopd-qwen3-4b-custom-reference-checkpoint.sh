@@ -21,13 +21,15 @@ export GOPD_ENABLE=True
 export USE_KL=True
 export GOPD_LAMBDA="${GOPD_LAMBDA:-1.25}"
 
-# Include the reference run/checkpoint in W&B and checkpoint directory names.
+# Include a short checkpoint tag in W&B and checkpoint directory names. W&B
+# limits GroupName to 128 characters, so do not embed the full parent run name.
 reference_path="${REFERENCE_CHECKPOINT_PATH%/}"
 reference_step="$(basename "${reference_path}")"
-reference_parent="$(basename "$(dirname "${reference_path}")")"
-reference_label="${REFERENCE_RUN_TAG:-${reference_parent}-${reference_step}}"
+reference_label="${REFERENCE_RUN_TAG:-${reference_step}}"
 reference_label="${reference_label//[^[:alnum:]._-]/-}"
+reference_label="${reference_label:0:48}"
 export OPD_RUN_NAME="${OPD_RUN_NAME:-gopd-qwen3-4b-step500-teacher-custom-ref-${reference_label}-lambda-${GOPD_LAMBDA}}"
+export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-gopd-custom-ref-${reference_label}-lambda-${GOPD_LAMBDA}}"
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.sh" "$@"
