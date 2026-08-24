@@ -104,4 +104,4 @@ export PROJECT_NAME="${PROJECT_NAME:-on-policy-distillation}"
 export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[\"console\",\"wandb\"]}"
 export APPLY_CHAT_TEMPLATE_ENABLE_THINKING="${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-False}"
 
-run_opd "gopd-exopd-qwen3-4b-nonthinking-rl-math-step500-lambda-1.25" "$@"
+run_opd "${OPD_RUN_NAME:-gopd-exopd-qwen3-4b-nonthinking-rl-math-step500-lambda-1.25}" "$@"
