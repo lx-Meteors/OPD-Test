@@ -1,1 +1,1 @@
-nohup bash experiments_scripts/opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.sh > meteor_run/opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.log 2>&1 &
+nohup bash experiments_scripts/opd-standard-qwen3-4b-nonthinking-rl-math-step500.sh > meteor_run/opd-standard-qwen3-4b-nonthinking-rl-math-step500.log 2>&1 &
