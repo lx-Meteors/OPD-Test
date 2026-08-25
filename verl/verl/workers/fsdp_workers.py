@@ -2550,25 +2550,48 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         return DataProto.from_dict(rm_inputs)
 
-    def _teacher_forward_batch(self, batch_td, top_k, strategy, teacher_temperature, compute_entropy):
-        """Micro-batch and run the teacher over one homogeneous batch.
+    def _teacher_micro_batches(self, batch_td, same_micro_num_in_dp=True):
+        """Split one homogeneous batch into micro batches.
 
-        Returns the same 8-tuple as ``_forward_micro_batch``, concatenated over
-        micro batches and restored to the incoming row order.
+        ``same_micro_num_in_dp`` is left on for whole-batch calls, where every rank
+        holds the same number of rows and letting ``rearrange_micro_batches`` raise the
+        count to the group maximum is free. The windowed path turns it off and equalizes
+        the pass count itself: there, the row count is the number of local sequences
+        reaching some depth, and raising the count to the group maximum would trip the
+        ``num_micro_batches <= len(seq_len_effective)`` assert on any rank holding fewer
+        rows than that maximum.
         """
-        import itertools
-
-        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+        from verl.utils.seqlen_balancing import rearrange_micro_batches
 
         if self.config.use_dynamic_bsz:
             max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-            micro_batches, indices = rearrange_micro_batches(batch=batch_td, max_token_len=max_token_len)
-        else:
-            micro_batches = batch_td.split(self.config.micro_batch_size_per_gpu)
-            indices = None
+            return rearrange_micro_batches(
+                batch=batch_td, max_token_len=max_token_len, same_micro_num_in_dp=same_micro_num_in_dp
+            )
+        return list(batch_td.split(self.config.micro_batch_size_per_gpu)), None
+
+    def _teacher_run_micro_batches(
+        self, micro_batches, indices, top_k, strategy, teacher_temperature, compute_entropy, total_passes=None
+    ):
+        """Run the teacher over prepared micro batches, restoring the incoming row order.
+
+        Returns the same 8-tuple as ``_forward_micro_batch``, concatenated over micro
+        batches. ``total_passes`` pads the pass count by re-running the first micro batch
+        and dropping its output. The teacher is FSDP-wrapped, so each forward is a
+        collective over the whole group; the windowed path uses this to keep the number
+        of forwards equal on every rank when the amount of work is not.
+        """
+        import itertools
+
+        from verl.utils.seqlen_balancing import get_reverse_idx
+
+        n_real = len(micro_batches)
+        passes = list(micro_batches)
+        if total_passes is not None and total_passes > n_real:
+            passes += [micro_batches[0]] * (total_passes - n_real)
 
         collected = [[] for _ in range(8)]
-        for micro_batch in micro_batches:
+        for i, micro_batch in enumerate(passes):
             if hasattr(micro_batch, "batch") and isinstance(micro_batch.batch, TensorDict):
                 mb_top_k_ids = micro_batch.batch.get("student_top_k_ids", None)
             elif isinstance(micro_batch, TensorDict):
@@ -2584,6 +2607,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 strategy=strategy,
                 teacher_temperature=teacher_temperature,
             )
+            if i >= n_real:
+                continue
             for slot, val in zip(collected, outs):
                 if val is not None:
                     slot.append(val)
@@ -2595,6 +2620,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             revert_indices = torch.tensor(get_reverse_idx(flat), dtype=torch.long, device=merged[0].device)
             merged = [m[revert_indices] if m is not None else None for m in merged]
         return tuple(merged)
+
+    def _teacher_forward_batch(self, batch_td, top_k, strategy, teacher_temperature, compute_entropy):
+        """Micro-batch and run the teacher over one homogeneous batch."""
+        micro_batches, indices = self._teacher_micro_batches(batch_td)
+        return self._teacher_run_micro_batches(
+            micro_batches, indices, top_k, strategy, teacher_temperature, compute_entropy
+        )
 
     @staticmethod
     def teacher_ctx_spans(resp_len, window, segment):
@@ -2659,25 +2691,44 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         out = [None] * 8
         for start, end, ctx_start in self.teacher_ctx_spans(resp_len, window, max(1, min(segment, resp_len))):
-            keep = resp_mask[:, start].bool()
-            if not bool(keep.any()):
-                continue
-            rows = keep.nonzero(as_tuple=True)[0]
+            rows = resp_mask[:, start].bool().nonzero(as_tuple=True)[0]
+            # The span list is the same on every rank -- it is fixed by the padded
+            # response length and the two knobs -- but the rows are not: they are the
+            # local sequences that reach this depth, and past the onset that count is
+            # data dependent and often zero. Every forward here is an FSDP all-gather
+            # over the whole group, so a rank that skipped a depth another rank
+            # forwarded, or that split it into fewer micro batches, would leave the
+            # group waiting on a collective that never comes. Take part everywhere,
+            # standing in one row where there is nothing to read out, and agree on the
+            # pass count before forwarding. The stand-in row still carries its prompt,
+            # so it is a normal sequence rather than an all-padding one.
+            live = rows.numel() > 0
+            src = rows if live else rows.new_zeros(1)
             seg = {
-                "input_ids": torch.cat([prompt_ids[rows], responses[rows, ctx_start:end]], dim=1),
-                "attention_mask": torch.cat([prompt_mask[rows], resp_mask[rows, ctx_start:end]], dim=1),
-                "responses": responses[rows, start:end],
+                "input_ids": torch.cat([prompt_ids[src], responses[src, ctx_start:end]], dim=1),
+                "attention_mask": torch.cat([prompt_mask[src], resp_mask[src, ctx_start:end]], dim=1),
+                "responses": responses[src, start:end],
             }
             seg["position_ids"] = compute_position_id_with_mask(seg["attention_mask"])
             if stu_ids is not None:
-                seg["student_top_k_ids"] = stu_ids[rows, start:end]
-            res = self._teacher_forward_batch(
-                TensorDict(seg, batch_size=rows.numel()),
+                seg["student_top_k_ids"] = stu_ids[src, start:end]
+            micro_batches, indices = self._teacher_micro_batches(
+                TensorDict(seg, batch_size=src.numel()), same_micro_num_in_dp=False
+            )
+            n_pass = torch.tensor([len(micro_batches)], dtype=torch.long, device=responses.device)
+            if dist.is_initialized():
+                dist.all_reduce(n_pass, op=dist.ReduceOp.MAX)
+            res = self._teacher_run_micro_batches(
+                micro_batches,
+                indices,
                 top_k,
                 strategy,
                 teacher_temperature,
                 compute_entropy,
+                total_passes=int(n_pass.item()),
             )
+            if not live:
+                continue
             for i, v in enumerate(res):
                 if v is None:
                     continue

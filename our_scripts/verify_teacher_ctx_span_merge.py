@@ -6,7 +6,7 @@ starts past ``window``, so the span starting at exactly ``window`` still carries
 ``ctx_start == 0`` and re-encodes the same prefix as the very first span. Emitting the
 two as one span is meant to be free: same teacher input, one pass fewer.
 
-Three checks, the first two needing no GPU.
+Four checks, only the last needing a GPU.
 
   0. On the plumbing. The window has to survive four hops -- dataclass field, shell
      hydra override, trainer meta_info, reward worker -- and a break in any of them is
@@ -21,7 +21,15 @@ Three checks, the first two needing no GPU.
      read-out must stay a partition of the response. Also reports the cost in
      re-encoded response tokens, which is what the merge is buying.
 
-  2. On the real teacher weights, comparing the per-token teacher log probs that OPD
+  2. On the rank invariance of the teacher forward count. The span list is fixed by the
+     padded response length and the two knobs, so it is the same everywhere, but the
+     rows within a span are the local sequences reaching that depth, and past the onset
+     that count is data dependent and often zero. Each teacher forward is an FSDP
+     all-gather over the whole group, so ranks that disagree on how many to issue hang
+     the job with the GPUs pinned. Neither the arithmetic check nor a single-process
+     forward can see this, so it is checked directly.
+
+  3. On the real teacher weights, comparing the per-token teacher log probs that OPD
      actually consumes. The two schemes split at the onset:
 
        depth >= onset  both schemes feed the model an elementwise identical tensor of
@@ -40,7 +48,7 @@ Three checks, the first two needing no GPU.
      A ragged batch is included so the per-span row selection is exercised.
 
 Usage:
-    python our_scripts/verify_teacher_ctx_span_merge.py                  # all three
+    python our_scripts/verify_teacher_ctx_span_merge.py                  # all four
     python our_scripts/verify_teacher_ctx_span_merge.py --no-model       # skip GPU part
 """
 
@@ -303,7 +311,7 @@ def check_model(spans_new, model_path, resp_len, prompt_len, window, segment, sh
 
     print()
     print("=" * 78)
-    print(f"Part 2: real teacher weights ({model_path}, {dtype})")
+    print(f"Part 3: real teacher weights ({model_path}, {dtype})")
     print("=" * 78)
 
     torch_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[dtype]
@@ -415,6 +423,97 @@ def check_model(spans_new, model_path, resp_len, prompt_len, window, segment, sh
     print("      untruncated teacher than the legacy scheme where it cannot be.")
 
 
+def worker_method_source(name):
+    """Source of one reward-worker method, read from the shipped file."""
+    text = FSDP_WORKERS.read_text()
+    lines = text.splitlines()
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    raise AssertionError(f"{name} not found in {FSDP_WORKERS}")
+
+
+def pass_counts(spans, per_rank_lengths, micro_bsz, equalize):
+    """Forward passes each rank issues per span, under the static micro-batch split.
+
+    A rank forwards the rows whose response reaches the span's start, split into
+    micro batches of ``micro_bsz``. Without equalizing, a rank with no such row
+    forwards nothing at all for that span.
+    """
+    counts = []
+    for local in per_rank_lengths:
+        row_counts = [sum(1 for length in local if length > start) for start, _, _ in spans]
+        if equalize:
+            row_counts = [max(rows, 1) for rows in row_counts]
+        counts.append([-(-rows // micro_bsz) for rows in row_counts])
+    if equalize:
+        agreed = [max(rank[i] for rank in counts) for i in range(len(spans))]
+        counts = [list(agreed) for _ in counts]
+    return counts
+
+
+def check_rank_invariance(spans_fn, resp_len, window, segment, micro_bsz=4, n_ranks=8, rows_per_rank=128):
+    """The teacher forward count must not depend on the local batch.
+
+    The span list is rank-invariant: it is fixed by the padded response length and the
+    two knobs. The rows are not. Past the onset, the rows are the local sequences that
+    reach that depth, and for a model whose responses are mostly short that count is a
+    small rank-dependent number, often zero. Every teacher forward is an FSDP all-gather
+    over the whole group, so ranks that disagree on how many to issue leave the group
+    waiting on a collective that never comes, and the job hangs with the GPUs busy.
+
+    Nothing about this is visible in the span arithmetic or in a single-process forward,
+    which is why the other checks here pass while a real 8-GPU run deadlocks.
+    """
+    import random
+
+    print("=" * 78)
+    print("Part 2: rank invariance of the teacher forward count")
+    print("=" * 78)
+
+    src = worker_method_source("_teacher_forward_windowed")
+    forward_at = src.find("_teacher_run_micro_batches")
+    skip_at = src.find("if not live:")
+    checks = [
+        ("pass count is agreed across ranks", "dist.all_reduce" in src and "ReduceOp.MAX" in src),
+        ("rearrange's own dp sync is off", "same_micro_num_in_dp=False" in src),
+        ("a span with no local row still forwards", "rows.new_zeros(1)" in src),
+        ("the read-out, not the forward, is skipped", 0 <= forward_at < skip_at),
+    ]
+    for label, ok in checks:
+        print(f"  {'ok  ' if ok else 'FAIL'}    {label}")
+    assert all(ok for _, ok in checks), "the windowed teacher can desynchronize its ranks"
+
+    # Qwen3-4B non-thinking: mostly short answers with a thin long tail. This is the
+    # regime that breaks, and the opposite of the 1.5b runs, where nearly every
+    # sequence ran past the onset and every rank happened to agree by luck.
+    rng = random.Random(0)
+    lengths = [
+        [rng.randint(200, 3000) if rng.random() > 0.03 else rng.randint(3000, resp_len) for _ in range(rows_per_rank)]
+        for _ in range(n_ranks)
+    ]
+    spans = spans_fn(resp_len, window, segment)
+    onset = window + segment
+    deep = sum(1 for local in lengths for length in local if length > onset)
+    print(f"\n  {n_ranks} ranks x {rows_per_rank} rows, onset {onset}, {deep} rows past it")
+    print(f"  spans at depth {[s for s, _, _ in spans]}, micro batch {micro_bsz} rows\n")
+
+    for label, equalize in (("legacy", False), ("fixed", True)):
+        counts = pass_counts(spans, lengths, micro_bsz, equalize)
+        agree = len({tuple(c) for c in counts}) == 1
+        print(f"  {label:6s}  per-rank passes per span:")
+        for rank, c in enumerate(counts):
+            print(f"            rank {rank}: {c}")
+        print(f"          {'all ranks agree' if agree else 'RANKS DISAGREE -> deadlock'}\n")
+        if equalize:
+            assert agree, "forward count still depends on the local batch"
+        else:
+            assert not agree, "the length sample no longer exercises the bug; this check has no teeth"
+
+    print("PASS: every rank issues the same teacher forwards regardless of how many")
+    print("      of its sequences reach each depth.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -432,6 +531,8 @@ def main():
     print()
     spans_new = load_production_spans()
     check_spans(spans_new, args.prompt_len, args.resp_len)
+    print()
+    check_rank_invariance(spans_new, args.resp_len, args.window, args.segment)
     if not args.no_model:
         check_model(
             spans_new,
