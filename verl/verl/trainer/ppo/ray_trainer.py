@@ -795,7 +795,15 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
-        for test_data in self.val_dataloader:
+        validation_progress = tqdm(
+            self.val_dataloader,
+            total=len(self.val_dataloader),
+            desc=f"Validation step {self.global_steps}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        for test_data in validation_progress:
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
@@ -867,6 +875,7 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            validation_progress.set_postfix(generations=len(sample_scores), refresh=False)
 
             reward_extra_infos_dict["reward"].extend(scores)
             if "reward_extra_info" in result:
