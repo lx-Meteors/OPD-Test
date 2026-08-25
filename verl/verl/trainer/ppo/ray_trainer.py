@@ -1293,6 +1293,15 @@ class RayPPOTrainer:
                             batch.meta_info["kl_estimator"] = kl_estimator
                             batch.meta_info["reward_weight_mode"] = reward_weight_mode
                             batch.meta_info["teacher_temperature"] = teacher_temperature
+                            # Must travel through meta_info: the reward worker's own
+                            # config is config.reward_model, which has no such field,
+                            # so falling back to it would silently disable windowing.
+                            batch.meta_info["teacher_ctx_window"] = self.config.actor_rollout_ref.rollout.get(
+                                "teacher_ctx_window", 0
+                            )
+                            batch.meta_info["teacher_ctx_segment"] = self.config.actor_rollout_ref.rollout.get(
+                                "teacher_ctx_segment", 4096
+                            )
                             prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", None)
                             if prune_opd_cfg is not None and prune_opd_cfg.get("enable", False):
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)
@@ -2646,7 +2655,18 @@ class RayPPOTrainer:
                     metrics["prune_opd/effective_response_length_min"] = effective_response_length.min().item()
                     metrics.update(self._update_prune_opd_dynamic_response_length(effective_response_length))
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                rollout_cfg = self.config.actor_rollout_ref.rollout
+                teacher_ctx_window = rollout_cfg.get("teacher_ctx_window", 0) or 0
+                teacher_ctx_onset = (
+                    teacher_ctx_window + rollout_cfg.get("teacher_ctx_segment", 4096)
+                    if teacher_ctx_window > 0
+                    else 0
+                )
+                metrics.update(
+                    compute_data_metrics(
+                        batch=batch, use_critic=self.use_critic, teacher_ctx_onset=teacher_ctx_onset
+                    )
+                )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

@@ -143,6 +143,29 @@ class RolloutConfig(BaseConfig):
     top_k_strategy: str = "only_stu"  # "only_stu", "only_tch", "intersection", or "union"
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", or "none"
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
+
+    # Truncate the teacher's view of the student prefix to [prompt] + the last
+    # `teacher_ctx_window` response tokens and re-encode. 0 disables (teacher sees the
+    # full prefix). The student trajectory is unaffected; only the teacher's
+    # conditioning changes. Off-policy prefixes inflate the teacher's entropy
+    # monotonically with their length, so a bounded window keeps the teacher near the
+    # manifold it was trained on. Windows below ~1024 make the teacher confidently
+    # misaligned instead.
+    #
+    # `teacher_ctx_segment` is how many read-out positions share one re-encode. It is
+    # not a modelling knob but it is not free either: together the two fix the depth at
+    # which truncation first takes effect,
+    #
+    #     onset = teacher_ctx_window + teacher_ctx_segment
+    #
+    # because a position is only truncated once its chunk starts past the window. Every
+    # token shallower than `onset` sees the untruncated prefix, i.e. the intervention is
+    # a no-op there. Keep `onset` below the mean response length or nothing happens.
+    # Cost, counted in re-encoded response tokens over a response of length L, is
+    # (W + S) + ceil((L - W - S) / S) * (W + S), against L for the plain pass.
+    teacher_ctx_window: int = 0
+    teacher_ctx_segment: int = 4096
+
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True

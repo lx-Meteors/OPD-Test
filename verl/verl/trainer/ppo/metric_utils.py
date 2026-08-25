@@ -77,7 +77,9 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(
+    batch: DataProto, use_critic: bool = True, teacher_ctx_onset: int = 0
+) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -88,6 +90,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
         use_critic: Whether to include critic-specific metrics. Defaults to True.
+        teacher_ctx_onset: Depth at which the windowed teacher first truncates the
+            prefix, i.e. teacher_ctx_window + teacher_ctx_segment. 0 means no windowing,
+            in which case the teacher_ctx/* metrics are omitted.
 
     Returns:
         A dictionary of metrics including:
@@ -314,6 +319,21 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    # Windowed teacher: how much of the batch the intervention actually reaches. Tokens
+    # shallower than the onset see the untruncated prefix, so if these fractions sit
+    # near zero the windowing is configured but inert and any comparison against a
+    # baseline is measuring noise.
+    if teacher_ctx_onset > 0:
+        total_response_tokens = torch.sum(response_length)
+        truncated_tokens = torch.sum((response_length - teacher_ctx_onset).clamp(min=0))
+        metrics["teacher_ctx/onset"] = float(teacher_ctx_onset)
+        metrics["teacher_ctx/frac_tokens_truncated"] = (
+            (truncated_tokens / total_response_tokens).detach().item() if total_response_tokens > 0 else 0.0
+        )
+        metrics["teacher_ctx/frac_seqs_truncated"] = (
+            torch.mean((response_length > teacher_ctx_onset).float()).detach().item()
+        )
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

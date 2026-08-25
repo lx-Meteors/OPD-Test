@@ -92,6 +92,11 @@ run_opd() {
     export LOG_PROB_TOP_K="${LOG_PROB_TOP_K:-16}"
     export TOP_K_STRATEGY="${TOP_K_STRATEGY:-only_stu}"
     export REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
+    # Windowed teacher. 0 = teacher sees the full student prefix (baseline).
+    # Truncation only starts biting at depth TEACHER_CTX_WINDOW + TEACHER_CTX_SEGMENT,
+    # so keep that sum below the mean response length or the intervention is inert.
+    export TEACHER_CTX_WINDOW="${TEACHER_CTX_WINDOW:-0}"
+    export TEACHER_CTX_SEGMENT="${TEACHER_CTX_SEGMENT:-4096}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
     export MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
@@ -131,8 +136,13 @@ run_opd() {
     local ppo_max_token_len_per_gpu
     ppo_max_token_len_per_gpu=$(( ((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) > 32768) ? (MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) : 32768 ))
 
+    local tchwin_tag=""
+    if (( TEACHER_CTX_WINDOW > 0 )); then
+        tchwin_tag="-tchwin_${TEACHER_CTX_WINDOW}_seg_${TEACHER_CTX_SEGMENT}_onset_$(( TEACHER_CTX_WINDOW + TEACHER_CTX_SEGMENT ))"
+    fi
+
     local experiment_name
-    experiment_name="${combo_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-${timestamp}"
+    experiment_name="${combo_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${tchwin_tag}-${timestamp}"
     local ckpt_root="${CKPT_ROOT:-${REPO_ROOT}/checkpoint}"
     local ckpt_path="${ckpt_root}/${experiment_name}"
 
@@ -156,6 +166,14 @@ run_opd() {
     echo "Max response length: ${MAX_RESP_LENGTH}"
     echo "Validation max response length: ${MAX_VAL_RESP_LENGTH}"
     echo "Thinking override: ${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-<default>}"
+    if (( TEACHER_CTX_WINDOW > 0 )); then
+        echo "Teacher ctx window: W=${TEACHER_CTX_WINDOW} S=${TEACHER_CTX_SEGMENT} -> truncation onset at depth $(( TEACHER_CTX_WINDOW + TEACHER_CTX_SEGMENT ))"
+        if (( TEACHER_CTX_WINDOW + TEACHER_CTX_SEGMENT >= MAX_RESP_LENGTH )); then
+            echo "  WARNING: onset >= MAX_RESP_LENGTH (${MAX_RESP_LENGTH}), the teacher is never truncated and this run is a baseline at higher cost"
+        fi
+    else
+        echo "Teacher ctx window: <disabled, teacher sees full prefix>"
+    fi
     echo "Experiment name: ${experiment_name}"
     echo "Checkpoint dir: ${ckpt_path}"
     echo "Tracking backends: ${TRACKING_BACKENDS}"
@@ -200,6 +218,8 @@ run_opd() {
         "+actor_rollout_ref.rollout.top_k_strategy=${TOP_K_STRATEGY}"
         "+actor_rollout_ref.rollout.reward_weight_mode=${REWARD_WEIGHT_MODE}"
         "+actor_rollout_ref.rollout.teacher_temperature=${TEACHER_TEMPERATURE}"
+        "+actor_rollout_ref.rollout.teacher_ctx_window=${TEACHER_CTX_WINDOW}"
+        "+actor_rollout_ref.rollout.teacher_ctx_segment=${TEACHER_CTX_SEGMENT}"
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${PARALLEL_SIZE}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.8"
         "actor_rollout_ref.rollout.max_model_len=${max_model_len}"
