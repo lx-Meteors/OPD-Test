@@ -30,12 +30,6 @@ export GOPD_LAMBDA=1.0
 export USE_KL=False
 export KL_COEF=0.0
 export ADV_ESTIMATOR=token_reward_direct
-# Loading the 4B student independently on all eight FSDP ranks in fp32 creates a
-# large host-memory spike before sharding.  It is also incompatible with
-# FlashAttention 2.  Keep every frozen/trainable model in bf16 for this run.
-export MODEL_DTYPE="${MODEL_DTYPE:-bf16}"
-export REFERENCE_MODEL_DTYPE="${REFERENCE_MODEL_DTYPE:-bf16}"
-export TEACHER_MODEL_DTYPE="${TEACHER_MODEL_DTYPE:-bf16}"
 export SAVE_FREQ=10
 export OPD_RUN_NAME="opd-standard-reverse-step500-student-qwen3-4b-teacher"
 

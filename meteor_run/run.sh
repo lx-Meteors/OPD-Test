@@ -1,1 +1,1 @@
-nohup bash experiments_scripts/gopd-qwen3-4b-custom-reference-checkpoint.sh > meteor_run/gopd-qwen3-4b-custom-reference-checkpoint.log 2>&1 &
+nohup bash experiments_scripts/tchwin-opd-standard-qwen3-4b-nonthinking-rl-math-step500.sh > meteor_run/tchwin-opd-standard-qwen3-4b-nonthinking-rl-math-step500.log 2>&1 &

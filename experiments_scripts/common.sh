@@ -122,9 +122,6 @@ run_opd() {
     export TEACHER_CTX_SEGMENT="${TEACHER_CTX_SEGMENT:-4096}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
-    export MODEL_DTYPE="${MODEL_DTYPE:-bf16}"
-    export REFERENCE_MODEL_DTYPE="${REFERENCE_MODEL_DTYPE:-${MODEL_DTYPE}}"
-    export TEACHER_MODEL_DTYPE="${TEACHER_MODEL_DTYPE:-${MODEL_DTYPE}}"
     export IS_PLOT="${IS_PLOT:-False}"
     export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
     export PARALLEL_SIZE="${PARALLEL_SIZE:-1}"
@@ -295,10 +292,8 @@ run_opd() {
         "actor_rollout_ref.actor.fsdp_config.param_offload=False"
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False"
         "actor_rollout_ref.actor.fsdp_config.forward_prefetch=${FSDP_FORWARD_PREFETCH}"
-        "actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE}"
         "actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}"
         "actor_rollout_ref.ref.fsdp_config.param_offload=${REFERENCE_PARAM_OFFLOAD}"
-        "actor_rollout_ref.ref.fsdp_config.model_dtype=${REFERENCE_MODEL_DTYPE}"
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${REF_LOG_PROB_USE_DYNAMIC_BSZ}"
         "actor_rollout_ref.rollout.name=vllm"
         "actor_rollout_ref.rollout.temperature=${TEMPERATURE}"
@@ -349,7 +344,6 @@ run_opd() {
             "reward_model.model.input_tokenizer=null"
             "reward_model.model.use_remove_padding=True"
             "reward_model.model.fsdp_config.param_offload=${TEACHER_PARAM_OFFLOAD}"
-            "+reward_model.model.dtype=${TEACHER_MODEL_DTYPE}"
             "reward_model.micro_batch_size_per_gpu=${TEACHER_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
         )
     fi
