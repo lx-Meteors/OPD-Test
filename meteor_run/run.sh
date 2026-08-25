@@ -1,1 +1,1 @@
-nohup bash experiments_scripts/opd-standard-reverse-qwen3-4b-step500-student-base-teacher.sh > meteor_run/opd-standard-reverse-qwen3-4b-step500-student-base-teacher.log 2>&1 &
+nohup bash experiments_scripts/gopd-qwen3-4b-custom-reference-checkpoint.sh > meteor_run/gopd-qwen3-4b-custom-reference-checkpoint.log 2>&1 &

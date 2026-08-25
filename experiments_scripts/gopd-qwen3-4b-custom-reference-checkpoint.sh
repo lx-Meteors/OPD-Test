@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # or its actor directory. Raw VERL checkpoints are merged automatically.
 # Example:
 # export REFERENCE_CHECKPOINT_PATH="/ossfs/workspace/code/Prune-OPD/checkpoint/<run>/global_step_50"
-export REFERENCE_CHECKPOINT_PATH="${REFERENCE_CHECKPOINT_PATH:-}"
+export REFERENCE_CHECKPOINT_PATH="${REFERENCE_CHECKPOINT_PATH:-/ossfs/workspace/code/Prune-OPD/checkpoint/opd-standard-reverse-step500-student-qwen3-4b-teacher_token_reward_direct_Qwen3-4B-Non-Thinking-RL-Math-Step500_Qwen3-4B_16384-T_1.0-Tch_1.0-n_1-mbs_1024-topk_0-topk_strategy_only_stu-rw_student_p-2026-08-24_17-02-58/global_step_10}"
 export AUTO_MERGE_REFERENCE_CHECKPOINT="${AUTO_MERGE_REFERENCE_CHECKPOINT:-True}"
 
 if [[ -z "${REFERENCE_CHECKPOINT_PATH}" ]]; then
