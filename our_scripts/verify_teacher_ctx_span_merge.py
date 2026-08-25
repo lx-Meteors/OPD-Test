@@ -523,7 +523,7 @@ def main():
     ap.add_argument("--window", type=int, default=2048)
     ap.add_argument("--segment", type=int, default=4096)
     ap.add_argument("--short-len", type=int, default=5000)
-    # The qwen-4b runs train the teacher forward in bf16 (TEACHER_MODEL_DTYPE).
+    # Match the teacher forward of the runs, which is bf16.
     ap.add_argument("--dtype", default="bf16", choices=["fp32", "bf16"])
     args = ap.parse_args()
 
