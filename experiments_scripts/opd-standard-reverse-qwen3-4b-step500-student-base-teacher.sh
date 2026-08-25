@@ -30,6 +30,7 @@ export GOPD_LAMBDA=1.0
 export USE_KL=False
 export KL_COEF=0.0
 export ADV_ESTIMATOR=token_reward_direct
+export HANDOFF_OPD_ENABLE=False
 # Loading the 4B student independently on all eight FSDP ranks in fp32 creates a
 # large host-memory spike before sharding.  It is also incompatible with
 # FlashAttention 2.  Keep every frozen/trainable model in bf16 for this run.

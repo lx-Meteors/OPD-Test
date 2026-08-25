@@ -83,7 +83,7 @@ resolve_reference_checkpoint() {
     RESOLVED_REFERENCE_MODEL_PATH="${merged_dir}"
 }
 
-# G-OPD paper main setting: the original non-thinking model is both Student initialization and fixed Reference.
+# Hybrid setting: Qwen3-4B Student, RL-Math Step500 Teacher.
 if [[ -z "${ACTOR_MODEL_PATH:-}" ]]; then
     if [[ -d "${MODEL_ROOT}/Qwen3-4B" ]]; then
         export ACTOR_MODEL_PATH="${MODEL_ROOT}/Qwen3-4B"
@@ -128,12 +128,33 @@ fi
 export TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-DeepMath-103K-level6-57k}"
 export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parquet\",\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/HMMT24/test.parquet\",\"${DATA_ROOT}/test_data/HMMT25/test.parquet\"]}"
 
-export ADV_ESTIMATOR="${ADV_ESTIMATOR:-grpo}"
-export GOPD_ENABLE="${GOPD_ENABLE:-True}"
-export GOPD_LAMBDA="${GOPD_LAMBDA:-1.25}"
-export USE_KL="${USE_KL:-True}"
+export ADV_ESTIMATOR="${ADV_ESTIMATOR:-token_reward_direct}"
+export GOPD_ENABLE="${GOPD_ENABLE:-False}"
+export GOPD_LAMBDA="${GOPD_LAMBDA:-1.0}"
+export USE_KL="${USE_KL:-False}"
 export KL_COEF="${KL_COEF:-0.0}"
 export KL_TYPE="${KL_TYPE:-low_var_kl}"
+
+# Student rolls out at most 2K response tokens.  OPD is computed only on this
+# Student prefix.  For prefixes that reach the boundary, the Teacher samples
+# four continuations; the verifier keeps the best correct continuation and the
+# Student learns that suffix with token-level cross entropy.
+export HANDOFF_OPD_ENABLE="${HANDOFF_OPD_ENABLE:-True}"
+export HANDOFF_OPD_CUTOFF="${HANDOFF_OPD_CUTOFF:-2048}"
+export HANDOFF_TEACHER_NUM_SAMPLES="${HANDOFF_TEACHER_NUM_SAMPLES:-4}"
+export HANDOFF_VERIFIED_SUFFIX_ONLY="${HANDOFF_VERIFIED_SUFFIX_ONLY:-True}"
+export HANDOFF_SELECT_BEST_VERIFIED_SUFFIX="${HANDOFF_SELECT_BEST_VERIFIED_SUFFIX:-True}"
+export HANDOFF_CORRECT_THRESHOLD="${HANDOFF_CORRECT_THRESHOLD:-0.5}"
+export HANDOFF_SFT_WEIGHT="${HANDOFF_SFT_WEIGHT:-1.0}"
+export HANDOFF_TEACHER_BACKEND="${HANDOFF_TEACHER_BACKEND:-vllm}"
+export HANDOFF_TEACHER_TEMPERATURE="${HANDOFF_TEACHER_TEMPERATURE:-1.0}"
+export HANDOFF_TEACHER_TOP_P="${HANDOFF_TEACHER_TOP_P:-0.95}"
+export HANDOFF_TEACHER_DTYPE="${HANDOFF_TEACHER_DTYPE:-float32}"
+export HANDOFF_TEACHER_GPU_MEMORY_UTILIZATION="${HANDOFF_TEACHER_GPU_MEMORY_UTILIZATION:-0.4}"
+export HANDOFF_TEACHER_MAX_MODEL_LEN="${HANDOFF_TEACHER_MAX_MODEL_LEN:-32768}"
+export HANDOFF_TEACHER_MAX_NUM_BATCHED_TOKENS="${HANDOFF_TEACHER_MAX_NUM_BATCHED_TOKENS:-32768}"
+export HANDOFF_TEACHER_MAX_NUM_SEQS="${HANDOFF_TEACHER_MAX_NUM_SEQS:-64}"
+export HANDOFF_TEACHER_ENFORCE_EAGER="${HANDOFF_TEACHER_ENFORCE_EAGER:-False}"
 
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1024}"
 export MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-1024}"
@@ -152,9 +173,9 @@ export ACTOR_LR="${ACTOR_LR:-1e-5}"
 export LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.0}"
 export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
 export ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
-export MODEL_DTYPE="${MODEL_DTYPE:-bf16}"
-export REFERENCE_MODEL_DTYPE="${REFERENCE_MODEL_DTYPE:-bf16}"
-export TEACHER_MODEL_DTYPE="${TEACHER_MODEL_DTYPE:-bf16}"
+export MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
+export REFERENCE_MODEL_DTYPE="${REFERENCE_MODEL_DTYPE:-fp32}"
+export TEACHER_MODEL_DTYPE="${TEACHER_MODEL_DTYPE:-fp32}"
 
 export ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-False}"
 export ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ="${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ:-False}"
@@ -190,4 +211,4 @@ export PROJECT_NAME="${PROJECT_NAME:-on-policy-distillation}"
 export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[\"console\",\"wandb\"]}"
 export APPLY_CHAT_TEMPLATE_ENABLE_THINKING="${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-False}"
 
-run_opd "${OPD_RUN_NAME:-gopd-exopd-qwen3-4b-nonthinking-rl-math-step500-lambda-1.25}" "$@"
+run_opd "${OPD_RUN_NAME:-opd-2k-handoff-bestof4-correct-sft-qwen3-4b-step500}" "$@"

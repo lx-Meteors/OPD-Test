@@ -20,6 +20,7 @@ fi
 export GOPD_ENABLE=True
 export USE_KL=True
 export GOPD_LAMBDA="${GOPD_LAMBDA:-1.25}"
+export HANDOFF_OPD_ENABLE=False
 
 # Include a short checkpoint tag in W&B and checkpoint directory names. W&B
 # limits GroupName to 128 characters, so do not embed the full parent run name.

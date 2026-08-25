@@ -43,6 +43,7 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         only_reverse_kl_advantages (bool): Whether to replace rollout advantages with the G-OPD token signal.
         lambda_vals (float): G-OPD reward scaling factor. A value of 1.0 recovers standard OPD.
+        handoff_sft_weight (float): Weight of the teacher-continuation cross-entropy loss.
     """
 
     loss_mode: str = "vanilla"
@@ -53,6 +54,7 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     only_reverse_kl_advantages: bool = False
     lambda_vals: float = 1.0
+    handoff_sft_weight: float = 1.0
 
 
 @dataclass

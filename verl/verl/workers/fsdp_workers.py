@@ -1726,6 +1726,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.model.path, use_shm=use_shm)
 
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+
         if self.config.model.input_tokenizer is None:
             self._do_switch_chat_template = False
         else:
@@ -1734,7 +1736,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.input_tokenizer = hf_tokenizer(
                 input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False)
             )
-            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
@@ -1921,6 +1922,308 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
+
+    def _get_handoff_student_tokenizer(self, data: DataProto):
+        model_path = str(data.meta_info["handoff_student_model_path"])
+        cached_path = getattr(self, "_handoff_student_tokenizer_path", None)
+        if cached_path != model_path:
+            local_path = copy_to_local(model_path, use_shm=self.config.model.get("use_shm", False))
+            self._handoff_student_tokenizer = hf_tokenizer(
+                local_path, trust_remote_code=self.config.model.get("trust_remote_code", False)
+            )
+            self._handoff_student_tokenizer_path = model_path
+            self._handoff_tokenizers_identical = None
+        return self._handoff_student_tokenizer
+
+    def _handoff_tokenizers_match(self, student_tokenizer) -> bool:
+        cached = getattr(self, "_handoff_tokenizers_identical", None)
+        if cached is None:
+            special_ids_match = all(
+                getattr(student_tokenizer, key, None) == getattr(self.tokenizer, key, None)
+                for key in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
+            )
+            chat_template_match = getattr(student_tokenizer, "chat_template", None) == getattr(
+                self.tokenizer, "chat_template", None
+            )
+            cached = (
+                special_ids_match
+                and chat_template_match
+                and student_tokenizer.get_vocab() == self.tokenizer.get_vocab()
+            )
+            self._handoff_tokenizers_identical = cached
+            if self.rank == 0:
+                bridge = "direct token IDs" if cached else "text/tokenizer bridge"
+                print(f"[handoff] Student/Teacher tokenizer bridge: {bridge}.")
+        return cached
+
+    def _get_handoff_teacher_client(self, data: DataProto):
+        from verl.workers.rollout.handoff_teacher_server import TeacherVLLMClient
+
+        teacher_model_path = str(data.meta_info["handoff_teacher_model_path"])
+        local_teacher_path = copy_to_local(
+            teacher_model_path, use_shm=self.config.model.get("use_shm", False)
+        )
+        client_key = (
+            local_teacher_path,
+            str(data.meta_info.get("handoff_teacher_dtype", "bfloat16")),
+            float(data.meta_info.get("handoff_teacher_gpu_memory_utilization", 0.4)),
+            int(data.meta_info.get("handoff_teacher_max_model_len", 32768)),
+            int(data.meta_info.get("handoff_teacher_max_num_batched_tokens", 32768)),
+            int(data.meta_info.get("handoff_teacher_max_num_seqs", 64)),
+            bool(data.meta_info.get("handoff_teacher_enforce_eager", False)),
+        )
+        if getattr(self, "_handoff_teacher_client_key", None) != client_key:
+            old_client = getattr(self, "_handoff_teacher_client", None)
+            if old_client is not None:
+                old_client.close()
+            self._handoff_teacher_client = TeacherVLLMClient(
+                model_path=local_teacher_path,
+                rank=self.rank,
+                dtype=client_key[1],
+                gpu_memory_utilization=client_key[2],
+                max_model_len=client_key[3],
+                max_num_batched_tokens=client_key[4],
+                max_num_seqs=client_key[5],
+                enforce_eager=client_key[6],
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
+            )
+            self._handoff_teacher_client_key = client_key
+        return self._handoff_teacher_client
+
+    def _build_handoff_teacher_prompts(
+        self,
+        data: DataProto,
+        selected_indices: list[int],
+        valid_lengths: torch.Tensor,
+        student_tokenizer,
+        tokenizers_identical: bool,
+    ) -> list[list[int]]:
+        prompts = []
+        raw_prompts = data.non_tensor_batch.get("raw_prompt")
+        for index in selected_indices:
+            if tokenizers_identical:
+                valid_input = data.batch["input_ids"][index][data.batch["attention_mask"][index].bool()]
+                prompts.append(valid_input.detach().cpu().tolist())
+                continue
+
+            student_prefix_ids = data.batch["responses"][index, : int(valid_lengths[index].item())]
+            prefix_text = student_tokenizer.decode(
+                student_prefix_ids.detach().cpu().tolist(),
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            if raw_prompts is not None:
+                messages = raw_prompts[index]
+                if isinstance(messages, np.ndarray):
+                    messages = messages.tolist()
+                teacher_prompt_ids = self.tokenizer.apply_chat_template(
+                    list(messages), tokenize=True, add_generation_prompt=True
+                )
+                if torch.is_tensor(teacher_prompt_ids):
+                    teacher_prompt_ids = teacher_prompt_ids.tolist()
+                teacher_prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+                prompts.append(list(teacher_prompt_ids) + list(teacher_prefix_ids))
+            else:
+                valid_input = data.batch["input_ids"][index][data.batch["attention_mask"][index].bool()]
+                input_text = student_tokenizer.decode(
+                    valid_input.detach().cpu().tolist(),
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                prompts.append(self.tokenizer.encode(input_text, add_special_tokens=False))
+        return prompts
+
+    def _generate_handoff_with_vllm(
+        self,
+        data: DataProto,
+        selected: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        suffixes: torch.Tensor,
+        suffix_mask: torch.Tensor,
+        suffix_max_tokens: int,
+        temperature: float,
+        top_p: float,
+        student_tokenizer,
+    ) -> None:
+        if selected.numel() == 0:
+            return
+
+        tokenizers_identical = self._handoff_tokenizers_match(student_tokenizer)
+        selected_indices = selected.detach().cpu().tolist()
+        prompts = self._build_handoff_teacher_prompts(
+            data, selected_indices, valid_lengths, student_tokenizer, tokenizers_identical
+        )
+        max_model_len = int(data.meta_info.get("handoff_teacher_max_model_len", 32768))
+        required_model_len = max(map(len, prompts)) + suffix_max_tokens
+        if required_model_len > max_model_len:
+            raise ValueError(
+                f"Teacher prompt + suffix requires {required_model_len} tokens, but "
+                f"handoff teacher_max_model_len={max_model_len}."
+            )
+        client = self._get_handoff_teacher_client(data)
+        generated = client.generate(
+            prompts,
+            max_tokens=suffix_max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        if len(generated) != len(selected_indices):
+            raise RuntimeError(
+                f"Teacher vLLM returned {len(generated)} continuations for {len(selected_indices)} prompts."
+            )
+
+        for index, output in zip(selected_indices, generated, strict=True):
+            teacher_ids = list(output["token_ids"])
+            if tokenizers_identical:
+                student_ids = teacher_ids
+            else:
+                suffix_text = self.tokenizer.decode(
+                    teacher_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                student_ids = student_tokenizer.encode(suffix_text, add_special_tokens=False)
+                if output.get("finish_reason") == "stop" and student_tokenizer.eos_token_id is not None:
+                    student_ids.append(student_tokenizer.eos_token_id)
+
+            student_ids = student_ids[:suffix_max_tokens]
+            if not student_ids:
+                continue
+            copy_length = len(student_ids)
+            suffixes[index, :copy_length] = torch.tensor(
+                student_ids, dtype=suffixes.dtype, device=suffixes.device
+            )
+            local_mask = torch.ones(copy_length, dtype=suffix_mask.dtype, device=suffix_mask.device)
+            if student_tokenizer.eos_token_id is not None:
+                eos_hits = suffixes[index, :copy_length].eq(student_tokenizer.eos_token_id)
+                eos_seen_before = eos_hits.cumsum(dim=-1) - eos_hits.long()
+                local_mask = eos_seen_before.eq(0).to(dtype=suffix_mask.dtype)
+            suffix_mask[index, :copy_length] = local_mask
+
+    def _generate_handoff_with_hf(
+        self,
+        data: DataProto,
+        selected: torch.Tensor,
+        suffixes: torch.Tensor,
+        suffix_mask: torch.Tensor,
+        suffix_max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> None:
+        """Compatibility fallback for environments where vLLM is unavailable."""
+
+        generation_micro_batch_size = int(data.meta_info.get("handoff_teacher_micro_batch_size", 1))
+        if generation_micro_batch_size <= 0:
+            raise ValueError("handoff_teacher_micro_batch_size must be positive.")
+
+        # All ranks must enter summon_full_params even when a local shard has no
+        # handoff samples, because entering/exiting the context is collective.
+        self.reward_module.eval()
+        with FSDP.summon_full_params(
+            self.reward_module, recurse=True, writeback=False, rank0_only=False, offload_to_cpu=False
+        ):
+            for start in range(0, selected.numel(), generation_micro_batch_size):
+                selected_chunk = selected[start : start + generation_micro_batch_size]
+                selected_input_ids = data.batch["input_ids"][selected_chunk]
+                selected_attention = data.batch["attention_mask"][selected_chunk]
+                generation_kwargs = {
+                    "input_ids": selected_input_ids,
+                    "attention_mask": selected_attention,
+                    "max_new_tokens": suffix_max_tokens,
+                    "do_sample": temperature > 0,
+                    "top_p": top_p,
+                    "use_cache": True,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                }
+                if temperature > 0:
+                    generation_kwargs["temperature"] = temperature
+                with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                    generated = self.reward_module.module.generate(**generation_kwargs)
+
+                generated_suffix = generated[:, selected_input_ids.shape[-1] :]
+                copy_length = min(generated_suffix.shape[-1], suffix_max_tokens)
+                suffixes[selected_chunk, :copy_length] = generated_suffix[:, :copy_length]
+
+                local_mask = torch.ones_like(generated_suffix[:, :copy_length], dtype=torch.long)
+                if self.tokenizer.eos_token_id is not None:
+                    eos_hits = generated_suffix[:, :copy_length].eq(self.tokenizer.eos_token_id)
+                    eos_seen_before = eos_hits.cumsum(dim=-1) - eos_hits.long()
+                    local_mask = eos_seen_before.eq(0).long()
+                suffix_mask[selected_chunk, :copy_length] = local_mask
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="purple")
+    def generate_continuations(self, data: DataProto):
+        """Generate Teacher suffixes on Reward workers."""
+
+        teacher_backend = str(data.meta_info.get("handoff_teacher_backend", "vllm")).lower()
+        if teacher_backend == "hf" and not isinstance(self.reward_module, FSDP):
+            raise NotImplementedError(
+                "The HuggingFace Teacher continuation fallback requires reward_model.strategy=fsdp."
+            )
+        data = data.to(get_device_id())
+        cutoff = int(data.meta_info["handoff_cutoff"])
+        suffix_max_tokens = int(data.meta_info["handoff_suffix_max_tokens"])
+        temperature = float(data.meta_info.get("handoff_teacher_temperature", 1.0))
+        top_p = float(data.meta_info.get("handoff_teacher_top_p", 0.95))
+        responses = data.batch["responses"]
+        if responses.shape[-1] != cutoff:
+            raise ValueError(f"Expected student response width {cutoff}, got {responses.shape[-1]}.")
+
+        response_attention = data.batch["attention_mask"][:, -cutoff:].bool()
+        valid_lengths = response_attention.sum(dim=-1)
+        student_tokenizer = self._get_handoff_student_tokenizer(data)
+        tokenizers_identical = self._handoff_tokenizers_match(student_tokenizer)
+        eos_token_id = student_tokenizer.eos_token_id
+        last_indices = (valid_lengths - 1).clamp_min(0).long()
+        last_tokens = responses.gather(1, last_indices.unsqueeze(-1)).squeeze(-1)
+        handoff_mask = (valid_lengths == cutoff) & (last_tokens != eos_token_id)
+        if "handoff_candidate_active" in data.batch:
+            handoff_mask &= data.batch["handoff_candidate_active"].bool()
+
+        batch_size = responses.shape[0]
+        suffixes = torch.full(
+            (batch_size, suffix_max_tokens),
+            student_tokenizer.pad_token_id,
+            dtype=responses.dtype,
+            device=responses.device,
+        )
+        suffix_mask = torch.zeros((batch_size, suffix_max_tokens), dtype=torch.long, device=responses.device)
+        selected = torch.nonzero(handoff_mask, as_tuple=False).squeeze(-1)
+
+        if teacher_backend == "hf":
+            if not tokenizers_identical:
+                raise ValueError(
+                    "handoff_opd teacher_backend=hf requires identical Student and Teacher tokenizers. "
+                    "Use teacher_backend=vllm for the text/tokenizer bridge."
+                )
+            self._generate_handoff_with_hf(
+                data, selected, suffixes, suffix_mask, suffix_max_tokens, temperature, top_p
+            )
+        elif teacher_backend == "vllm":
+            self._generate_handoff_with_vllm(
+                data,
+                selected,
+                valid_lengths,
+                suffixes,
+                suffix_mask,
+                suffix_max_tokens,
+                temperature,
+                top_p,
+                student_tokenizer,
+            )
+        else:
+            raise ValueError(f"Unknown handoff Teacher backend: {teacher_backend!r}.")
+
+        get_torch_device().empty_cache()
+        return DataProto.from_dict(
+            tensors={
+                "teacher_suffixes": suffixes,
+                "teacher_suffix_mask": suffix_mask,
+                "handoff_mask": handoff_mask,
+            }
+        )
 
     def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input

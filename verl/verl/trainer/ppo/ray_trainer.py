@@ -44,6 +44,12 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.handoff_opd import (
+    attach_teacher_continuations,
+    expand_handoff_candidates,
+    gate_teacher_suffix_sft_by_reward,
+    select_best_verified_handoff_candidate,
+)
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -354,7 +360,40 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_prune_opd_dynamic_response_length()
+        self._init_handoff_opd()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _init_handoff_opd(self):
+        handoff_cfg = self.config.actor_rollout_ref.rollout.get("handoff_opd", {})
+        self.handoff_opd_enabled = bool(handoff_cfg.get("enable", False))
+        self.handoff_opd_cfg = handoff_cfg
+        if not self.handoff_opd_enabled:
+            return
+
+        if not self.use_rm:
+            raise ValueError("handoff_opd requires reward_model.enable=True so the teacher can generate continuations.")
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            raise ValueError("handoff_opd currently supports synchronous rollout only.")
+        if self.prune_opd_dynamic_response_length_enabled:
+            raise ValueError("handoff_opd cannot be combined with prune_opd.dynamic_response_length.")
+
+        teacher_backend = str(handoff_cfg.get("teacher_backend", "vllm")).lower()
+        if teacher_backend not in {"vllm", "hf"}:
+            raise ValueError(f"handoff_opd teacher_backend must be 'vllm' or 'hf', got {teacher_backend!r}.")
+
+        cutoff = int(handoff_cfg.get("cutoff", 4096))
+        total_length = int(self.config.actor_rollout_ref.rollout.response_length)
+        if cutoff <= 0 or cutoff >= total_length:
+            raise ValueError(f"handoff_opd cutoff must be in (0, {total_length}), got {cutoff}.")
+        self.handoff_opd_cutoff = cutoff
+        self.handoff_teacher_num_samples = int(handoff_cfg.get("teacher_num_samples", 1))
+        if self.handoff_teacher_num_samples <= 0:
+            raise ValueError("handoff_opd teacher_num_samples must be positive.")
+        self.handoff_verified_suffix_only = bool(handoff_cfg.get("verified_suffix_only", False))
+        self.handoff_select_best_verified_suffix = bool(handoff_cfg.get("select_best_verified_suffix", False))
+        if self.handoff_select_best_verified_suffix and not self.handoff_verified_suffix_only:
+            raise ValueError("handoff_opd select_best_verified_suffix requires verified_suffix_only=True.")
+        self.handoff_correct_threshold = float(handoff_cfg.get("correct_threshold", 0.5))
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -375,9 +414,54 @@ class RayPPOTrainer:
         self.prune_opd_dynamic_response_length = max(min_len, min(init_len, max_len))
 
     def _set_dynamic_response_length_for_generation(self, gen_batch: DataProto):
+        if self.handoff_opd_enabled:
+            gen_batch.meta_info["max_response_length"] = self.handoff_opd_cutoff
+            return
         if not self.prune_opd_dynamic_response_length_enabled:
             return
         gen_batch.meta_info["max_response_length"] = self.prune_opd_dynamic_response_length
+
+    def _apply_handoff_opd(self, student_output: DataProto, timing_raw: dict) -> DataProto:
+        if not self.handoff_opd_enabled:
+            return student_output
+
+        total_length = int(self.config.actor_rollout_ref.rollout.response_length)
+        reward_sp_size = int(self.config.reward_model.get("ulysses_sequence_parallel_size", 1))
+        reward_dispatch_size = self.rm_wg.world_size // reward_sp_size
+        student_output = expand_handoff_candidates(
+            student_output,
+            cutoff=self.handoff_opd_cutoff,
+            eos_token_id=self.tokenizer.eos_token_id,
+            num_teacher_samples=self.handoff_teacher_num_samples,
+            dispatch_size=reward_dispatch_size,
+        )
+        student_output.meta_info.update(
+            {
+                "handoff_cutoff": self.handoff_opd_cutoff,
+                "handoff_suffix_max_tokens": total_length - self.handoff_opd_cutoff,
+                "handoff_teacher_temperature": float(self.handoff_opd_cfg.get("teacher_temperature", 1.0)),
+                "handoff_teacher_top_p": float(self.handoff_opd_cfg.get("teacher_top_p", 0.95)),
+                "handoff_teacher_micro_batch_size": int(self.handoff_opd_cfg.get("teacher_micro_batch_size", 1)),
+                "handoff_teacher_backend": str(self.handoff_opd_cfg.get("teacher_backend", "vllm")).lower(),
+                "handoff_teacher_model_path": str(self.config.reward_model.model.path),
+                "handoff_student_model_path": str(self.config.actor_rollout_ref.model.path),
+                "handoff_teacher_dtype": str(self.handoff_opd_cfg.get("teacher_dtype", "bfloat16")),
+                "handoff_teacher_gpu_memory_utilization": float(
+                    self.handoff_opd_cfg.get("teacher_gpu_memory_utilization", 0.4)
+                ),
+                "handoff_teacher_max_model_len": int(
+                    self.handoff_opd_cfg.get("teacher_max_model_len", 32768)
+                ),
+                "handoff_teacher_max_num_batched_tokens": int(
+                    self.handoff_opd_cfg.get("teacher_max_num_batched_tokens", 32768)
+                ),
+                "handoff_teacher_max_num_seqs": int(self.handoff_opd_cfg.get("teacher_max_num_seqs", 64)),
+                "handoff_teacher_enforce_eager": bool(self.handoff_opd_cfg.get("teacher_enforce_eager", False)),
+            }
+        )
+        with marked_timer("teacher_continuation", timing_raw, color="purple"):
+            teacher_output = self.rm_wg.generate_continuations(student_output)
+        return attach_teacher_continuations(student_output, teacher_output)
 
     def _update_prune_opd_dynamic_response_length(self, effective_response_length: torch.Tensor) -> dict[str, float]:
         if not self.prune_opd_dynamic_response_length_enabled:
@@ -1217,6 +1301,7 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        gen_batch_output = self._apply_handoff_opd(gen_batch_output, timing_raw)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1251,10 +1336,24 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if "handoff_parent_index" in gen_batch_output.batch:
+                        parent_index_data = gen_batch_output.pop(batch_keys=["handoff_parent_index"])
+                        parent_indices = parent_index_data.batch["handoff_parent_index"]
+                        batch = batch.select_idxs(parent_indices)
+                        if self.handoff_select_best_verified_suffix:
+                            gen_batch_output.batch["handoff_parent_index"] = parent_indices
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if self.handoff_opd_enabled:
+                        handoff_count = batch.batch["handoff_mask"].float().sum()
+                        suffix_tokens = batch.batch["handoff_ce_mask"].float().sum()
+                        metrics["handoff/ratio"] = (handoff_count / max(len(batch), 1)).item()
+                        metrics["handoff/teacher_suffix_tokens"] = suffix_tokens.item()
+                        metrics["handoff/teacher_suffix_tokens_per_sample"] = (
+                            suffix_tokens / handoff_count.clamp_min(1)
+                        ).item()
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1629,6 +1728,64 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if self.handoff_opd_enabled and self.handoff_verified_suffix_only:
+                            if "true_reward_score" not in reward_extra_infos_dict:
+                                raise RuntimeError(
+                                    "Verified suffix SFT requires the reward manager to return true_reward_score; "
+                                    "distillation rm_scores cannot be used as a correctness label."
+                                )
+                            if self.handoff_select_best_verified_suffix:
+                                batch, selection_stats = select_best_verified_handoff_candidate(
+                                    batch,
+                                    reward_scores=batch.batch["true_reward_score"],
+                                    correct_threshold=self.handoff_correct_threshold,
+                                )
+                                handoff_parent_count = max(selection_stats["handoff_parent_count"], 1)
+                                candidate_handoff_count = max(selection_stats["candidate_handoff_count"], 1)
+                                metrics["handoff/teacher_suffix_candidate_correct_count"] = selection_stats[
+                                    "candidate_correct_count"
+                                ]
+                                metrics["handoff/teacher_suffix_candidate_correct_ratio"] = (
+                                    selection_stats["candidate_correct_count"] / candidate_handoff_count
+                                )
+                                metrics["handoff/teacher_suffix_correct_count"] = selection_stats[
+                                    "selected_correct_count"
+                                ]
+                                metrics["handoff/teacher_suffix_correct_ratio"] = (
+                                    selection_stats["selected_correct_count"] / handoff_parent_count
+                                )
+                                metrics["handoff/actor_batch_size_after_selection"] = selection_stats["parent_count"]
+
+                                # Candidate selection changes both row count and order.
+                                if self.config.trainer.balance_batch:
+                                    self._balance_batch(batch, metrics=metrics, logging_prefix="actor_seqlen")
+                                batch.meta_info["global_token_num"] = torch.sum(
+                                    batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                                reward_extra_infos_dict = {
+                                    key: batch.non_tensor_batch[key]
+                                    for key in reward_extra_infos_dict
+                                    if key in batch.non_tensor_batch
+                                }
+                            else:
+                                accepted_handoff = gate_teacher_suffix_sft_by_reward(
+                                    batch,
+                                    reward_scores=batch.batch["true_reward_score"],
+                                    correct_threshold=self.handoff_correct_threshold,
+                                )
+                                handoff_mask = batch.batch["handoff_mask"].to(
+                                    device=accepted_handoff.device, dtype=torch.bool
+                                )
+                                handoff_count = handoff_mask.sum()
+                                accepted_count = accepted_handoff.sum()
+                                metrics["handoff/teacher_suffix_correct_count"] = accepted_count.item()
+                                metrics["handoff/teacher_suffix_correct_ratio"] = (
+                                    accepted_count.float() / handoff_count.clamp_min(1)
+                                ).item()
+                            metrics["handoff/verified_suffix_tokens"] = (
+                                batch.batch["handoff_ce_mask"].float().sum().item()
+                            )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
