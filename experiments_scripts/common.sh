@@ -120,6 +120,11 @@ run_opd() {
     # so keep that sum below the mean response length or the intervention is inert.
     export TEACHER_CTX_WINDOW="${TEACHER_CTX_WINDOW:-0}"
     export TEACHER_CTX_SEGMENT="${TEACHER_CTX_SEGMENT:-4096}"
+    # CFG-guided teacher. 0 = disabled. gamma > 0 makes the run G-OPD whose reference
+    # branch is the same teacher scored with the prompt deleted, so the sampled-token
+    # advantage is (1+g)*log q_full - g*log q_free - log p. Needs LOG_PROB_TOP_K=0 and
+    # no separate reference model; lambda_vals is derived below as 1 + gamma.
+    export TEACHER_CFG_GAMMA="${TEACHER_CFG_GAMMA:-0}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
     export IS_PLOT="${IS_PLOT:-False}"
@@ -168,6 +173,17 @@ run_opd() {
         fi
     fi
 
+    if awk -v g="${TEACHER_CFG_GAMMA}" 'BEGIN { exit !(g > 0) }'; then
+        if [[ "${GOPD_ENABLE}" == "True" ]]; then
+            echo "TEACHER_CFG_GAMMA and GOPD_ENABLE both drive policy_loss.lambda_vals; enable only one." >&2
+            exit 1
+        fi
+        if [[ "${LOG_PROB_TOP_K}" != "0" ]]; then
+            echo "TEACHER_CFG_GAMMA requires LOG_PROB_TOP_K=0 (sampled-token path), got ${LOG_PROB_TOP_K}." >&2
+            exit 1
+        fi
+    fi
+
     require_path "$(resolve_path "${TRAIN_DATASET}")"
     require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
     require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME24/test.parquet")"
@@ -207,8 +223,13 @@ run_opd() {
         tchwin_tag="-tchwin_${TEACHER_CTX_WINDOW}_seg_${TEACHER_CTX_SEGMENT}_onset_$(( TEACHER_CTX_WINDOW + TEACHER_CTX_SEGMENT ))"
     fi
 
+    local cfgtch_tag=""
+    if awk -v g="${TEACHER_CFG_GAMMA}" 'BEGIN { exit !(g > 0) }'; then
+        cfgtch_tag="-cfgtch_${TEACHER_CFG_GAMMA}"
+    fi
+
     local experiment_name
-    experiment_name="${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${tchwin_tag}-${timestamp}"
+    experiment_name="${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${tchwin_tag}${cfgtch_tag}-${timestamp}"
     local ckpt_root="${CKPT_ROOT:-${REPO_ROOT}/checkpoint}"
     local ckpt_path="${ckpt_root}/${experiment_name}"
 
@@ -251,6 +272,11 @@ run_opd() {
         fi
     else
         echo "Teacher ctx window: <disabled, teacher sees full prefix>"
+    fi
+    if awk -v g="${TEACHER_CFG_GAMMA}" 'BEGIN { exit !(g > 0) }'; then
+        echo "CFG-guided teacher: gamma=${TEACHER_CFG_GAMMA} -> lambda_vals=$(awk -v g="${TEACHER_CFG_GAMMA}" 'BEGIN { printf "%g", 1 + g }') (reference branch = prompt-free teacher)"
+    else
+        echo "CFG-guided teacher: <disabled>"
     fi
     echo "Experiment name: ${experiment_name}"
     echo "Checkpoint dir: ${ckpt_path}"
@@ -306,6 +332,7 @@ run_opd() {
         "+actor_rollout_ref.rollout.teacher_temperature=${TEACHER_TEMPERATURE}"
         "+actor_rollout_ref.rollout.teacher_ctx_window=${TEACHER_CTX_WINDOW}"
         "+actor_rollout_ref.rollout.teacher_ctx_segment=${TEACHER_CTX_SEGMENT}"
+        "+actor_rollout_ref.rollout.teacher_cfg_gamma=${TEACHER_CFG_GAMMA}"
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
         "actor_rollout_ref.rollout.max_model_len=${max_model_len}"
@@ -353,6 +380,18 @@ run_opd() {
             "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
             "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
+        )
+    fi
+
+    if awk -v g="${TEACHER_CFG_GAMMA}" 'BEGIN { exit !(g > 0) }'; then
+        # Same G-OPD actor path as above, but the reference branch is the prompt-free
+        # teacher computed inside the reward worker, so no reference model is loaded
+        # and lambda is tied to gamma: (1+g)*T_full - g*T_free - S needs lambda = 1+g.
+        local cfg_lambda
+        cfg_lambda="$(awk -v g="${TEACHER_CFG_GAMMA}" 'BEGIN { printf "%g", 1 + g }')"
+        cmd+=(
+            "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
+            "++actor_rollout_ref.actor.policy_loss.lambda_vals=${cfg_lambda}"
         )
     fi
 

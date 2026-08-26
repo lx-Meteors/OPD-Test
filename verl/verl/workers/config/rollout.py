@@ -166,6 +166,22 @@ class RolloutConfig(BaseConfig):
     teacher_ctx_window: int = 0
     teacher_ctx_segment: int = 4096
 
+    # CFG-guided teacher (context-contrast G-OPD). The teacher scores every response
+    # token twice: once under the full context [prompt + student prefix] and once with
+    # the prompt deleted [anchor + student prefix]. The prompt-free pass stands in for
+    # the G-OPD reference branch, so the sampled-token advantage becomes
+    #
+    #     (1 + g) * log q_full - g * log q_free - log p,
+    #
+    # whose per-state optimum is the guided teacher q_full^(1+g) / q_free^g (the
+    # missing log-partition depends only on the state, so it drops out of the policy
+    # gradient). The student rollout, validation, and every other knob are untouched;
+    # like the windowed teacher this only changes what the teacher conditions on.
+    # 0 disables. Requires log_prob_top_k == 0 (sampled-token path) and no separate
+    # reference model. Enable through the run scripts, which also set the matching
+    # policy_loss.lambda_vals = 1 + g.
+    teacher_cfg_gamma: float = 0.0
+
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True

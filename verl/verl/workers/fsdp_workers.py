@@ -2795,6 +2795,22 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             teacher_temperature = data.meta_info.get("teacher_temperature", self.config.get("teacher_temperature", 1.0))
             ctx_window = data.meta_info.get("teacher_ctx_window", self.config.get("teacher_ctx_window", 0))
             ctx_segment = data.meta_info.get("teacher_ctx_segment", self.config.get("teacher_ctx_segment", 4096))
+            cfg_gamma = float(data.meta_info.get("teacher_cfg_gamma", self.config.get("teacher_cfg_gamma", 0.0)) or 0.0)
+
+            if cfg_gamma > 0.0:
+                assert top_k == 0, (
+                    "teacher_cfg_gamma only supports the sampled-token path (log_prob_top_k == 0); "
+                    f"got log_prob_top_k={top_k}"
+                )
+                assert not self._do_switch_chat_template, (
+                    "teacher_cfg_gamma re-scores the student's own token ids without the prompt, "
+                    "which requires student and teacher to share a tokenizer"
+                )
+                if self.rank == 0:
+                    print(
+                        f"CFG-guided teacher ENABLED: gamma={cfg_gamma} "
+                        f"(G-OPD reference branch = teacher scored without the prompt)"
+                    )
 
             if ctx_window and ctx_window > 0:
                 if self.rank == 0:
@@ -2826,6 +2842,44 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 teacher_in_student_mask,
             ) = forward_out
 
+            teacher_free_logp = None
+            if cfg_gamma > 0.0:
+                # Prompt-free pass: the same teacher re-scores the student's response with
+                # the prompt deleted, [anchor + response]. Its log-probs feed the G-OPD
+                # reference branch, so the actor's advantage becomes the guided teacher
+                # (1+g)*log q_full - g*log q_free - log p. A single anchor token stands in
+                # for the prompt so the first response token still has a predecessor to be
+                # scored from; everything downstream of the input build reuses the plain
+                # teacher forward, so micro-batching and FSDP collectives are unchanged.
+                from verl.utils.model import compute_position_id_with_mask
+
+                free_responses = rm_data.batch["responses"]
+                free_resp_len = free_responses.size(1)
+                free_resp_mask = rm_data.batch["attention_mask"][:, -free_resp_len:]
+                anchor_id = self.tokenizer.bos_token_id
+                if anchor_id is None:
+                    anchor_id = self.tokenizer.eos_token_id
+                anchor = torch.full(
+                    (free_responses.size(0), 1),
+                    anchor_id,
+                    dtype=free_responses.dtype,
+                    device=free_responses.device,
+                )
+                free_batch = {
+                    "input_ids": torch.cat([anchor, free_responses], dim=1),
+                    "attention_mask": torch.cat([torch.ones_like(anchor), free_resp_mask], dim=1),
+                    "responses": free_responses,
+                }
+                free_batch["position_ids"] = compute_position_id_with_mask(free_batch["attention_mask"])
+                free_out = self._teacher_forward_batch(
+                    TensorDict(free_batch, batch_size=free_responses.size(0)),
+                    0,
+                    top_k_strategy,
+                    teacher_temperature,
+                    False,
+                )
+                teacher_free_logp = free_out[0]
+
             if top_k > 0:
                 # Reward calculation is moved to ray_trainer for top_k > 0
                 # because it needs student_on_teacher_log_probs which requires another actor forward
@@ -2848,6 +2902,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             
             if teacher_on_student_logp is not None:
                 tensors["teacher_on_student_log_probs"] = teacher_on_student_logp
+
+            if teacher_free_logp is not None:
+                tensors["teacher_free_log_probs"] = teacher_free_logp
 
             if teacher_top_k_ids is not None:
                 tensors["teacher_top_k_ids"] = teacher_top_k_ids

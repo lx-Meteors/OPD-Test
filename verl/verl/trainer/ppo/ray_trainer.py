@@ -1302,6 +1302,9 @@ class RayPPOTrainer:
                             batch.meta_info["teacher_ctx_segment"] = self.config.actor_rollout_ref.rollout.get(
                                 "teacher_ctx_segment", 4096
                             )
+                            batch.meta_info["teacher_cfg_gamma"] = self.config.actor_rollout_ref.rollout.get(
+                                "teacher_cfg_gamma", 0.0
+                            )
                             prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", None)
                             if prune_opd_cfg is not None and prune_opd_cfg.get("enable", False):
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)
@@ -1309,6 +1312,20 @@ class RayPPOTrainer:
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
                                 batch = batch.union(teacher_data)
+
+                            teacher_cfg_gamma = float(
+                                self.config.actor_rollout_ref.rollout.get("teacher_cfg_gamma", 0.0) or 0.0
+                            )
+                            if teacher_cfg_gamma > 0.0:
+                                # The G-OPD advantage in the actor reads ref_log_prob, but the
+                                # reference here is the same teacher scored without the prompt,
+                                # not a third model. Alias it so the actor path stays untouched
+                                # and no reference worker is ever instantiated.
+                                assert not self.use_reference_policy, (
+                                    "teacher_cfg_gamma replaces the G-OPD reference model with the "
+                                    "prompt-free teacher; do not also configure a reference policy"
+                                )
+                                batch.batch["ref_log_prob"] = batch.batch["teacher_free_log_probs"]
 
                             if top_k > 0:
                                 # All distillation reward calculation is now moved to GPU worker (actor_rollout_wg)
