@@ -2856,9 +2856,21 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 free_responses = rm_data.batch["responses"]
                 free_resp_len = free_responses.size(1)
                 free_resp_mask = rm_data.batch["attention_mask"][:, -free_resp_len:]
-                anchor_id = self.tokenizer.bos_token_id
+                # The worker only builds a tokenizer when chat-template switching is
+                # configured (input_tokenizer != null), so resolve the anchor from the
+                # model config instead, which always exists. bos falls back to eos;
+                # either is fine -- the anchor only has to be a neutral predecessor
+                # for the first response token.
+                module_cfg = getattr(self.reward_module, "module", self.reward_module).config
+                anchor_id = getattr(module_cfg, "bos_token_id", None)
                 if anchor_id is None:
-                    anchor_id = self.tokenizer.eos_token_id
+                    anchor_id = getattr(module_cfg, "eos_token_id", None)
+                if isinstance(anchor_id, (list, tuple)):
+                    anchor_id = anchor_id[0]
+                assert anchor_id is not None, (
+                    "teacher_cfg_gamma: could not resolve an anchor token id from the "
+                    "reward model config (bos_token_id and eos_token_id are both unset)"
+                )
                 anchor = torch.full(
                     (free_responses.size(0), 1),
                     anchor_id,
