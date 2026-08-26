@@ -1296,6 +1296,12 @@ class RayPPOTrainer:
                             batch.meta_info["teacher_ctx_window"] = self.config.actor_rollout_ref.rollout.get(
                                 "teacher_ctx_window", 0
                             )
+                            # Travels through meta_info to both the reward worker (which runs
+                            # the prompt-free teacher pass) and compute_distillation_reward
+                            # (which folds the tilt into the only_stu reward).
+                            batch.meta_info["teacher_cfg_gamma"] = self.config.actor_rollout_ref.rollout.get(
+                                "teacher_cfg_gamma", 0.0
+                            )
                             prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", None)
                             if prune_opd_cfg is not None and prune_opd_cfg.get("enable", False):
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)

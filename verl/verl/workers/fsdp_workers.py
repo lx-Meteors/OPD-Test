@@ -2743,6 +2743,22 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             top_k = data.meta_info.get("log_prob_top_k", self.config.get("log_prob_top_k", 0))
             top_k_strategy = data.meta_info.get("top_k_strategy", self.config.get("top_k_strategy", "only_stu"))
             teacher_temperature = data.meta_info.get("teacher_temperature", self.config.get("teacher_temperature", 1.0))
+            cfg_gamma = float(data.meta_info.get("teacher_cfg_gamma", self.config.get("teacher_cfg_gamma", 0.0)) or 0.0)
+
+            if cfg_gamma > 0.0:
+                assert top_k > 0 and top_k_strategy == "only_stu", (
+                    "teacher_cfg_gamma on this branch supports the top-k only_stu path; "
+                    f"got top_k={top_k}, strategy={top_k_strategy}"
+                )
+                assert not self._do_switch_chat_template, (
+                    "teacher_cfg_gamma re-scores the student's own token ids without the prompt, "
+                    "which requires student and teacher to share a tokenizer"
+                )
+                if self.rank == 0:
+                    print(
+                        f"CFG-guided teacher ENABLED: gamma={cfg_gamma} "
+                        f"(only_stu reward uses (1+g)*logq_full - g*logq_free per top-k cell)"
+                    )
             
             if ctx_window and ctx_window > 0:
                 if self.rank == 0:
@@ -2770,6 +2786,56 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 teacher_in_student_mask,
             ) = forward_out
 
+            teacher_free_logp = None
+            teacher_free_on_student_logp = None
+            if cfg_gamma > 0.0:
+                from verl.utils.model import compute_position_id_with_mask
+
+                responses = rm_data.batch["responses"]
+                attn = rm_data.batch["attention_mask"]
+                bsz, resp_len = responses.shape
+                resp_mask = attn[:, -resp_len:]
+
+                # Prompt-free context: [anchor] + student response. A single anchor
+                # token replaces the prompt so that response position 0 still has a
+                # predecessor to be scored from. BOS when the teacher has one, EOS
+                # otherwise (Qwen3 exposes no BOS). Read the ids off the model config:
+                # RewardModelWorker only builds self.tokenizer when input_tokenizer is
+                # configured, which it is not in the shared-tokenizer setup.
+                unwrapped = self.reward_module
+                while hasattr(unwrapped, "_fsdp_wrapped_module"):
+                    unwrapped = unwrapped._fsdp_wrapped_module
+                model_cfg = unwrapped.config
+                anchor_id = getattr(model_cfg, "bos_token_id", None)
+                if anchor_id is None:
+                    anchor_id = getattr(model_cfg, "eos_token_id", None)
+                if isinstance(anchor_id, (list, tuple)):
+                    anchor_id = anchor_id[0]
+                assert anchor_id is not None, "teacher config exposes neither bos nor eos token id"
+
+                anchor = torch.full((bsz, 1), anchor_id, dtype=responses.dtype, device=responses.device)
+                free_td = {
+                    "input_ids": torch.cat([anchor, responses], dim=1),
+                    "attention_mask": torch.cat([torch.ones_like(anchor), resp_mask], dim=1),
+                    "responses": responses,
+                }
+                free_td["position_ids"] = compute_position_id_with_mask(free_td["attention_mask"])
+                if student_top_k_ids is not None:
+                    free_td["student_top_k_ids"] = student_top_k_ids
+
+                free_out = self._teacher_forward_batch(
+                    TensorDict(free_td, batch_size=bsz),
+                    top_k,
+                    top_k_strategy,
+                    teacher_temperature,
+                    False,
+                )
+                teacher_free_logp = free_out[0]
+                teacher_free_on_student_logp = free_out[1]
+                assert teacher_free_on_student_logp is not None, (
+                    "prompt-free teacher pass returned no read-out on the student's top-k ids"
+                )
+
             if top_k > 0:
                 # Reward calculation is moved to ray_trainer for top_k > 0
                 # because it needs student_on_teacher_log_probs which requires another actor forward
@@ -2792,6 +2858,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             
             if teacher_on_student_logp is not None:
                 tensors["teacher_on_student_log_probs"] = teacher_on_student_logp
+
+            if teacher_free_logp is not None:
+                tensors["teacher_free_log_probs"] = teacher_free_logp
+            if teacher_free_on_student_logp is not None:
+                tensors["teacher_free_on_student_log_probs"] = teacher_free_on_student_logp
 
             if teacher_top_k_ids is not None:
                 tensors["teacher_top_k_ids"] = teacher_top_k_ids

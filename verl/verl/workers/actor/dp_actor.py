@@ -501,6 +501,15 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError(
                 f"reward_weight_mode='{reward_weight_mode}' is only validated with top_k_strategy='only_stu', got '{strategy}'"
             )
+        cfg_gamma = float(data.meta_info.get("teacher_cfg_gamma", 0.0) or 0.0)
+        if cfg_gamma > 0.0 and (
+            strategy != "only_stu"
+            or reward_weight_mode in ("tri", "rkl_dt", "rkl_cdt", "rkl_sdt", "rkl_sdtw", "fq", "fkl", "mu_dt")
+        ):
+            raise ValueError(
+                "teacher_cfg_gamma only modifies the plain only_stu reward; "
+                f"got strategy='{strategy}', reward_weight_mode='{reward_weight_mode}'"
+            )
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -617,6 +626,14 @@ class DataParallelPPOActor(BasePPOActor):
                 rm_scores = compute_rkl_sdtw_scores(S_logp, T_on_S, valid_mask)
             else:
                 kl_val = S_logp - T_on_S
+                if cfg_gamma > 0.0:
+                    # CFG-guided teacher: per top-k cell the reward becomes
+                    #   -w_k * (log p_k - ((1+g) * log q_full,k - g * log q_free,k))
+                    # where q_free is the teacher scored on [anchor + response] with the
+                    # prompt deleted. Only the teacher term changes; the student_p
+                    # weights below are computed exactly as in the baseline.
+                    T_free_on_S = data.batch["teacher_free_on_student_log_probs"].to(device)
+                    kl_val = S_logp - ((1.0 + cfg_gamma) * T_on_S - cfg_gamma * T_free_on_S)
                 norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
                 rm_scores = -kl_val * norm_weights
             

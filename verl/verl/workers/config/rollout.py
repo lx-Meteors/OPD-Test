@@ -151,6 +151,19 @@ class RolloutConfig(BaseConfig):
     # trained on. 4096 measured best; windows below ~1024 make the teacher confidently
     # misaligned instead.
     teacher_ctx_window: int = 0
+    # CFG-guided teacher for the top-k path. The teacher scores the student's top-k
+    # token ids twice: once under the full context [prompt + student prefix] and once
+    # with the prompt deleted [anchor + student prefix]. The per-cell reward becomes
+    #
+    #     -w_k * (log p_k - ((1+g) * log q_full,k - g * log q_free,k)),
+    #
+    # i.e. the baseline only_stu reward with the teacher log-prob replaced by the
+    # CFG-tilted one; the student_p weights w_k are untouched. The prompt-free branch
+    # measures how much of each cell's probability is generic prefix-continuation, so
+    # the tilt (log q_full - log q_free) rewards question-anchored tokens and
+    # penalizes echo drift. 0 disables. Requires top_k > 0 and
+    # top_k_strategy == "only_stu"; no other knob changes.
+    teacher_cfg_gamma: float = 0.0
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True

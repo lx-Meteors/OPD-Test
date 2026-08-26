@@ -115,6 +115,11 @@ run_opd() {
     export REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
     # 0 = teacher sees the full student prefix (baseline)
     export TEACHER_CTX_WINDOW="${TEACHER_CTX_WINDOW:-0}"
+    # CFG-guided teacher for the top-k only_stu reward. gamma > 0 adds a second,
+    # prompt-free teacher pass over [anchor + response] and replaces the teacher
+    # log-prob in each top-k cell with (1+g)*logq_full - g*logq_free; the student_p
+    # weights are unchanged. 0 = baseline reward.
+    export TEACHER_CFG_GAMMA="${TEACHER_CFG_GAMMA:-0}"
     export USE_KL="${USE_KL:-False}"
     export ENABLE_FORMAT_REWARD="${ENABLE_FORMAT_REWARD:-False}"
     export MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
@@ -160,7 +165,11 @@ run_opd() {
     ppo_max_token_len_per_gpu=$(( ((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) > 32768) ? (MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) : 32768 ))
 
     local experiment_name
-    experiment_name="${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-tchwin_${TEACHER_CTX_WINDOW}-${timestamp}"
+    local cfgtch_tag=""
+    if awk "BEGIN{exit !(${TEACHER_CFG_GAMMA} > 0)}"; then
+        cfgtch_tag="-cfgtch_${TEACHER_CFG_GAMMA}"
+    fi
+    experiment_name="${run_name}_${ADV_ESTIMATOR}_${actor_model_name}_${reward_model_name}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-tchwin_${TEACHER_CTX_WINDOW}${cfgtch_tag}-${timestamp}"
     local ckpt_root="${CKPT_ROOT:-${REPO_ROOT}/checkpoint}"
     local ckpt_path="${ckpt_root}/${experiment_name}"
 
@@ -187,6 +196,11 @@ run_opd() {
     echo "Save frequency: ${SAVE_FREQ}"
     echo "Total training steps: ${TOTAL_TRAINING_STEPS}"
     echo "Thinking override: ${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-<default>}"
+    if [[ -n "${cfgtch_tag}" ]]; then
+        echo "CFG-guided teacher: gamma=${TEACHER_CFG_GAMMA} (top-k reward uses (1+g)*logq_full - g*logq_free)"
+    else
+        echo "CFG-guided teacher: disabled"
+    fi
     echo "Experiment name: ${experiment_name}"
     echo "Checkpoint dir: ${ckpt_path}"
     echo "Tracking backends: ${TRACKING_BACKENDS}"
@@ -232,6 +246,7 @@ run_opd() {
         "+actor_rollout_ref.rollout.reward_weight_mode=${REWARD_WEIGHT_MODE}"
         "+actor_rollout_ref.rollout.teacher_temperature=${TEACHER_TEMPERATURE}"
         "+actor_rollout_ref.rollout.teacher_ctx_window=${TEACHER_CTX_WINDOW}"
+        "+actor_rollout_ref.rollout.teacher_cfg_gamma=${TEACHER_CFG_GAMMA}"
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${PARALLEL_SIZE}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.8"
         "actor_rollout_ref.rollout.max_model_len=${max_model_len}"
