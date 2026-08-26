@@ -28,4 +28,4 @@ export APPLY_CHAT_TEMPLATE_ENABLE_THINKING="${APPLY_CHAT_TEMPLATE_ENABLE_THINKIN
 export TEACHER_CTX_WINDOW=0
 export TEACHER_CFG_GAMMA="${TEACHER_CFG_GAMMA:-0.3}"
 
-run_opd "cfgopd-qwen3-4b-nonthinking-step1200-qwen3-4b" "$@"
+run_opd "opd-cfg-qwen3-4b-nonthinking-step1200-qwen3-4b" "$@"
