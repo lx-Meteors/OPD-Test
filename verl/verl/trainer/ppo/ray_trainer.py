@@ -1302,6 +1302,9 @@ class RayPPOTrainer:
                             batch.meta_info["teacher_ctx_segment"] = self.config.actor_rollout_ref.rollout.get(
                                 "teacher_ctx_segment", 4096
                             )
+                            batch.meta_info["opd_neg_kappa"] = self.config.actor_rollout_ref.rollout.get(
+                                "opd_neg_kappa", 0.0
+                            )
                             prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", None)
                             if prune_opd_cfg is not None and prune_opd_cfg.get("enable", False):
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)

@@ -2795,6 +2795,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             teacher_temperature = data.meta_info.get("teacher_temperature", self.config.get("teacher_temperature", 1.0))
             ctx_window = data.meta_info.get("teacher_ctx_window", self.config.get("teacher_ctx_window", 0))
             ctx_segment = data.meta_info.get("teacher_ctx_segment", self.config.get("teacher_ctx_segment", 4096))
+            neg_kappa = float(data.meta_info.get("opd_neg_kappa", self.config.get("opd_neg_kappa", 0.0)) or 0.0)
+
+            if neg_kappa > 0.0:
+                assert top_k == 0, (
+                    "opd_neg_kappa only supports the sampled-token path (log_prob_top_k == 0); "
+                    f"got log_prob_top_k={top_k}"
+                )
+                if self.rank == 0:
+                    print(
+                        f"Asymmetric OPD reward ENABLED: kappa={neg_kappa} "
+                        f"(positive side linear RKL, negative side expm1(kappa*r)/kappa, floor -1/kappa)"
+                    )
 
             if ctx_window and ctx_window > 0:
                 if self.rank == 0:
@@ -2836,6 +2848,19 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 
                 reverse_kl = student_logp - teacher_logp
                 rm_scores = -reverse_kl
+                if neg_kappa > 0.0:
+                    # Asymmetric shaping of the sampled-token reward r = log q - log p:
+                    # keep the supplement side (r >= 0, teacher over-weights the token)
+                    # linear as in reverse KL, and pass the dismantle side (r < 0)
+                    # through the forward-KL curve expm1(kappa*r)/kappa. Punishments are
+                    # bounded below by -1/kappa; small cleanups keep slope ~1 near zero;
+                    # as p -> q the curve reduces to plain RKL, so the fixed point is
+                    # unchanged and full dismantling force returns late in training.
+                    rm_scores = torch.where(
+                        rm_scores >= 0,
+                        rm_scores,
+                        torch.expm1(neg_kappa * rm_scores) / neg_kappa,
+                    )
                 
                 teacher_valid_counts = None
                 overlap_mask = None

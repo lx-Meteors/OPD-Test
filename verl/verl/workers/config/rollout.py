@@ -166,6 +166,18 @@ class RolloutConfig(BaseConfig):
     teacher_ctx_window: int = 0
     teacher_ctx_segment: int = 4096
 
+    # Asymmetric shaping of the sampled-token OPD reward r = log q - log p
+    # ("supplement first, dismantle later"). 0 disables (plain reverse KL).
+    # When kappa > 0 the positive side stays linear and the negative side becomes
+    # expm1(kappa * r) / kappa: the forward-KL curve. Punishments are bounded below
+    # by -1/kappa, keep slope ~1 near zero (small legitimate cleanups untouched),
+    # and the curve anneals back to plain RKL as the student approaches the
+    # teacher, so the fixed point p = q is unchanged. kappa = 1 is the canonical
+    # setting (negative side exactly e^r - 1, jointly a valid f-divergence with
+    # the linear positive side); smaller kappa caps less aggressively.
+    # Requires log_prob_top_k == 0 (sampled-token reward path).
+    opd_neg_kappa: float = 0.0
+
     prune_opd: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
