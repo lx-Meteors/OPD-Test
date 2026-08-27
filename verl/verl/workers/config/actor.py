@@ -43,6 +43,9 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         only_reverse_kl_advantages (bool): Whether to replace rollout advantages with the G-OPD token signal.
         lambda_vals (float): G-OPD reward scaling factor. A value of 1.0 recovers standard OPD.
+        extrapolation_max_tokens (int): Apply the extra G-OPD extrapolation residual only to the first
+            N response tokens. A value <= 0 applies extrapolation to the full response. Standard OPD
+            alignment remains active on every valid response token.
     """
 
     loss_mode: str = "vanilla"
@@ -53,6 +56,7 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     only_reverse_kl_advantages: bool = False
     lambda_vals: float = 1.0
+    extrapolation_max_tokens: int = 0
 
 
 @dataclass

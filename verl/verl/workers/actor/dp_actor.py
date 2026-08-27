@@ -897,16 +897,47 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.policy_loss.only_reverse_kl_advantages:
                         lambda_value = self.config.policy_loss.lambda_vals
+                        extrapolation_max_tokens = self.config.policy_loss.extrapolation_max_tokens
                         ref_log_prob = model_inputs["ref_log_prob"]
                         teacher_log_prob = model_inputs["teacher_log_probs"]
                         with torch.no_grad():
-                            # G-OPD cost: (log S - log R) - lambda * (log T - log R).
-                            # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
-                            reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
-                                teacher_log_prob - ref_log_prob
+                            # Decompose G-OPD into the full-trajectory OPD cost plus an extra
+                            # Teacher-Ref extrapolation residual:
+                            #   (log S - log T) - (lambda - 1) * (log T - log R).
+                            # Restricting the residual to a response prefix therefore makes
+                            # later tokens exactly standard OPD instead of removing their loss.
+                            response_positions = torch.arange(
+                                response_mask.shape[-1], device=response_mask.device
+                            )
+                            if extrapolation_max_tokens > 0:
+                                extrapolation_mask = response_positions < extrapolation_max_tokens
+                            else:
+                                extrapolation_mask = torch.ones_like(response_positions, dtype=torch.bool)
+
+                            extrapolation_mask_2d = extrapolation_mask.unsqueeze(0).expand_as(response_mask)
+                            extrapolation_mask_for_logprob = extrapolation_mask_2d
+                            while extrapolation_mask_for_logprob.dim() < old_log_prob.dim():
+                                extrapolation_mask_for_logprob = extrapolation_mask_for_logprob.unsqueeze(-1)
+
+                            opd_cost = old_log_prob - teacher_log_prob
+                            extrapolation_residual = teacher_log_prob - ref_log_prob
+                            reverse_kl = opd_cost - (lambda_value - 1.0) * (
+                                extrapolation_mask_for_logprob.to(extrapolation_residual.dtype)
+                                * extrapolation_residual
                             )
                             advantages = -reverse_kl
                         micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
+                        micro_batch_metrics["actor/gopd_extrapolation_max_tokens"] = (
+                            float(extrapolation_max_tokens) * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/gopd_extrapolated_token_fraction"] = (
+                            verl_F.masked_mean(
+                                extrapolation_mask_2d.to(response_mask.dtype), response_mask
+                            )
+                            .detach()
+                            .item()
+                            * loss_scale_factor
+                        )
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )

@@ -141,6 +141,7 @@ run_opd() {
     export KL_TYPE="${KL_TYPE:-low_var_kl}"
     export GOPD_ENABLE="${GOPD_ENABLE:-False}"
     export GOPD_LAMBDA="${GOPD_LAMBDA:-1.0}"
+    export GOPD_EXTRAPOLATION_MAX_TOKENS="${GOPD_EXTRAPOLATION_MAX_TOKENS:-0}"
     export ROLLOUT_IS="${ROLLOUT_IS:-null}"
     export ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
     export ROLLOUT_RS="${ROLLOUT_RS:-null}"
@@ -224,6 +225,11 @@ run_opd() {
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         echo "Reference: ${REFERENCE_MODEL_PATH}"
         echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        if (( GOPD_EXTRAPOLATION_MAX_TOKENS > 0 )); then
+            echo "G-OPD extrapolation scope: first ${GOPD_EXTRAPOLATION_MAX_TOKENS} response tokens"
+        else
+            echo "G-OPD extrapolation scope: full response"
+        fi
     fi
     echo "Train dataset: ${TRAIN_DATASET}"
     echo "Train batch size: ${TRAIN_BATCH_SIZE}"
@@ -333,6 +339,7 @@ run_opd() {
             "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
             "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
+            "++actor_rollout_ref.actor.policy_loss.extrapolation_max_tokens=${GOPD_EXTRAPOLATION_MAX_TOKENS}"
         )
     fi
 

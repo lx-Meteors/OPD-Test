@@ -131,6 +131,7 @@ export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parque
 export ADV_ESTIMATOR="${ADV_ESTIMATOR:-grpo}"
 export GOPD_ENABLE="${GOPD_ENABLE:-True}"
 export GOPD_LAMBDA="${GOPD_LAMBDA:-1.25}"
+export GOPD_EXTRAPOLATION_MAX_TOKENS="${GOPD_EXTRAPOLATION_MAX_TOKENS:-4096}"
 export USE_KL="${USE_KL:-True}"
 export KL_COEF="${KL_COEF:-0.0}"
 export KL_TYPE="${KL_TYPE:-low_var_kl}"
@@ -186,4 +187,4 @@ export PROJECT_NAME="${PROJECT_NAME:-on-policy-distillation}"
 export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[\"console\",\"wandb\"]}"
 export APPLY_CHAT_TEMPLATE_ENABLE_THINKING="${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-False}"
 
-run_opd "${OPD_RUN_NAME:-gopd-exopd-qwen3-4b-nonthinking-rl-math-step500-lambda-1.25}" "$@"
+run_opd "${OPD_RUN_NAME:-gopd-exopd-first4k-qwen3-4b-nonthinking-rl-math-step500-lambda-1.25}" "$@"
