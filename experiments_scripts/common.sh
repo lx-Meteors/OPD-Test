@@ -141,6 +141,14 @@ run_opd() {
     export KL_TYPE="${KL_TYPE:-low_var_kl}"
     export GOPD_ENABLE="${GOPD_ENABLE:-False}"
     export GOPD_LAMBDA="${GOPD_LAMBDA:-1.0}"
+    # SC-ratio OPD: adv = (logT - logS) * (1 + clamp(1 - SC_S/SC_T, 0, 1)); reference-free.
+    export GOPD_SC_RATIO="${GOPD_SC_RATIO:-False}"
+    # Live-clock control arm: adv = lambda * (logT - logS) when > 0; reference-free.
+    export GOPD_LIVE_CLOCK_LAMBDA="${GOPD_LIVE_CLOCK_LAMBDA:-0.0}"
+    GOPD_REFERENCE_FREE="False"
+    if [[ "${GOPD_SC_RATIO}" == "True" || ( "${GOPD_LIVE_CLOCK_LAMBDA}" != "0.0" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0" ) ]]; then
+        GOPD_REFERENCE_FREE="True"
+    fi
     export ROLLOUT_IS="${ROLLOUT_IS:-null}"
     export ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
     export ROLLOUT_RS="${ROLLOUT_RS:-null}"
@@ -154,13 +162,17 @@ run_opd() {
     export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-203}"
     export TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 
-    if [[ "${GOPD_ENABLE}" == "True" ]]; then
+    if [[ "${GOPD_ENABLE}" == "True" && "${GOPD_REFERENCE_FREE}" != "True" ]]; then
         : "${REFERENCE_MODEL_PATH:?REFERENCE_MODEL_PATH must be set when GOPD_ENABLE=True}"
         require_model_if_local_path "${REFERENCE_MODEL_PATH}"
         if [[ "${USE_KL}" != "True" ]]; then
             echo "G-OPD requires USE_KL=True so the fixed reference worker is instantiated." >&2
             exit 1
         fi
+    fi
+    if [[ "${GOPD_SC_RATIO}" == "True" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0.0" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0" ]]; then
+        echo "GOPD_SC_RATIO and GOPD_LIVE_CLOCK_LAMBDA are mutually exclusive." >&2
+        exit 1
     fi
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
@@ -222,8 +234,14 @@ run_opd() {
         echo "Teacher: <disabled>"
     fi
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
-        echo "Reference: ${REFERENCE_MODEL_PATH}"
-        echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        if [[ "${GOPD_SC_RATIO}" == "True" ]]; then
+            echo "Advantage mode: SC-ratio OPD (reference-free)"
+        elif [[ "${GOPD_REFERENCE_FREE}" == "True" ]]; then
+            echo "Advantage mode: live-clock OPD, lambda=${GOPD_LIVE_CLOCK_LAMBDA} (reference-free)"
+        else
+            echo "Reference: ${REFERENCE_MODEL_PATH}"
+            echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        fi
     fi
     echo "Train dataset: ${TRAIN_DATASET}"
     echo "Train batch size: ${TRAIN_BATCH_SIZE}"
@@ -330,10 +348,14 @@ run_opd() {
 
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         cmd+=(
-            "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
             "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
+            "++actor_rollout_ref.actor.policy_loss.sc_ratio_weight=${GOPD_SC_RATIO}"
+            "++actor_rollout_ref.actor.policy_loss.live_clock_lambda=${GOPD_LIVE_CLOCK_LAMBDA}"
         )
+        if [[ "${GOPD_REFERENCE_FREE}" != "True" ]]; then
+            cmd+=("+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}")
+        fi
     fi
 
     if [[ "${USE_KL}" == "True" ]]; then

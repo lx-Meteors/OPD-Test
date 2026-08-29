@@ -71,6 +71,13 @@ policy_loss:
   # G-OPD reward scaling factor; 1.0 recovers standard OPD
   lambda_vals: 1.0
 
+  # SC-ratio OPD: adv = (logT - logS) * (1 + clamp(1 - SC_S/SC_T, 0, 1)).
+  # Live, reference-free replacement for the frozen extrapolation term.
+  sc_ratio_weight: false
+
+  # Live-clock control arm: when > 0, adv = live_clock_lambda * (logT - logS).
+  live_clock_lambda: 0.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

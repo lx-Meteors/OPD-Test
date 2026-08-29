@@ -1579,6 +1579,15 @@ class RayPPOTrainer:
                                 )
                                 metrics.update({"teacher/entropy": teacher_entropy_agg.detach().item()})
 
+                            # Teacher self-certainty KL(U || pi_T), the SC-ratio channel
+                            if "teacher_self_certainty" in batch.batch.keys():
+                                teacher_sc_agg = agg_loss(
+                                    loss_mat=batch.batch["teacher_self_certainty"],
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                                metrics.update({"teacher/self_certainty": teacher_sc_agg.detach().item()})
+
                             # Cleanup: We are done with entropys
                             if "entropys" in batch.batch.keys():
                                 batch.batch.pop("entropys")
@@ -2558,6 +2567,9 @@ class RayPPOTrainer:
                     ]
                     if not self.config.actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages:
                         keys_to_pop.append("teacher_log_probs")
+                    if not self.config.actor_rollout_ref.actor.policy_loss.get("sc_ratio_weight", False):
+                        # Only the SC-ratio advantage mode consumes it in update_actor.
+                        keys_to_pop.append("teacher_self_certainty")
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
                             batch.batch.pop(key)

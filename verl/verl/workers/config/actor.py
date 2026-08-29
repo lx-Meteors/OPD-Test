@@ -43,6 +43,15 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         only_reverse_kl_advantages (bool): Whether to replace rollout advantages with the G-OPD token signal.
         lambda_vals (float): G-OPD reward scaling factor. A value of 1.0 recovers standard OPD.
+        sc_ratio_weight (bool): SC-ratio OPD mode. Replace the frozen reference
+            extrapolation with the live self-certainty gap weight:
+            adv = (log T - log S) * (1 + clamp(1 - SC_S/SC_T, 0, 1)).
+            Reference-free (no ref worker needed); requires the teacher worker's
+            teacher_self_certainty channel. Mutually exclusive with live_clock_lambda.
+        live_clock_lambda (float): Live-clock control arm. When > 0, use
+            adv = live_clock_lambda * (log T - log S), i.e. G-OPD with the frozen
+            initial-debt map d replaced by the live debt a (identical at init).
+            Reference-free. 0 disables.
     """
 
     loss_mode: str = "vanilla"
@@ -53,6 +62,8 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     only_reverse_kl_advantages: bool = False
     lambda_vals: float = 1.0
+    sc_ratio_weight: bool = False
+    live_clock_lambda: float = 0.0
 
 
 @dataclass

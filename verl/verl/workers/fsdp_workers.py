@@ -1924,6 +1924,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
     def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+        from verl.utils.self_certainty import self_certainty_from_logits
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
         import verl.utils.torch_functional as verl_F
         response_length = micro_batch["responses"].size(-1)
@@ -1939,6 +1940,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             teacher_top_k_ids = None
             teacher_top_k_log_probs = None
             teacher_entropy = None
+            teacher_self_certainty = None
             teacher_valid_counts = None
             teacher_overlap_mask = None
             teacher_in_student_mask = None  # For union strategy: T_in_S computed in chunks
@@ -1999,6 +2001,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 )
 
                 local_entropy_rmpad = None
+                local_sc_rmpad = None
                 local_valid_counts = None
                 local_overlap_mask = None
                 local_top_k_log_probs_on_student_ids = None
@@ -2020,6 +2023,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     # We want entropy at each position.
                     if compute_entropy:
                         local_entropy_rmpad = self._compute_entropy_safe(logits_rmpad) # (total_nnz,)
+                        # Self-certainty KL(U || p) rides the same schedule as the
+                        # entropy channel: one scalar per position for the SC-ratio
+                        # advantage (see verl/utils/self_certainty.py).
+                        local_sc_rmpad = self_certainty_from_logits(logits_rmpad)  # (total_nnz,)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -2144,6 +2151,15 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             sp_size=self.ulysses_sequence_parallel_size,
                             group=self.ulysses_sequence_parallel_group
                         )
+                    if local_sc_rmpad is not None:
+                        full_self_certainty = gather_outputs_and_unpad(
+                            local_hidden_states=local_sc_rmpad.unsqueeze(-1),
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                            group=self.ulysses_sequence_parallel_group
+                        )
                 else:
                     full_log_probs = pad_input(
                         hidden_states=rm_log_probs.unsqueeze(-1),
@@ -2208,6 +2224,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             batch=batch_size,
                             seqlen=seqlen,
                         )
+                    if local_sc_rmpad is not None:
+                        full_self_certainty = pad_input(
+                            hidden_states=local_sc_rmpad.unsqueeze(-1),
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
 
                 rm_log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 if local_top_k_log_probs_on_student_ids is not None:
@@ -2224,6 +2247,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     teacher_in_student_mask = full_teacher_in_student_mask[:, -response_length - 1 : -1, :] # Keep K dimension
                 if local_entropy_rmpad is not None:
                     teacher_entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+                if local_sc_rmpad is not None:
+                    teacher_self_certainty = full_self_certainty.squeeze(-1)[:, -response_length - 1 : -1]
 
             else:
                 output = self.reward_module(
@@ -2251,6 +2276,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     # Compute entropy
                     if compute_entropy:
                         teacher_entropy = self._compute_entropy_safe(rm_logits_resp) # (bsz, response_length)
+                        teacher_self_certainty = self_certainty_from_logits(rm_logits_resp)  # (bsz, response_length)
 
                     rm_log_probs = verl_F.logprobs_from_logits(rm_logits_resp, micro_batch["responses"])
                     
@@ -2287,7 +2313,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             teacher_on_student_log_probs = teacher_on_student_log_probs - teacher_logsumexp
                             teacher_overlap_mask = None
 
-            return rm_log_probs, teacher_on_student_log_probs, teacher_top_k_ids, teacher_top_k_log_probs, teacher_entropy, teacher_valid_counts, teacher_overlap_mask, teacher_in_student_mask
+            return rm_log_probs, teacher_on_student_log_probs, teacher_top_k_ids, teacher_top_k_log_probs, teacher_entropy, teacher_self_certainty, teacher_valid_counts, teacher_overlap_mask, teacher_in_student_mask
 
     def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor):
         batch_size = data.batch.batch_size[0]
@@ -2617,6 +2643,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             output_teacher_top_k_ids = []
             output_teacher_top_k_logp = []
             output_entropy = []
+            output_self_certainty = []
             output_valid_counts = []
             output_overlap_counts = []
             output_teacher_in_student = []  # For union strategy: T_in_S computed in chunks
@@ -2636,7 +2663,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     # Fallback for other types (e.g. dict) if split behaves differently
                     mb_top_k_ids = micro_batch.get("student_top_k_ids", None) if hasattr(micro_batch, "get") else None
 
-                teacher_logp_batch, teacher_on_student_logp_batch, teacher_top_k_ids_batch, teacher_top_k_logp_teacher_batch, teacher_entropy_batch, teacher_valid_counts_batch, teacher_overlap_mask_batch, teacher_in_student_mask_batch = self._forward_micro_batch(
+                teacher_logp_batch, teacher_on_student_logp_batch, teacher_top_k_ids_batch, teacher_top_k_logp_teacher_batch, teacher_entropy_batch, teacher_self_certainty_batch, teacher_valid_counts_batch, teacher_overlap_mask_batch, teacher_in_student_mask_batch = self._forward_micro_batch(
                     micro_batch, 
                     student_top_k_ids=mb_top_k_ids,
                     compute_entropy=compute_entropy,
@@ -2653,6 +2680,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     output_teacher_top_k_logp.append(teacher_top_k_logp_teacher_batch)
                 if teacher_entropy_batch is not None:
                     output_entropy.append(teacher_entropy_batch)
+                if teacher_self_certainty_batch is not None:
+                    output_self_certainty.append(teacher_self_certainty_batch)
                 if teacher_valid_counts_batch is not None:
                     output_valid_counts.append(teacher_valid_counts_batch)
                 if teacher_overlap_mask_batch is not None:
@@ -2676,6 +2705,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             teacher_entropy = None
             if len(output_entropy) > 0:
                 teacher_entropy = torch.cat(output_entropy, dim=0)
+
+            teacher_self_certainty = None
+            if len(output_self_certainty) > 0:
+                teacher_self_certainty = torch.cat(output_self_certainty, dim=0)
 
             teacher_valid_counts = None
             if len(output_valid_counts) > 0:
@@ -2702,6 +2735,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     teacher_top_k_logp = teacher_top_k_logp[revert_indices]
                 if teacher_entropy is not None:
                     teacher_entropy = teacher_entropy[revert_indices]
+                if teacher_self_certainty is not None:
+                    teacher_self_certainty = teacher_self_certainty[revert_indices]
                 if teacher_valid_counts is not None:
                     teacher_valid_counts = teacher_valid_counts[revert_indices]
                 if teacher_overlap_mask is not None:
@@ -2740,7 +2775,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
             if teacher_entropy is not None:
                 tensors["teacher_entropy"] = teacher_entropy
-                
+
+            if teacher_self_certainty is not None:
+                tensors["teacher_self_certainty"] = teacher_self_certainty
+
             if teacher_valid_counts is not None:
                 tensors["teacher_valid_counts"] = teacher_valid_counts
             if overlap_mask is not None:

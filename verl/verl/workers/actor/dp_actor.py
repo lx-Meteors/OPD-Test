@@ -34,6 +34,8 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
+from verl.utils.self_certainty import self_certainty_from_logits
+from verl.utils.self_certainty import sc_ratio_weight as sc_ratio_weight_fn
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
@@ -85,14 +87,17 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None,
+        calculate_self_certainty=False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
             topk_ids: # (bs, response_len, k)
             topk_log_probs: # (bs, response_len, k)
+            self_certainty: # (bs, response_len), no-grad KL(U || pi) per position,
+                only when calculate_self_certainty=True (else None)
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -109,6 +114,7 @@ class DataParallelPPOActor(BasePPOActor):
             entropy = None
             topk_ids = None
             topk_log_probs = None
+            self_certainty = None
             
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -182,7 +188,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
                 
-                need_logits = top_k > 0
+                need_logits = top_k > 0 or calculate_self_certainty
 
                 if self.use_fused_kernels and not need_logits:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -191,6 +197,11 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+
+                    if calculate_self_certainty:
+                        # no-grad statistic of the current (rollout-identical, since the
+                        # single optimizer step comes after this micro loop) policy
+                        sc_rmpad = self_certainty_from_logits(logits_rmpad)  # (total_nnz,)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -287,6 +298,13 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if calculate_self_certainty:
+                        sc_rmpad = gather_outputs_and_unpad(
+                            sc_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                     if top_k > 0:
                          topk_ids = gather_outputs_and_unpad(
                             topk_ids,
@@ -304,6 +322,13 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if calculate_self_certainty:
+                    full_self_certainty = pad_input(
+                        hidden_states=sc_rmpad.unsqueeze(-1),
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
@@ -332,6 +357,8 @@ class DataParallelPPOActor(BasePPOActor):
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if calculate_self_certainty:
+                    self_certainty = full_self_certainty.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 
                 if top_k > 0:
@@ -353,7 +380,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
                 
-                need_logits = top_k > 0
+                need_logits = top_k > 0 or calculate_self_certainty
                 if self.use_fused_kernels and not need_logits:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -363,6 +390,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+
+                    if calculate_self_certainty:
+                        self_certainty = self_certainty_from_logits(logits)  # (bsz, response_length)
                     
                     # Optimization: when top_k > 0, compute log_softmax once and gather both
                     # log_probs and topk_log_probs to avoid duplicate computation
@@ -393,7 +423,7 @@ class DataParallelPPOActor(BasePPOActor):
                         # Use pre-computed log_probs_all (always available when need_topk=True)
                         topk_log_probs = log_probs_all.gather(dim=-1, index=topk_ids)
 
-            return entropy, log_probs, topk_ids, topk_log_probs
+            return entropy, log_probs, topk_ids, topk_log_probs, self_certainty
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_probs_for_ids(self, data: DataProto) -> torch.Tensor:
@@ -433,7 +463,7 @@ class DataParallelPPOActor(BasePPOActor):
             mb_target_ids = model_inputs["target_ids"]
             with torch.no_grad():
                 # We reuse _forward_micro_batch. It returns (entropy, log_probs, topk_ids, topk_log_probs)
-                _, _, _, topk_log_probs = self._forward_micro_batch(
+                _, _, _, topk_log_probs, _ = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=False, 
                     top_k=top_k, student_top_k_ids=mb_target_ids
                 )
@@ -497,7 +527,7 @@ class DataParallelPPOActor(BasePPOActor):
                 model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                 mb_target_ids = model_inputs["teacher_top_k_ids"]
                 with torch.no_grad():
-                    _, _, _, topk_log_probs = self._forward_micro_batch(
+                    _, _, _, topk_log_probs, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=False, 
                         top_k=top_k, student_top_k_ids=mb_target_ids
                     )
@@ -707,7 +737,7 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs, topk_ids, topk_log_probs = self._forward_micro_batch(
+                entropy, log_probs, topk_ids, topk_log_probs, _ = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, top_k=top_k
                 )
             # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k
@@ -743,6 +773,33 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys, topk_ids_tensor, topk_log_probs_tensor
 
+    # Depth segmentation follows the established probe convention:
+    # [0, 2k), [2k, 4k), [4k, 8k), [8k, inf).
+    _SC_SEG_BOUNDS = (2048, 4096, 8192)
+
+    @torch.no_grad()
+    def _sc_ratio_metrics(self, sc_weight, student_sc, teacher_sc, response_mask):
+        """SC-ratio probes. Raw values, deliberately NOT multiplied by
+        loss_scale_factor: the metric pipeline mean-reduces over micro-batches,
+        so the logged series read directly as per-token means."""
+        mask = response_mask.to(torch.float32)
+        out = {
+            "actor/sc_weight_mean": verl_F.masked_mean(sc_weight, mask).item(),
+            "actor/sc_weight_zero_frac": verl_F.masked_mean((sc_weight <= 0).float(), mask).item(),
+            "actor/sc_student_mean": verl_F.masked_mean(student_sc.float(), mask).item(),
+            "actor/sc_teacher_mean": verl_F.masked_mean(teacher_sc.float(), mask).item(),
+        }
+        positions = torch.arange(mask.shape[-1], device=mask.device)
+        lo = 0
+        for seg_idx, hi in enumerate((*self._SC_SEG_BOUNDS, mask.shape[-1] + 1)):
+            seg_mask = ((positions >= lo) & (positions < hi)).float().unsqueeze(0) * mask
+            if seg_mask.sum() > 0:
+                out[f"actor/sc_weight_seg{seg_idx}"] = (
+                    (sc_weight * seg_mask).sum() / seg_mask.sum()
+                ).item()
+            lo = hi
+        return out
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -762,7 +819,17 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         if self.config.policy_loss.only_reverse_kl_advantages:
-            for key in ("ref_log_prob", "teacher_log_probs"):
+            if self.config.policy_loss.sc_ratio_weight and self.config.policy_loss.live_clock_lambda > 0:
+                raise ValueError("sc_ratio_weight and live_clock_lambda are mutually exclusive advantage modes")
+            required_keys = ["teacher_log_probs"]
+            if self.config.policy_loss.sc_ratio_weight:
+                # SC-ratio mode replaces the frozen reference contrast with the live
+                # teacher/student self-certainty gap: no reference model required.
+                required_keys.append("teacher_self_certainty")
+            elif self.config.policy_loss.live_clock_lambda <= 0:
+                # Classic G-OPD extrapolation needs the frozen reference log-probs.
+                required_keys.append("ref_log_prob")
+            for key in required_keys:
                 if key not in data.batch:
                     raise ValueError(f"G-OPD requires '{key}' in the actor batch")
                 if key not in select_keys:
@@ -855,15 +922,17 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, _, _, topk_log_probs, _ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
                         log_prob_for_loss = topk_log_probs
+                        student_self_certainty = None  # SC-ratio mode is sampled-token only
                         
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        _, log_prob, _, _, student_self_certainty = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                            calculate_self_certainty=self.config.policy_loss.sc_ratio_weight,
                         )
                         log_prob_for_loss = log_prob
 
@@ -897,19 +966,56 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.policy_loss.only_reverse_kl_advantages:
                         lambda_value = self.config.policy_loss.lambda_vals
-                        ref_log_prob = model_inputs["ref_log_prob"]
+                        sc_ratio_mode = self.config.policy_loss.sc_ratio_weight
+                        live_clock_lambda = self.config.policy_loss.live_clock_lambda
                         teacher_log_prob = model_inputs["teacher_log_probs"]
-                        with torch.no_grad():
-                            # G-OPD cost: (log S - log R) - lambda * (log T - log R).
-                            # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
-                            reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
-                                teacher_log_prob - ref_log_prob
+                        if (sc_ratio_mode or live_clock_lambda > 0) and advantages.dim() == 3:
+                            raise ValueError(
+                                "sc_ratio_weight / live_clock_lambda are sampled-token-only "
+                                "advantage modes and do not support top-k (3D) advantages"
                             )
-                            advantages = -reverse_kl
+                        with torch.no_grad():
+                            if sc_ratio_mode:
+                                # SC-ratio OPD: adv = (log T - log S) * (1 + w),
+                                # w = clamp(1 - SC_S/SC_T, 0, 1). The bonus stays parallel
+                                # to the live alignment debt (quadrant-3 buyout is
+                                # impossible by construction), is capped at doubling it,
+                                # and retires per state as the student's distribution
+                                # shape catches up with the teacher's. Reference-free.
+                                sc_weight = sc_ratio_weight_fn(
+                                    student_self_certainty, model_inputs["teacher_self_certainty"]
+                                )
+                                advantages = (teacher_log_prob - old_log_prob) * (1.0 + sc_weight)
+                            elif live_clock_lambda > 0:
+                                # Live-clock control arm: adv = lambda * (log T - log S).
+                                # G-OPD's frozen tilt replaced by its live version (a = d
+                                # at init); isolates the pure force-magnitude effect.
+                                advantages = live_clock_lambda * (teacher_log_prob - old_log_prob)
+                            else:
+                                # Classic G-OPD cost: (log S - log R) - lambda * (log T - log R).
+                                # Its negative is the sampled-token policy advantage;
+                                # lambda=1 recovers standard OPD.
+                                ref_log_prob = model_inputs["ref_log_prob"]
+                                reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
+                                    teacher_log_prob - ref_log_prob
+                                )
+                                advantages = -reverse_kl
                         micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
+                        if sc_ratio_mode:
+                            # Raw values (NOT scaled by loss_scale_factor): read directly in W&B.
+                            micro_batch_metrics.update(
+                                self._sc_ratio_metrics(
+                                    sc_weight,
+                                    student_self_certainty,
+                                    model_inputs["teacher_self_certainty"],
+                                    response_mask,
+                                )
+                            )
+                        if live_clock_lambda > 0:
+                            micro_batch_metrics["actor/live_clock_lambda"] = float(live_clock_lambda)
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
