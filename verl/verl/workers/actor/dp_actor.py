@@ -979,6 +979,8 @@ class DataParallelPPOActor(BasePPOActor):
                         # Online probes for the demolition/supplement decomposition and the
                         # rent -> length -> runaway causal chain. Raw values, deliberately
                         # NOT multiplied by loss_scale_factor: read them directly in W&B.
+                        # cf_tilt_adv is the counterfactual ungated full-trajectory tilt:
+                        # actual - counterfactual reads off what this arm's gate withheld.
                         tilt_adv = (lambda_value - 1.0) * (
                             extrapolation_mask_for_logprob.to(extrapolation_residual.dtype)
                             * extrapolation_residual
@@ -987,6 +989,7 @@ class DataParallelPPOActor(BasePPOActor):
                             compute_gopd_probe_metrics(
                                 align_adv=teacher_log_prob - old_log_prob,
                                 tilt_adv=tilt_adv,
+                                cf_tilt_adv=(lambda_value - 1.0) * d_raw,
                                 d_raw=d_raw,
                                 response_mask=response_mask,
                             )
