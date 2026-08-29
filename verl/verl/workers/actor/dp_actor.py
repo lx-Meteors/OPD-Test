@@ -897,9 +897,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.policy_loss.only_reverse_kl_advantages:
                         lambda_value = self.config.policy_loss.lambda_vals
+                        opd_max_tokens = self.config.policy_loss.opd_max_tokens
                         extrapolation_max_tokens = self.config.policy_loss.extrapolation_max_tokens
                         ref_log_prob = model_inputs["ref_log_prob"]
                         teacher_log_prob = model_inputs["teacher_log_probs"]
+                        full_response_mask = response_mask
                         with torch.no_grad():
                             # Decompose G-OPD into the full-trajectory OPD cost plus an extra
                             # Teacher-Ref extrapolation residual:
@@ -930,10 +932,30 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/gopd_extrapolation_max_tokens"] = (
                             float(extrapolation_max_tokens) * loss_scale_factor
                         )
-                        micro_batch_metrics["actor/gopd_extrapolated_token_fraction"] = (
+                        # Mask the policy-loss denominator as well as its numerator. Merely
+                        # zeroing suffix advantages would dilute a prefix-only token-mean loss
+                        # by the number of otherwise-valid suffix tokens.
+                        if opd_max_tokens > 0:
+                            opd_mask = response_positions < opd_max_tokens
+                            opd_mask_2d = opd_mask.unsqueeze(0).expand_as(response_mask)
+                            response_mask = response_mask * opd_mask_2d.to(response_mask.dtype)
+                        micro_batch_metrics["actor/gopd_opd_max_tokens"] = (
+                            float(opd_max_tokens) * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/gopd_opd_token_fraction"] = (
                             verl_F.masked_mean(
-                                extrapolation_mask_2d.to(response_mask.dtype), response_mask
+                                response_mask,
+                                full_response_mask,
                             )
+                            .detach()
+                            .item()
+                            * loss_scale_factor
+                        )
+                        effective_extrapolation_mask = (
+                            extrapolation_mask_2d.to(response_mask.dtype) * response_mask
+                        )
+                        micro_batch_metrics["actor/gopd_extrapolated_token_fraction"] = (
+                            verl_F.masked_mean(effective_extrapolation_mask, full_response_mask)
                             .detach()
                             .item()
                             * loss_scale_factor

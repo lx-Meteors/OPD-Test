@@ -71,9 +71,13 @@ policy_loss:
   # G-OPD reward scaling factor; 1.0 recovers standard OPD
   lambda_vals: 1.0
 
+  # Apply the Student-Teacher OPD alignment term only to the first N response
+  # tokens. <= 0 means the full response.
+  opd_max_tokens: 0
+
   # Apply only the extra G-OPD Teacher-Ref extrapolation residual to the
-  # first N response tokens. <= 0 means the full response. The standard
-  # Student-Teacher OPD term is still applied to every valid response token.
+  # first N response tokens. <= 0 means the full response. This scope is
+  # independent of opd_max_tokens.
   extrapolation_max_tokens: 0
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
