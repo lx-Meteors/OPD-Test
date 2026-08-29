@@ -958,21 +958,10 @@ class DataParallelPPOActor(BasePPOActor):
                             .item()
                             * loss_scale_factor
                         )
-                        if debt_gated:
-                            revoked_indicator = (revoked > 0).to(response_mask.dtype)
-                            while revoked_indicator.dim() > response_mask.dim():
-                                revoked_indicator = revoked_indicator.amax(dim=-1)
-                            micro_batch_metrics["actor/gopd_debt_gate_revoked_frac"] = (
-                                verl_F.masked_mean(revoked_indicator, response_mask).detach().item()
-                                * loss_scale_factor
-                            )
-                            tilt = (lambda_value - 1.0) * extrapolation_residual
-                            while tilt.dim() > response_mask.dim():
-                                tilt = tilt.mean(dim=-1)
-                            micro_batch_metrics["actor/gopd_debt_gate_tilt_mean"] = (
-                                verl_F.masked_mean(tilt, response_mask).detach().item()
-                                * loss_scale_factor
-                            )
+                        # Note: no dedicated debt-gate metrics here. The revoked-token
+                        # occupancy is identically gopd_probe/quad_frac_q3 (revoked > 0
+                        # iff d > 0 and logS >= logT), and the effective tilt is
+                        # gopd_probe/tilt_mean; both are emitted unscaled by the probe.
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
