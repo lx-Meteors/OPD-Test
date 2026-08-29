@@ -46,6 +46,13 @@ class PolicyLossConfig(BaseConfig):
         extrapolation_max_tokens (int): Apply the extra G-OPD extrapolation residual only to the first
             N response tokens. A value <= 0 applies extrapolation to the full response. Standard OPD
             alignment remains active on every valid response token.
+        debt_gated_extrapolation (bool): Quadrant surgery on the extrapolation residual d = logT - logR.
+            The demolition side (d < 0) applies unconditionally; the supplement side (d > 0) applies only
+            while the student still under-weights the sampled token (logS < logT) and is revoked per token
+            once learned. Removes the one toxic quadrant (supplement fighting the alignment term's
+            demolition: loop subsidies, per-token length rent, stop-delay bias) without a position cutoff.
+            At initialization S = R, so the gate passes everything and the objective coincides with full
+            G-OPD; it anneals toward the demolition-only field as tokens are learned.
     """
 
     loss_mode: str = "vanilla"
@@ -57,6 +64,7 @@ class PolicyLossConfig(BaseConfig):
     only_reverse_kl_advantages: bool = False
     lambda_vals: float = 1.0
     extrapolation_max_tokens: int = 0
+    debt_gated_extrapolation: bool = False
 
 
 @dataclass

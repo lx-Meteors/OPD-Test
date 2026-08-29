@@ -898,6 +898,7 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.config.policy_loss.only_reverse_kl_advantages:
                         lambda_value = self.config.policy_loss.lambda_vals
                         extrapolation_max_tokens = self.config.policy_loss.extrapolation_max_tokens
+                        debt_gated = self.config.policy_loss.debt_gated_extrapolation
                         ref_log_prob = model_inputs["ref_log_prob"]
                         teacher_log_prob = model_inputs["teacher_log_probs"]
                         with torch.no_grad():
@@ -921,6 +922,23 @@ class DataParallelPPOActor(BasePPOActor):
 
                             opd_cost = old_log_prob - teacher_log_prob
                             extrapolation_residual = teacher_log_prob - ref_log_prob
+                            if debt_gated:
+                                # Quadrant surgery: the demolition side of the residual
+                                # (d < 0, teacher likes the token less than the reference)
+                                # applies unconditionally; the supplement side (d > 0) is
+                                # granted only while the student still under-weights the
+                                # sampled token (log S < log T) and is revoked per token
+                                # once learned. The single masked quadrant (d > 0 and
+                                # log S >= log T) is where extrapolation would fight the
+                                # alignment term's demolition: loop subsidies, per-token
+                                # length rent, and the stop-delay bias all live there.
+                                supplement_qualified = (old_log_prob < teacher_log_prob).to(
+                                    extrapolation_residual.dtype
+                                )
+                                revoked = torch.clamp_min(extrapolation_residual, 0.0) * (
+                                    1.0 - supplement_qualified
+                                )
+                                extrapolation_residual = extrapolation_residual - revoked
                             reverse_kl = opd_cost - (lambda_value - 1.0) * (
                                 extrapolation_mask_for_logprob.to(extrapolation_residual.dtype)
                                 * extrapolation_residual
@@ -938,6 +956,21 @@ class DataParallelPPOActor(BasePPOActor):
                             .item()
                             * loss_scale_factor
                         )
+                        if debt_gated:
+                            revoked_indicator = (revoked > 0).to(response_mask.dtype)
+                            while revoked_indicator.dim() > response_mask.dim():
+                                revoked_indicator = revoked_indicator.amax(dim=-1)
+                            micro_batch_metrics["actor/gopd_debt_gate_revoked_frac"] = (
+                                verl_F.masked_mean(revoked_indicator, response_mask).detach().item()
+                                * loss_scale_factor
+                            )
+                            tilt = (lambda_value - 1.0) * extrapolation_residual
+                            while tilt.dim() > response_mask.dim():
+                                tilt = tilt.mean(dim=-1)
+                            micro_batch_metrics["actor/gopd_debt_gate_tilt_mean"] = (
+                                verl_F.masked_mean(tilt, response_mask).detach().item()
+                                * loss_scale_factor
+                            )
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )

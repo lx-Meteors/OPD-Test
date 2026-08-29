@@ -76,6 +76,16 @@ policy_loss:
   # Student-Teacher OPD term is still applied to every valid response token.
   extrapolation_max_tokens: 0
 
+  # Debt-gated extrapolation (quadrant surgery) on d = logT - logR: the
+  # demolition side (d < 0) applies unconditionally at every position; the
+  # supplement side (d > 0) applies only while the student still under-weights
+  # the sampled token (logS < logT) and shuts off per token once learned. This
+  # removes the toxic quadrant where extrapolation fights the alignment term's
+  # demolition (loop subsidies, length rent, stop-delay bias) with no position
+  # cutoff. At init S = R, so this starts exactly as full G-OPD and anneals
+  # toward demolition-only as learning completes.
+  debt_gated_extrapolation: false
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

@@ -142,6 +142,7 @@ run_opd() {
     export GOPD_ENABLE="${GOPD_ENABLE:-False}"
     export GOPD_LAMBDA="${GOPD_LAMBDA:-1.0}"
     export GOPD_EXTRAPOLATION_MAX_TOKENS="${GOPD_EXTRAPOLATION_MAX_TOKENS:-0}"
+    export GOPD_DEBT_GATE="${GOPD_DEBT_GATE:-False}"
     export ROLLOUT_IS="${ROLLOUT_IS:-null}"
     export ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
     export ROLLOUT_RS="${ROLLOUT_RS:-null}"
@@ -229,6 +230,9 @@ run_opd() {
             echo "G-OPD extrapolation scope: first ${GOPD_EXTRAPOLATION_MAX_TOKENS} response tokens"
         else
             echo "G-OPD extrapolation scope: full response"
+        fi
+        if [[ "${GOPD_DEBT_GATE}" == "True" ]]; then
+            echo "G-OPD debt gate: demolition side unconditional, supplement side only while logS < logT"
         fi
     fi
     echo "Train dataset: ${TRAIN_DATASET}"
@@ -340,6 +344,7 @@ run_opd() {
             "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
             "++actor_rollout_ref.actor.policy_loss.extrapolation_max_tokens=${GOPD_EXTRAPOLATION_MAX_TOKENS}"
+            "++actor_rollout_ref.actor.policy_loss.debt_gated_extrapolation=${GOPD_DEBT_GATE}"
         )
     fi
 
