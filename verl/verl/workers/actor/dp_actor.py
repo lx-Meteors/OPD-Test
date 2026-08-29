@@ -34,6 +34,7 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
+from verl.utils.sc_probe import compute_sc_probe_metrics
 from verl.utils.self_certainty import self_certainty_from_logits
 from verl.utils.self_certainty import sc_ratio_weight as sc_ratio_weight_fn
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -773,33 +774,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys, topk_ids_tensor, topk_log_probs_tensor
 
-    # Depth segmentation follows the established probe convention:
-    # [0, 2k), [2k, 4k), [4k, 8k), [8k, inf).
-    _SC_SEG_BOUNDS = (2048, 4096, 8192)
-
-    @torch.no_grad()
-    def _sc_ratio_metrics(self, sc_weight, student_sc, teacher_sc, response_mask):
-        """SC-ratio probes. Raw values, deliberately NOT multiplied by
-        loss_scale_factor: the metric pipeline mean-reduces over micro-batches,
-        so the logged series read directly as per-token means."""
-        mask = response_mask.to(torch.float32)
-        out = {
-            "actor/sc_weight_mean": verl_F.masked_mean(sc_weight, mask).item(),
-            "actor/sc_weight_zero_frac": verl_F.masked_mean((sc_weight <= 0).float(), mask).item(),
-            "actor/sc_student_mean": verl_F.masked_mean(student_sc.float(), mask).item(),
-            "actor/sc_teacher_mean": verl_F.masked_mean(teacher_sc.float(), mask).item(),
-        }
-        positions = torch.arange(mask.shape[-1], device=mask.device)
-        lo = 0
-        for seg_idx, hi in enumerate((*self._SC_SEG_BOUNDS, mask.shape[-1] + 1)):
-            seg_mask = ((positions >= lo) & (positions < hi)).float().unsqueeze(0) * mask
-            if seg_mask.sum() > 0:
-                out[f"actor/sc_weight_seg{seg_idx}"] = (
-                    (sc_weight * seg_mask).sum() / seg_mask.sum()
-                ).item()
-            lo = hi
-        return out
-
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -1005,13 +979,15 @@ class DataParallelPPOActor(BasePPOActor):
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
                         if sc_ratio_mode:
-                            # Raw values (NOT scaled by loss_scale_factor): read directly in W&B.
+                            # sc_probe/* suite: raw values (NOT scaled by loss_scale_factor),
+                            # num/den pairs for exact ratios. See verl/utils/sc_probe.py.
                             micro_batch_metrics.update(
-                                self._sc_ratio_metrics(
-                                    sc_weight,
-                                    student_self_certainty,
-                                    model_inputs["teacher_self_certainty"],
-                                    response_mask,
+                                compute_sc_probe_metrics(
+                                    align_adv=teacher_log_prob - old_log_prob,
+                                    sc_weight=sc_weight,
+                                    sc_student=student_self_certainty,
+                                    sc_teacher=model_inputs["teacher_self_certainty"],
+                                    response_mask=response_mask,
                                 )
                             )
                         if live_clock_lambda > 0:
