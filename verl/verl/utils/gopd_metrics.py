@@ -71,15 +71,18 @@ def compute_gopd_probe_metrics(
         out[f"gopd_probe/quad_frac_{name}"] = full_mean(q.to(mask.dtype))
 
     # --- buyout probe: extrapolation actively fighting demolition --------------
+    # Exact rates come from the num/den pairs (divide the logged series):
+    #   buyout rate = buyout_tok_den / tok_total_den, mean size = tilt_num / tok_den.
     buyout = ((align_adv < 0) & (tilt_adv > 0)).to(mask.dtype) * mask
     cf_buyout = ((align_adv < 0) & (cf_tilt_adv > 0)).to(mask.dtype) * mask
-    out["gopd_probe/buyout_frac"] = (buyout.sum() / n_tok).item()
-    out["gopd_probe/cf_buyout_frac"] = (cf_buyout.sum() / n_tok).item()
     out["gopd_probe/buyout_tilt_num"] = (tilt_adv.clamp_min(0.0) * buyout).sum().item()
     out["gopd_probe/buyout_tok_den"] = buyout.sum().item()
+    out["gopd_probe/cf_buyout_tok_num"] = cf_buyout.sum().item()
 
     # --- granted supplement: qualified positive tilt actually paid --------------
-    granted = ((align_adv > 0) & (tilt_adv > 0)).to(mask.dtype) * mask
+    # align >= 0 complements buyout's align < 0, so positive tilt partitions
+    # exactly: postilt_total_den == buyout_tilt_num + supp_granted_tilt_num.
+    granted = ((align_adv >= 0) & (tilt_adv > 0)).to(mask.dtype) * mask
     out["gopd_probe/supp_granted_tilt_num"] = (tilt_adv.clamp_min(0.0) * granted).sum().item()
     out["gopd_probe/supp_granted_tok_den"] = granted.sum().item()
 
