@@ -41,6 +41,13 @@ def compute_gopd_probe_metrics(
     if align_adv.dim() != 2 or tilt_adv.dim() != 2 or d_raw.dim() != 2:
         return {}
 
+    # float32 throughout: inputs may arrive in bf16, whose ~8 mantissa bits lose
+    # percent-level accuracy when summing over 16k tokens (the ledger num/den
+    # comparisons need better than that).
+    align_adv = align_adv.float()
+    tilt_adv = tilt_adv.float()
+    cf_tilt_adv = cf_tilt_adv.float()
+    d_raw = d_raw.float()
     mask = response_mask.to(align_adv.dtype)
     n_tok = mask.sum().clamp_min(1.0)
     out: dict[str, float] = {}
@@ -118,6 +125,8 @@ def compute_gopd_probe_metrics(
     row_idx = torch.arange(mask.shape[0], device=mask.device)
     terminal_mask = torch.zeros_like(mask)
     terminal_mask[row_idx, last_idx] = terminated_row
+    # Guard zero-length rows: their clamped last_idx points at padding.
+    terminal_mask = terminal_mask * mask
     out["gopd_probe/terminal_cnt_den"] = terminal_mask.sum().item()
     out["gopd_probe/terminal_tilt_num"] = (tilt_adv * terminal_mask).sum().item()
     out["gopd_probe/terminal_align_num"] = (align_adv * terminal_mask).sum().item()
