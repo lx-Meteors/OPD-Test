@@ -31,6 +31,7 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.gopd_metrics import compute_gopd_probe_metrics
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
@@ -922,6 +923,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                             opd_cost = old_log_prob - teacher_log_prob
                             extrapolation_residual = teacher_log_prob - ref_log_prob
+                            d_raw = extrapolation_residual
                             if debt_gated:
                                 # Quadrant surgery: the demolition side of the residual
                                 # (d < 0, teacher likes the token less than the reference)
@@ -973,6 +975,21 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
+                        )
+                        # Online probes for the demolition/supplement decomposition and the
+                        # rent -> length -> runaway causal chain. Raw values, deliberately
+                        # NOT multiplied by loss_scale_factor: read them directly in W&B.
+                        tilt_adv = (lambda_value - 1.0) * (
+                            extrapolation_mask_for_logprob.to(extrapolation_residual.dtype)
+                            * extrapolation_residual
+                        )
+                        micro_batch_metrics.update(
+                            compute_gopd_probe_metrics(
+                                align_adv=teacher_log_prob - old_log_prob,
+                                tilt_adv=tilt_adv,
+                                d_raw=d_raw,
+                                response_mask=response_mask,
+                            )
                         )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
