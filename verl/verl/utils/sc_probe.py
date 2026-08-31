@@ -56,8 +56,10 @@ from __future__ import annotations
 import torch
 
 _SEG_BOUNDS = (2048, 4096, 8192)
+_TERMINAL_WINDOW = 256
+_ACTIVE_EPS = 0.05
 
-__all__ = ["compute_sc_probe_metrics"]
+__all__ = ["compute_sc_probe_metrics", "compute_sc_centered_probe_metrics"]
 
 
 @torch.no_grad()
@@ -134,5 +136,101 @@ def compute_sc_probe_metrics(
     out["sc_probe/terminal_cnt_den"] = terminal_mask.sum().item()
     out["sc_probe/terminal_a_num"] = (a * terminal_mask).sum().item()
     out["sc_probe/terminal_w_num"] = (w * terminal_mask).sum().item()
+
+    return out
+
+
+@torch.no_grad()
+def compute_sc_centered_probe_metrics(
+    align_adv: torch.Tensor,
+    centered_tilt: torch.Tensor,
+    sc_student: torch.Tensor,
+    sc_teacher: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Probes for the SC-centered advantage adv = a + c, c = g - mean_traj(g).
+
+    One readout per pre-registered claim (all raw, num/den pairs for exact
+    cross-micro aggregation, same conventions as compute_sc_probe_metrics):
+
+      * c_abs_mean            E[|c|]: the live force budget. Offline (init
+                              student proxy) predicts ~0.078; the underpowered
+                              kill line is a sustained < 0.02 by step ~15.
+      * c_mean                masked mean of c; ~0 by construction (identity
+                              check on the centering + mask plumbing).
+      * g_mean                uncentered log(SC_T/SC_S) level: the speed
+                              component the centering removes. Expected to
+                              flip sign early (student SC overshoot) and
+                              settle at a small positive value.
+      * seg{k} c/cabs num/den depth profile of the redistribution: the
+                              first4k-like schedule (front positive, deep
+                              negative) is the claim under test. Front-minus-
+                              deep contrast offline: +0.082.
+      * conflict num/den      sign(c) != sign(a) among tokens where both are
+                              active (|.| > 0.05). Offline: ~30% (bounded real
+                              conflict; G-OPD terminal: 60%).
+      * capped rows           runaway targeting: mean c and negative-force
+                              share on full-buffer rows (offline: 66-71%
+                              negative beyond 8k).
+      * terminal window       mean c over the last 256 valid tokens of
+                              terminated rows (offline: ~-0.13 on correct
+                              endings; watch for early-truncation side
+                              effects).
+    """
+    if align_adv.dim() != 2 or centered_tilt.dim() != 2:
+        return {}
+
+    a = align_adv.float()
+    c = centered_tilt.float()
+    sc_s = sc_student.float()
+    sc_t = sc_teacher.float()
+    mask = response_mask.to(torch.float32)
+    n_tok = mask.sum().clamp_min(1.0)
+    g = torch.log(sc_t.clamp_min(1e-6) / sc_s.clamp_min(1e-6))
+    out: dict[str, float] = {}
+
+    def full_mean(x: torch.Tensor) -> float:
+        return ((x * mask).sum() / n_tok).item()
+
+    out["sc_centered/align_mean"] = full_mean(a)
+    out["sc_centered/align_abs_mean"] = full_mean(a.abs())
+    out["sc_centered/c_mean"] = full_mean(c)
+    out["sc_centered/c_abs_mean"] = full_mean(c.abs())
+    out["sc_centered/g_mean"] = full_mean(g)
+    out["sc_centered/g_abs_mean"] = full_mean(g.abs())
+    out["sc_centered/sc_student_mean"] = full_mean(sc_s)
+    out["sc_centered/sc_teacher_mean"] = full_mean(sc_t)
+
+    # --- conflict with the alignment debt -------------------------------------
+    active = ((c.abs() > _ACTIVE_EPS) & (a.abs() > _ACTIVE_EPS)).float() * mask
+    conflict = (torch.sign(c) != torch.sign(a)).float() * active
+    out["sc_centered/active_den"] = active.sum().item()
+    out["sc_centered/conflict_num"] = conflict.sum().item()
+
+    # --- depth segments (num/den pairs) ---------------------------------------
+    positions = torch.arange(mask.shape[-1], device=mask.device)
+    lo = 0
+    for k, hi in enumerate((*_SEG_BOUNDS, mask.shape[-1] + 1)):
+        seg = ((positions >= lo) & (positions < hi)).float().unsqueeze(0) * mask
+        out[f"sc_centered/tok_den_seg{k}"] = seg.sum().item()
+        out[f"sc_centered/c_num_seg{k}"] = (c * seg).sum().item()
+        out[f"sc_centered/cabs_num_seg{k}"] = (c.abs() * seg).sum().item()
+        lo = hi
+
+    # --- runaway targeting: capped (full-buffer) rows --------------------------
+    lengths = mask.sum(dim=-1)
+    capped_row = (lengths >= mask.shape[-1]).float()
+    capped_col = capped_row.unsqueeze(-1)
+    out["sc_centered/capped_seq_frac"] = capped_row.mean().item()
+    out["sc_centered/tok_capped_den"] = (capped_col * mask).sum().item()
+    out["sc_centered/c_capped_num"] = (c * capped_col * mask).sum().item()
+    out["sc_centered/cneg_capped_num"] = ((c < 0).float() * capped_col * mask).sum().item()
+
+    # --- terminal window: last 256 valid tokens of terminated rows -------------
+    terminated_col = (1.0 - capped_row).unsqueeze(-1)
+    start = (lengths - _TERMINAL_WINDOW).clamp_min(0.0).unsqueeze(-1)
+    window = (positions.unsqueeze(0) >= start).float() * mask * terminated_col
+    out["sc_centered/term_den"] = window.sum().item()
+    out["sc_centered/c_term_num"] = (c * window).sum().item()
 
     return out

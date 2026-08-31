@@ -40,7 +40,7 @@ import math
 
 import torch
 
-__all__ = ["self_certainty_from_logits", "sc_ratio_weight"]
+__all__ = ["self_certainty_from_logits", "sc_ratio_weight", "centered_log_sc_ratio"]
 
 
 def self_certainty_from_logits(logits: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
@@ -65,6 +65,54 @@ def self_certainty_from_logits(logits: torch.Tensor, chunk_size: int = 4096) -> 
         chunk = flat[start : start + chunk_size].to(torch.float32)
         out[start : start + chunk.size(0)] = torch.logsumexp(chunk, dim=-1) - chunk.mean(dim=-1) - log_v
     return out.view(original_shape[:-1])
+
+
+def centered_log_sc_ratio(
+    student_self_certainty: torch.Tensor,
+    teacher_self_certainty: torch.Tensor,
+    response_mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Within-trajectory centered log SC-ratio for the SC-centered advantage.
+
+        g_t = log(SC_T(s_t) / SC_S(s_t)),   c_t = g_t - mean_traj(g)
+
+    where the mean runs over each row's valid response tokens. The centered
+    tilt c is added to the sampled-token alignment debt: adv = a + c.
+
+    Why centered: raw g is empirically almost everywhere positive (the student's
+    tail suppression lags the teacher's), so adding it uncentered is a
+    length-coupled rent — a uniform positive advantage offset that acts as pure
+    self-sharpening speed and props up runaway loops. Subtracting the
+    per-trajectory mean removes exactly that speed component and leaves a
+    zero-sum redistribution of commitment: positive where the teacher's
+    distribution shape is relatively clearer than the student's (front of the
+    trajectory, execution corridors), negative where it is relatively more
+    confused (deep wandering, loops). Per-trajectory total force is identically
+    zero, so no length rent and no clock speedup by construction. It is also
+    immune to the global sign flips of g observed live (the student's SC
+    overshoots the teacher's during the early entropy-collapse sprint).
+
+    Single-rollout self-contained: no cross-sample statistics, no reference
+    model, no window, no free constants (the natural nats scale of the log
+    ratio is on the same order as G-OPD's tilt budget, so beta = 1).
+
+    Args:
+        student_self_certainty: (bsz, response_len) SC_S per position.
+        teacher_self_certainty: (bsz, response_len) SC_T per position.
+        response_mask: (bsz, response_len) valid-token mask.
+        eps: numerical floor for both SC values (SC >= 0 up to rounding).
+
+    Returns:
+        (bsz, response_len) float32 tensor c, zeroed outside the mask.
+        Rows with a single valid token center to exactly zero.
+    """
+    sc_s = student_self_certainty.to(torch.float32).clamp_min(eps)
+    sc_t = teacher_self_certainty.to(torch.float32).clamp_min(eps)
+    mask = response_mask.to(torch.float32)
+    g = torch.log(sc_t / sc_s) * mask
+    row_mean = g.sum(dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    return (g - row_mean) * mask
 
 
 def sc_ratio_weight(

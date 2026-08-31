@@ -78,6 +78,10 @@ policy_loss:
   # Live-clock control arm: when > 0, adv = live_clock_lambda * (logT - logS).
   live_clock_lambda: 0.0
 
+  # SC-centered OPD: adv = (logT - logS) + (g - mean_traj(g)), g = log(SC_T/SC_S).
+  # Within-trajectory zero-sum commitment redistribution; reference-free, beta=1.
+  sc_centered_ratio: false
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

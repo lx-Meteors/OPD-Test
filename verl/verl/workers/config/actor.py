@@ -52,6 +52,14 @@ class PolicyLossConfig(BaseConfig):
             adv = live_clock_lambda * (log T - log S), i.e. G-OPD with the frozen
             initial-debt map d replaced by the live debt a (identical at init).
             Reference-free. 0 disables.
+        sc_centered_ratio (bool): SC-centered OPD mode. adv = a + c with
+            a = log T - log S and c = g - mean_traj(g), g = log(SC_T/SC_S):
+            a within-trajectory zero-sum redistribution of commitment toward
+            states where the teacher's distribution shape is relatively clearer.
+            Pure direction (zero net speed, no length rent by construction),
+            single-rollout self-contained, beta = 1 (no free constants).
+            Reference-free; requires the teacher_self_certainty channel.
+            Mutually exclusive with sc_ratio_weight and live_clock_lambda.
     """
 
     loss_mode: str = "vanilla"
@@ -64,6 +72,7 @@ class PolicyLossConfig(BaseConfig):
     lambda_vals: float = 1.0
     sc_ratio_weight: bool = False
     live_clock_lambda: float = 0.0
+    sc_centered_ratio: bool = False
 
 
 @dataclass

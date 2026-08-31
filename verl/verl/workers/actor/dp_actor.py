@@ -34,8 +34,8 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
-from verl.utils.sc_probe import compute_sc_probe_metrics
-from verl.utils.self_certainty import self_certainty_from_logits
+from verl.utils.sc_probe import compute_sc_centered_probe_metrics, compute_sc_probe_metrics
+from verl.utils.self_certainty import centered_log_sc_ratio, self_certainty_from_logits
 from verl.utils.self_certainty import sc_ratio_weight as sc_ratio_weight_fn
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
@@ -793,12 +793,20 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         if self.config.policy_loss.only_reverse_kl_advantages:
-            if self.config.policy_loss.sc_ratio_weight and self.config.policy_loss.live_clock_lambda > 0:
-                raise ValueError("sc_ratio_weight and live_clock_lambda are mutually exclusive advantage modes")
+            ref_free_modes = (
+                self.config.policy_loss.sc_ratio_weight,
+                self.config.policy_loss.live_clock_lambda > 0,
+                self.config.policy_loss.sc_centered_ratio,
+            )
+            if sum(ref_free_modes) > 1:
+                raise ValueError(
+                    "sc_ratio_weight, live_clock_lambda and sc_centered_ratio are "
+                    "mutually exclusive advantage modes"
+                )
             required_keys = ["teacher_log_probs"]
-            if self.config.policy_loss.sc_ratio_weight:
-                # SC-ratio mode replaces the frozen reference contrast with the live
-                # teacher/student self-certainty gap: no reference model required.
+            if self.config.policy_loss.sc_ratio_weight or self.config.policy_loss.sc_centered_ratio:
+                # Both SC modes replace the frozen reference contrast with live
+                # teacher/student self-certainty: no reference model required.
                 required_keys.append("teacher_self_certainty")
             elif self.config.policy_loss.live_clock_lambda <= 0:
                 # Classic G-OPD extrapolation needs the frozen reference log-probs.
@@ -906,7 +914,10 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         _, log_prob, _, _, student_self_certainty = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                            calculate_self_certainty=self.config.policy_loss.sc_ratio_weight,
+                            calculate_self_certainty=(
+                                self.config.policy_loss.sc_ratio_weight
+                                or self.config.policy_loss.sc_centered_ratio
+                            ),
                         )
                         log_prob_for_loss = log_prob
 
@@ -941,15 +952,32 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.config.policy_loss.only_reverse_kl_advantages:
                         lambda_value = self.config.policy_loss.lambda_vals
                         sc_ratio_mode = self.config.policy_loss.sc_ratio_weight
+                        sc_centered_mode = self.config.policy_loss.sc_centered_ratio
                         live_clock_lambda = self.config.policy_loss.live_clock_lambda
                         teacher_log_prob = model_inputs["teacher_log_probs"]
-                        if (sc_ratio_mode or live_clock_lambda > 0) and advantages.dim() == 3:
+                        if (sc_ratio_mode or sc_centered_mode or live_clock_lambda > 0) and advantages.dim() == 3:
                             raise ValueError(
-                                "sc_ratio_weight / live_clock_lambda are sampled-token-only "
-                                "advantage modes and do not support top-k (3D) advantages"
+                                "sc_ratio_weight / sc_centered_ratio / live_clock_lambda are "
+                                "sampled-token-only advantage modes and do not support top-k "
+                                "(3D) advantages"
                             )
                         with torch.no_grad():
-                            if sc_ratio_mode:
+                            if sc_centered_mode:
+                                # SC-centered OPD: adv = a + c with a = log T - log S and
+                                # c = g - mean_traj(g), g = log(SC_T/SC_S). The centered
+                                # tilt is a zero-sum within-trajectory redistribution of
+                                # commitment toward states where the teacher's distribution
+                                # shape is relatively clearer: pure direction, zero net
+                                # speed, no length rent by construction. Reference-free,
+                                # single-rollout self-contained, beta = 1 (natural nats
+                                # scale matches the G-OPD tilt budget).
+                                centered_tilt = centered_log_sc_ratio(
+                                    student_self_certainty,
+                                    model_inputs["teacher_self_certainty"],
+                                    response_mask,
+                                )
+                                advantages = (teacher_log_prob - old_log_prob) + centered_tilt
+                            elif sc_ratio_mode:
                                 # SC-ratio OPD: adv = (log T - log S) * (1 + w),
                                 # w = clamp(1 - SC_S/SC_T, 0, 1). The bonus stays parallel
                                 # to the live alignment debt (quadrant-3 buyout is
@@ -985,6 +1013,19 @@ class DataParallelPPOActor(BasePPOActor):
                                 compute_sc_probe_metrics(
                                     align_adv=teacher_log_prob - old_log_prob,
                                     sc_weight=sc_weight,
+                                    sc_student=student_self_certainty,
+                                    sc_teacher=model_inputs["teacher_self_certainty"],
+                                    response_mask=response_mask,
+                                )
+                            )
+                        if sc_centered_mode:
+                            # sc_centered/* suite: one readout per pre-registered claim
+                            # (budget, depth schedule, conflict, runaway targeting,
+                            # terminal window). See verl/utils/sc_probe.py.
+                            micro_batch_metrics.update(
+                                compute_sc_centered_probe_metrics(
+                                    align_adv=teacher_log_prob - old_log_prob,
+                                    centered_tilt=centered_tilt,
                                     sc_student=student_self_certainty,
                                     sc_teacher=model_inputs["teacher_self_certainty"],
                                     response_mask=response_mask,

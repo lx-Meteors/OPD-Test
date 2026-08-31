@@ -145,8 +145,10 @@ run_opd() {
     export GOPD_SC_RATIO="${GOPD_SC_RATIO:-False}"
     # Live-clock control arm: adv = lambda * (logT - logS) when > 0; reference-free.
     export GOPD_LIVE_CLOCK_LAMBDA="${GOPD_LIVE_CLOCK_LAMBDA:-0.0}"
+    # SC-centered OPD: adv = (logT - logS) + (g - mean_traj(g)), g = log(SC_T/SC_S); reference-free.
+    export GOPD_SC_CENTERED="${GOPD_SC_CENTERED:-False}"
     GOPD_REFERENCE_FREE="False"
-    if [[ "${GOPD_SC_RATIO}" == "True" || ( "${GOPD_LIVE_CLOCK_LAMBDA}" != "0.0" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0" ) ]]; then
+    if [[ "${GOPD_SC_RATIO}" == "True" || "${GOPD_SC_CENTERED}" == "True" || ( "${GOPD_LIVE_CLOCK_LAMBDA}" != "0.0" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0" ) ]]; then
         GOPD_REFERENCE_FREE="True"
     fi
     export ROLLOUT_IS="${ROLLOUT_IS:-null}"
@@ -170,8 +172,12 @@ run_opd() {
             exit 1
         fi
     fi
-    if [[ "${GOPD_SC_RATIO}" == "True" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0.0" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0" ]]; then
-        echo "GOPD_SC_RATIO and GOPD_LIVE_CLOCK_LAMBDA are mutually exclusive." >&2
+    local gopd_ref_free_mode_count=0
+    [[ "${GOPD_SC_RATIO}" == "True" ]] && gopd_ref_free_mode_count=$((gopd_ref_free_mode_count + 1))
+    [[ "${GOPD_SC_CENTERED}" == "True" ]] && gopd_ref_free_mode_count=$((gopd_ref_free_mode_count + 1))
+    [[ "${GOPD_LIVE_CLOCK_LAMBDA}" != "0.0" && "${GOPD_LIVE_CLOCK_LAMBDA}" != "0" ]] && gopd_ref_free_mode_count=$((gopd_ref_free_mode_count + 1))
+    if (( gopd_ref_free_mode_count > 1 )); then
+        echo "GOPD_SC_RATIO, GOPD_SC_CENTERED and GOPD_LIVE_CLOCK_LAMBDA are mutually exclusive." >&2
         exit 1
     fi
 
@@ -236,6 +242,8 @@ run_opd() {
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         if [[ "${GOPD_SC_RATIO}" == "True" ]]; then
             echo "Advantage mode: SC-ratio OPD (reference-free)"
+        elif [[ "${GOPD_SC_CENTERED}" == "True" ]]; then
+            echo "Advantage mode: SC-centered OPD, adv = a + (g - mean_traj(g)) (reference-free)"
         elif [[ "${GOPD_REFERENCE_FREE}" == "True" ]]; then
             echo "Advantage mode: live-clock OPD, lambda=${GOPD_LIVE_CLOCK_LAMBDA} (reference-free)"
         else
@@ -352,6 +360,7 @@ run_opd() {
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
             "++actor_rollout_ref.actor.policy_loss.sc_ratio_weight=${GOPD_SC_RATIO}"
             "++actor_rollout_ref.actor.policy_loss.live_clock_lambda=${GOPD_LIVE_CLOCK_LAMBDA}"
+            "++actor_rollout_ref.actor.policy_loss.sc_centered_ratio=${GOPD_SC_CENTERED}"
         )
         if [[ "${GOPD_REFERENCE_FREE}" != "True" ]]; then
             cmd+=("+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}")

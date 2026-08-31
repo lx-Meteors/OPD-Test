@@ -2567,8 +2567,11 @@ class RayPPOTrainer:
                     ]
                     if not self.config.actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages:
                         keys_to_pop.append("teacher_log_probs")
-                    if not self.config.actor_rollout_ref.actor.policy_loss.get("sc_ratio_weight", False):
-                        # Only the SC-ratio advantage mode consumes it in update_actor.
+                    if not (
+                        self.config.actor_rollout_ref.actor.policy_loss.get("sc_ratio_weight", False)
+                        or self.config.actor_rollout_ref.actor.policy_loss.get("sc_centered_ratio", False)
+                    ):
+                        # Only the SC advantage modes consume it in update_actor.
                         keys_to_pop.append("teacher_self_certainty")
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
