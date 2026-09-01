@@ -1,1 +1,1 @@
-nohup bash experiments_scripts/opd-standard-qwen3-4b-nonthinking-rl-math-step500.sh > meteor_run/opd-standard-qwen3-4b-nonthinking-rl-math-step500.log 2>&1 &
+nohup bash experiments_scripts/sc-ratio-opd-qwen3-4b-nonthinking-rl-math-step500.sh > meteor_run/sc-ratio-opd-qwen3-4b-nonthinking-rl-math-step500.log 2>&1 &
