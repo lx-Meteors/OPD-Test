@@ -165,7 +165,11 @@ def compute_sc_centered_probe_metrics(
     enters through a single identity: at step 0 the rollout policy IS the init
     model (REFERENCE_MODEL_PATH defaults to ACTOR_MODEL_PATH), hence
     a = logT - logS equals d exactly and 0.25 * |a| is the force budget G-OPD
-    would have spent on the extrapolation term (lambda = 1.25). d is frozen for
+    would have spent on the extrapolation term. That lambda = 1.25 belongs to
+    the G-OPD comparison arm (opd-baseline-qwen3-4b's GOPD_LAMBDA default); this
+    arm runs GOPD_LAMBDA=1.0 and the centered branch ignores lambda_vals
+    altogether, so the actor/gopd_lambda series (= 1.0 * loss_scale_factor) has
+    nothing to do with the 0.25 above. d is frozen for
     the whole run; a is not. From step 1 on, a = d - (logS_t - logR) is the live
     debt and it typically melts, so a ratio taken against the same-step a
     inflates on its own and would confirm P2 by artefact. Both propositions are
@@ -196,27 +200,35 @@ def compute_sc_centered_probe_metrics(
             anti-aligned force as if it had substituted, so it only bounds.
             Per-token normalisation is mandatory in both: numerator and
             denominator come from different steps, whose per-segment token
-            counts differ, so the raw sums no longer cancel.
+            counts differ, so the raw sums no longer cancel. The step-0
+            denominator also has to exist: the init student rarely reaches the
+            deep segments (offline, its longest correct trajectory is 6.8k), so
+            a segment whose tok_den_seg{k} at step 0 is small carries a noisy or
+            empty denominator. Gate on it (a few thousand tokens) and report
+            "no data" for that segment rather than a large ratio.
       * fingerprint overlap (P1, per segment)
             agree_num_seg{k} / strong_den_seg{k}; offline ~67% front, ~54% deep.
             Not readable on its own: the chance level of sign agreement is
             p_a * p_c + (1 - p_a) * (1 - p_c), with p_a = strong_apos_num /
             strong_den and p_c = strong_cpos_num / strong_den, and both
             marginals drift over training and across segments (c is zero-sum,
-            a is early-positive). Always report overlap minus chance.
+            a is early-positive). Always report overlap minus chance. The table
+            degenerates where c is exactly 0 (single-token rows center to zero):
+            such tokens count towards neither agree_num nor strong_cpos_num, so
+            treat the overlap as unreadable in a batch full of very short
+            responses (watch tok_den_seg0 against the response-length series).
       * payment schedule (per segment)
             c_num_seg{k} / tok_den_seg{k}: front positive, deep negative is the
             claim. Offline front-1k minus 8k+ contrast +0.082 (first4k itself
             +0.027, gopd whole-trajectory +0.016).
       * deep-force attribution
-            c_capped_num_seg{k} / tok_capped_den_seg{k} against the segment
-            mean: the negative force beyond 8k should land on runaway rows
-            (offline, the longest correct trajectory is 6.8k). Read this on
-            seg4: seg5 is filled almost exclusively by capped rows, so its
-            capped-vs-normal contrast has no denominator left. Negative-force
-            share on those rows, offline 66-71% beyond 8k:
-            (cabs_capped_num_seg{k} - c_capped_num_seg{k}) / 2
-            / cabs_capped_num_seg{k}
+            c_capped_num_seg{k} / tok_capped_den_seg{k} against the same
+            segment's normal-row mean, which is the complement
+            (c_num_seg{k} - c_capped_num_seg{k}) / (tok_den_seg{k} -
+            tok_capped_den_seg{k}): the negative force beyond 8k should land on
+            runaway rows (offline, the longest correct trajectory is 6.8k).
+            Read this on seg4: seg5 is filled almost exclusively by capped rows,
+            so its capped-vs-normal contrast has no denominator left.
       * force budget / kill line
             c_abs_mean. Offline (init-student proxy) ~0.078, live student
             estimated 0.02-0.04. A sustained < 0.02 by step ~15 means the arm
@@ -253,6 +265,24 @@ def compute_sc_centered_probe_metrics(
       * uncentered g per segment: logsct_num_seg{k} - logscs_num_seg{k}.
       * global means of |a|, |c| and g: sum a segment family and divide by
         sum(tok_den_seg). c_abs_mean is kept anyway, as the kill line.
+      * runaway row share: the trainer already logs response_length/clip_ratio
+        over the whole batch. A per-micro row mean here would additionally have
+        broken this file's num/den convention (it is a ratio taken inside the
+        micro, so it only survives the mean-reduce while every micro-batch holds
+        the same number of rows).
+      * align_mean is kept although it is recoverable too: c is zero-sum per
+        row, so actor/gopd_adv_mean = align_mean * loss_scale_factor exactly,
+        and actor/gopd_lambda is that same factor while lambda_vals is 1.0.
+        Recovering it means dividing two loss_scale_factor-contaminated series
+        and relying on this arm's lambda; the probe suite keeps raw readings.
+
+    Deliberately no longer measured:
+      * negative-force share on capped rows. The pre-registered "66-71%
+        negative beyond 8k" was a token-count share, carried by the retired
+        cneg_capped_num global; the offline script that produced the figure is
+        gone, so it cannot be re-derived or its convention re-checked. It stays
+        on record as history only, and the deep-force claim rests on the
+        mean-vs-mean attribution above, which is what the proposition needs.
     """
     if align_adv.dim() != 2 or centered_tilt.dim() != 2:
         return {}
@@ -291,7 +321,6 @@ def compute_sc_centered_probe_metrics(
     lengths = mask.sum(dim=-1)
     capped_row = (lengths >= mask.shape[-1]).float()
     capped_col = capped_row.unsqueeze(-1)
-    out["sc_centered/capped_seq_frac"] = capped_row.mean().item()
 
     # --- depth segments (num/den pairs) ---------------------------------------
     positions = torch.arange(mask.shape[-1], device=mask.device)
@@ -310,7 +339,6 @@ def compute_sc_centered_probe_metrics(
         out[f"sc_centered/strong_cpos_num_seg{k}"] = (strong_a * (c > 0).float() * seg).sum().item()
         out[f"sc_centered/tok_capped_den_seg{k}"] = seg_capped.sum().item()
         out[f"sc_centered/c_capped_num_seg{k}"] = (c * seg_capped).sum().item()
-        out[f"sc_centered/cabs_capped_num_seg{k}"] = (c.abs() * seg_capped).sum().item()
         out[f"sc_centered/logsct_num_seg{k}"] = (log_sc_t * seg).sum().item()
         out[f"sc_centered/logscs_num_seg{k}"] = (log_sc_s * seg).sum().item()
         lo = hi

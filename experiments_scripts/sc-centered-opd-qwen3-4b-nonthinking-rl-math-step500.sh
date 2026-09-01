@@ -34,8 +34,10 @@
 #                       against the chance level from the strong_{apos,cpos}
 #                       marginals.
 #   conflict_num/active_den   bounded-conflict rate vs the alignment debt (~30%).
-#   c_capped_num_seg / cabs_capped_num_seg   runaway targeting of the deep
-#                       negative force (read on seg4; seg5 is all-capped).
+#   c_capped_num_seg / tok_capped_den_seg   runaway targeting of the deep
+#                       negative force, against the normal-row complement
+#                       (read on seg4; seg5 is all-capped). Runaway row share
+#                       itself is the trainer's response_length/clip_ratio.
 #   logsct_num / logscs_num_seg   teacher/student attribution of the g profile
 #                       (their difference is exactly g).
 #   c_term_num/term_den terminal-window tilt (watch for early-truncation side

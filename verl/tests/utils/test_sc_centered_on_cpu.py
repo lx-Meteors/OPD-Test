@@ -146,13 +146,13 @@ _FAMILIES = (
     "strong_cpos_num",
     "tok_capped_den",
     "c_capped_num",
-    "cabs_capped_num",
     "logsct_num",
     "logscs_num",
 )
 
-# Globals dropped in favour of the segment families (algebraically recoverable)
-# or of no service to either proposition.
+# Globals dropped in favour of the segment families (algebraically recoverable),
+# of no service to either proposition, or already logged by the trainer
+# (capped_seq_frac vs response_length/clip_ratio).
 _DELETED_KEYS = (
     "sc_centered/align_abs_mean",
     "sc_centered/g_mean",
@@ -160,6 +160,7 @@ _DELETED_KEYS = (
     "sc_centered/tok_capped_den",
     "sc_centered/c_capped_num",
     "sc_centered/cneg_capped_num",
+    "sc_centered/capped_seq_frac",
 )
 
 # capped row / the 12288 boundary / one token past it / a seg4-only row /
@@ -216,6 +217,9 @@ def _bruteforce_segments(a, c, sc_s, sc_t, mask):
             d["cabs_num"] += abs(cv)
             d["absa_num"] += abs(av)
             d["csigna_num"] += cv * sign_a
+            if capped:
+                d["tok_capped_den"] += 1.0
+                d["c_capped_num"] += cv
             if abs(av) > 0.5:
                 d["strong_den"] += 1.0
                 if sign_c == sign_a:
@@ -224,10 +228,6 @@ def _bruteforce_segments(a, c, sc_s, sc_t, mask):
                     d["strong_apos_num"] += 1.0
                 if cv > 0.0:
                     d["strong_cpos_num"] += 1.0
-            if capped:
-                d["tok_capped_den"] += 1.0
-                d["c_capped_num"] += cv
-                d["cabs_capped_num"] += abs(cv)
             d["logsct_num"] += math.log(max(sct_row[j], 1e-6))
             d["logscs_num"] += math.log(max(scs_row[j], 1e-6))
     return acc
@@ -261,7 +261,6 @@ def test_probe_matches_bruteforce():
     assert abs(seg_c) < 1e-3  # zero-sum identity again, via the segment route
 
     capped = lengths >= mask.shape[-1]
-    assert math.isclose(out["sc_centered/capped_seq_frac"], capped.float().mean().item(), rel_tol=1e-6)
     cap_tokens = m[capped].sum().item()
     seg_cap_den = sum(out[f"sc_centered/tok_capped_den_seg{k}"] for k in range(_N_SEG))
     assert math.isclose(seg_cap_den, cap_tokens, rel_tol=1e-6)
@@ -316,7 +315,7 @@ def test_segment_partition_and_subset_identities():
         assert out[f"sc_centered/agree_num_seg{k}"] <= out[f"sc_centered/strong_den_seg{k}"]
         assert out[f"sc_centered/strong_apos_num_seg{k}"] <= out[f"sc_centered/strong_den_seg{k}"]
         assert out[f"sc_centered/strong_cpos_num_seg{k}"] <= out[f"sc_centered/strong_den_seg{k}"]
-        assert out[f"sc_centered/cabs_capped_num_seg{k}"] <= out[f"sc_centered/cabs_num_seg{k}"] + 1e-3
+        assert abs(out[f"sc_centered/c_capped_num_seg{k}"]) <= out[f"sc_centered/cabs_num_seg{k}"] + 1e-3
         assert abs(out[f"sc_centered/csigna_num_seg{k}"]) <= out[f"sc_centered/cabs_num_seg{k}"] + 1e-3
 
 
@@ -328,9 +327,9 @@ def test_boundary_lengths_land_in_expected_segments():
     assert out["sc_centered/tok_den_seg4"] == 4096.0 * 3 + 808.0
     # the 12288-long row stops exactly at the seg5 boundary and contributes nothing
     assert out["sc_centered/tok_den_seg5"] == 4096.0 + 1.0
+    # only the full-buffer row is capped, so its tokens are the whole buffer
     assert out["sc_centered/tok_capped_den_seg5"] == 4096.0
-    # only the full-buffer row is capped
-    assert math.isclose(out["sc_centered/capped_seq_frac"], 1.0 / len(_DEEP_LENGTHS), rel_tol=1e-6)
+    assert sum(out[f"sc_centered/tok_capped_den_seg{k}"] for k in range(_N_SEG)) == 16384.0
 
 
 def test_strong_line_is_strictly_greater():
@@ -426,6 +425,9 @@ def test_deleted_keys_are_absent():
         # the linear SC families were replaced by their log versions
         assert f"sc_centered/sct_num_seg{k}" not in out
         assert f"sc_centered/scs_num_seg{k}" not in out
+        # dropped: its only reading (negative mass share on capped rows) was not
+        # the token-count share the retired offline baseline referred to
+        assert f"sc_centered/cabs_capped_num_seg{k}" not in out
     assert "sc_centered/tok_den_seg6" not in out  # exactly six segments
 
 
@@ -442,7 +444,7 @@ def test_degenerate_rows_are_safe():
     assert all(math.isfinite(v) for v in out0.values())
     assert out0["sc_centered/tok_den_seg0"] == 0.0
     assert out0["sc_centered/term_den"] == 0.0
-    assert out0["sc_centered/capped_seq_frac"] == 0.0
+    assert out0["sc_centered/tok_capped_den_seg0"] == 0.0
 
 
 def test_probe_rejects_topk_shapes():
