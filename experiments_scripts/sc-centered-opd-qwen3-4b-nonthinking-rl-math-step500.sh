@@ -21,12 +21,23 @@
 # logprobs only (top-k 0), same teacher scoring pass; the only wires are the
 # per-position self-certainty scalars of the two models.
 #
-# Readouts (sc_centered/* suite, raw num/den pairs):
+# Readouts (sc_centered/* suite, raw num/den pairs; six segments
+# [0,1k)/[1k,2k)/[2k,4k)/[4k,8k)/[8k,12k)/[12k,+), see verl/utils/sc_probe.py for
+# the derived readings and their pre-registered baselines):
 #   c_abs_mean          live force budget; pre-registered underpowered kill line:
 #                       sustained < 0.02 by ~step 15.
-#   c_num_seg0..3       depth schedule (front positive, deep negative claim).
+#   c_num_seg0..5       depth schedule (front positive, deep negative claim).
+#   csigna_num / absa_num_seg   substitution rate against the extrapolation force
+#                       budget 0.25*|a|, whose denominator is pinned at step 0
+#                       (where S = R makes a = d exactly).
+#   agree_num / strong_den_seg  fingerprint overlap on |a| > 0.5 tokens, read
+#                       against the chance level from the strong_{apos,cpos}
+#                       marginals.
 #   conflict_num/active_den   bounded-conflict rate vs the alignment debt (~30%).
-#   c_capped_num / cneg_capped_num   runaway targeting (negative-force coverage).
+#   c_capped_num_seg / cabs_capped_num_seg   runaway targeting of the deep
+#                       negative force (read on seg4; seg5 is all-capped).
+#   logsct_num / logscs_num_seg   teacher/student attribution of the g profile
+#                       (their difference is exactly g).
 #   c_term_num/term_den terminal-window tilt (watch for early-truncation side
 #                       effects; offline ~-0.13 on correct endings).
 

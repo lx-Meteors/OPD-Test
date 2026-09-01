@@ -56,8 +56,11 @@ from __future__ import annotations
 import torch
 
 _SEG_BOUNDS = (2048, 4096, 8192)
+_CENTERED_SEG_BOUNDS = (1024, 2048, 4096, 8192, 12288)
 _TERMINAL_WINDOW = 256
 _ACTIVE_EPS = 0.05
+_STRONG_A = 0.5
+_SC_FLOOR = 1e-6
 
 __all__ = ["compute_sc_probe_metrics", "compute_sc_centered_probe_metrics"]
 
@@ -150,32 +153,106 @@ def compute_sc_centered_probe_metrics(
 ) -> dict[str, float]:
     """Probes for the SC-centered advantage adv = a + c, c = g - mean_traj(g).
 
-    One readout per pre-registered claim (all raw, num/den pairs for exact
-    cross-micro aggregation, same conventions as compute_sc_probe_metrics):
+    Two pre-registered propositions, both resolved per depth segment:
 
-      * c_abs_mean            E[|c|]: the live force budget. Offline (init
-                              student proxy) predicts ~0.078; the underpowered
-                              kill line is a sustained < 0.02 by step ~15.
-      * c_mean                masked mean of c; ~0 by construction (identity
-                              check on the centering + mask plumbing).
-      * g_mean                uncentered log(SC_T/SC_S) level: the speed
-                              component the centering removes. Expected to
-                              flip sign early (student SC overshoot) and
-                              settle at a small positive value.
-      * seg{k} c/cabs num/den depth profile of the redistribution: the
-                              first4k-like schedule (front positive, deep
-                              negative) is the claim under test. Front-minus-
-                              deep contrast offline: +0.082.
-      * conflict num/den      sign(c) != sign(a) among tokens where both are
-                              active (|.| > 0.05). Offline: ~30% (bounded real
-                              conflict; G-OPD terminal: 60%).
-      * capped rows           runaway targeting: mean c and negative-force
-                              share on full-buffer rows (offline: 66-71%
-                              negative beyond 8k).
-      * terminal window       mean c over the last 256 valid tokens of
-                              terminated rows (offline: ~-0.13 on correct
-                              endings; watch for early-truncation side
-                              effects).
+      P1 (selection) c lands on the tokens the frozen G-OPD extrapolation force
+                     lands on, and with the same sign.
+      P2 (payment)   c's per-token force is of the same order as the
+                     extrapolation force's, segment by segment.
+
+    Reference-free anchor, and its expiry date. This arm never instantiates a
+    reference worker, so d = logT - logR is not observable as a tensor. It
+    enters through a single identity: at step 0 the rollout policy IS the init
+    model (REFERENCE_MODEL_PATH defaults to ACTOR_MODEL_PATH), hence
+    a = logT - logS equals d exactly and 0.25 * |a| is the force budget G-OPD
+    would have spent on the extrapolation term (lambda = 1.25). d is frozen for
+    the whole run; a is not. From step 1 on, a = d - (logS_t - logR) is the live
+    debt and it typically melts, so a ratio taken against the same-step a
+    inflates on its own and would confirm P2 by artefact. Both propositions are
+    therefore read against a step-0 denominator (see below). This is an honest
+    limitation of the reference-free design, not a derivation: the dose law and
+    the first4k analysis both put the extrapolation force's value in the early
+    accumulation phase, which is the window the anchor covers.
+
+    Segments (_CENTERED_SEG_BOUNDS, response-token index, prompt excluded):
+      0 [0, 1k)    the "front 1k" of the offline +0.082 baseline
+      1 [1k, 2k)   continuity with the existing readouts
+      2 [2k, 4k)   inside the first4k window
+      3 [4k, 8k)   first4k's outer edge (first4k stops paying here)
+      4 [8k, 12k)  long but still-terminating trajectories
+      5 [12k, +)   loop deep tail
+    _SEG_BOUNDS is shared with compute_sc_probe_metrics (SC-ratio arm) and must
+    stay untouched: changing it would retroactively redefine seg0..3 of the
+    already-finished scratio run.
+
+    Derived readings (divide the two logged series in W&B):
+
+      * substitution rate, upper bound (P2, per segment)
+            [cabs_num_seg{k} / tok_den_seg{k}] at step t
+            / (0.25 * [absa_num_seg{k} / tok_den_seg{k}] at step 0)
+      * substitution rate, effective (P2, per segment)
+            same with csigna_num_seg{k} in the numerator: c projected onto the
+            extrapolation force's direction. The cabs version credits
+            anti-aligned force as if it had substituted, so it only bounds.
+            Per-token normalisation is mandatory in both: numerator and
+            denominator come from different steps, whose per-segment token
+            counts differ, so the raw sums no longer cancel.
+      * fingerprint overlap (P1, per segment)
+            agree_num_seg{k} / strong_den_seg{k}; offline ~67% front, ~54% deep.
+            Not readable on its own: the chance level of sign agreement is
+            p_a * p_c + (1 - p_a) * (1 - p_c), with p_a = strong_apos_num /
+            strong_den and p_c = strong_cpos_num / strong_den, and both
+            marginals drift over training and across segments (c is zero-sum,
+            a is early-positive). Always report overlap minus chance.
+      * payment schedule (per segment)
+            c_num_seg{k} / tok_den_seg{k}: front positive, deep negative is the
+            claim. Offline front-1k minus 8k+ contrast +0.082 (first4k itself
+            +0.027, gopd whole-trajectory +0.016).
+      * deep-force attribution
+            c_capped_num_seg{k} / tok_capped_den_seg{k} against the segment
+            mean: the negative force beyond 8k should land on runaway rows
+            (offline, the longest correct trajectory is 6.8k). Read this on
+            seg4: seg5 is filled almost exclusively by capped rows, so its
+            capped-vs-normal contrast has no denominator left. Negative-force
+            share on those rows, offline 66-71% beyond 8k:
+            (cabs_capped_num_seg{k} - c_capped_num_seg{k}) / 2
+            / cabs_capped_num_seg{k}
+      * force budget / kill line
+            c_abs_mean. Offline (init-student proxy) ~0.078, live student
+            estimated 0.02-0.04. A sustained < 0.02 by step ~15 means the arm
+            is underpowered: report it as such, do not raise beta to compensate.
+      * conflict rate
+            conflict_num / active_den. Same axis as the overlap family (sign
+            relation between c and a) but at the lower |.| > 0.05 threshold and
+            global only; kept solely for comparability with the gopd terminal
+            60% reading (offline SC-centered: ~30%, bounded real conflict).
+      * profile attribution
+            logsct_num_seg{k}, logscs_num_seg{k}. Their difference is exactly
+            g's segment sum (g = log SC_T - log SC_S), so the uncentered
+            profile needs no family of its own, and the split says whether a
+            flattening depth profile came from the teacher getting clearer in
+            the deep tail or from the student's tail suppression catching up --
+            two situations whose responses are opposite. Logged as means of
+            log SC rather than of SC because g is a difference of logs and only
+            the log means decompose it exactly (E[g] != log(E[SC_T]/E[SC_S]));
+            SC levels in nats remain available as sc_{student,teacher}_mean.
+      * zero-sum self-check
+            c_mean, ~0 by construction (centering + mask plumbing).
+      * terminal window
+            c_term_num / term_den over the last 256 valid tokens of terminated
+            rows (offline ~-0.13 on correct endings; watch for early-truncation
+            side effects). A safety watchdog, not a proposition.
+
+    Deliberately not logged, recoverable by algebra:
+      * positive / negative tilt mass per segment:
+        (cabs_num_seg{k} +/- c_num_seg{k}) / 2.
+      * normal (non-runaway) rows: total minus capped, e.g.
+        c_num_seg{k} - c_capped_num_seg{k}, denominator likewise.
+      * the full 2x2 sign table on the strong-a set: its four cells follow from
+        strong_den, agree_num, strong_apos and strong_cpos.
+      * uncentered g per segment: logsct_num_seg{k} - logscs_num_seg{k}.
+      * global means of |a|, |c| and g: sum a segment family and divide by
+        sum(tok_den_seg). c_abs_mean is kept anyway, as the kill line.
     """
     if align_adv.dim() != 2 or centered_tilt.dim() != 2:
         return {}
@@ -186,45 +263,57 @@ def compute_sc_centered_probe_metrics(
     sc_t = sc_teacher.float()
     mask = response_mask.to(torch.float32)
     n_tok = mask.sum().clamp_min(1.0)
-    g = torch.log(sc_t.clamp_min(1e-6) / sc_s.clamp_min(1e-6))
+    log_sc_s = torch.log(sc_s.clamp_min(_SC_FLOOR))
+    log_sc_t = torch.log(sc_t.clamp_min(_SC_FLOOR))
+    sign_a = torch.sign(a)
+    strong_a = (a.abs() > _STRONG_A).float()
+    # torch.sign(0) = 0, so a zero tilt never counts as agreement (on the strong
+    # set sign(a) is +/-1, so only sign(c) can be the zero).
+    agree = (torch.sign(c) == sign_a).float() * strong_a
     out: dict[str, float] = {}
 
     def full_mean(x: torch.Tensor) -> float:
         return ((x * mask).sum() / n_tok).item()
 
     out["sc_centered/align_mean"] = full_mean(a)
-    out["sc_centered/align_abs_mean"] = full_mean(a.abs())
     out["sc_centered/c_mean"] = full_mean(c)
     out["sc_centered/c_abs_mean"] = full_mean(c.abs())
-    out["sc_centered/g_mean"] = full_mean(g)
-    out["sc_centered/g_abs_mean"] = full_mean(g.abs())
     out["sc_centered/sc_student_mean"] = full_mean(sc_s)
     out["sc_centered/sc_teacher_mean"] = full_mean(sc_t)
 
     # --- conflict with the alignment debt -------------------------------------
     active = ((c.abs() > _ACTIVE_EPS) & (a.abs() > _ACTIVE_EPS)).float() * mask
-    conflict = (torch.sign(c) != torch.sign(a)).float() * active
+    conflict = (torch.sign(c) != sign_a).float() * active
     out["sc_centered/active_den"] = active.sum().item()
     out["sc_centered/conflict_num"] = conflict.sum().item()
-
-    # --- depth segments (num/den pairs) ---------------------------------------
-    positions = torch.arange(mask.shape[-1], device=mask.device)
-    lo = 0
-    for k, hi in enumerate((*_SEG_BOUNDS, mask.shape[-1] + 1)):
-        seg = ((positions >= lo) & (positions < hi)).float().unsqueeze(0) * mask
-        out[f"sc_centered/tok_den_seg{k}"] = seg.sum().item()
-        out[f"sc_centered/c_num_seg{k}"] = (c * seg).sum().item()
-        out[f"sc_centered/cabs_num_seg{k}"] = (c.abs() * seg).sum().item()
-        lo = hi
 
     # --- runaway targeting: capped (full-buffer) rows --------------------------
     lengths = mask.sum(dim=-1)
     capped_row = (lengths >= mask.shape[-1]).float()
     capped_col = capped_row.unsqueeze(-1)
     out["sc_centered/capped_seq_frac"] = capped_row.mean().item()
-    out["sc_centered/tok_capped_den"] = (capped_col * mask).sum().item()
-    out["sc_centered/c_capped_num"] = (c * capped_col * mask).sum().item()
-    out["sc_centered/cneg_capped_num"] = ((c < 0).float() * capped_col * mask).sum().item()
+
+    # --- depth segments (num/den pairs) ---------------------------------------
+    positions = torch.arange(mask.shape[-1], device=mask.device)
+    lo = 0
+    for k, hi in enumerate((*_CENTERED_SEG_BOUNDS, mask.shape[-1] + 1)):
+        seg = ((positions >= lo) & (positions < hi)).float().unsqueeze(0) * mask
+        seg_capped = seg * capped_col
+        out[f"sc_centered/tok_den_seg{k}"] = seg.sum().item()
+        out[f"sc_centered/c_num_seg{k}"] = (c * seg).sum().item()
+        out[f"sc_centered/cabs_num_seg{k}"] = (c.abs() * seg).sum().item()
+        out[f"sc_centered/absa_num_seg{k}"] = (a.abs() * seg).sum().item()
+        out[f"sc_centered/csigna_num_seg{k}"] = (c * sign_a * seg).sum().item()
+        out[f"sc_centered/strong_den_seg{k}"] = (strong_a * seg).sum().item()
+        out[f"sc_centered/agree_num_seg{k}"] = (agree * seg).sum().item()
+        out[f"sc_centered/strong_apos_num_seg{k}"] = ((a > _STRONG_A).float() * seg).sum().item()
+        out[f"sc_centered/strong_cpos_num_seg{k}"] = (strong_a * (c > 0).float() * seg).sum().item()
+        out[f"sc_centered/tok_capped_den_seg{k}"] = seg_capped.sum().item()
+        out[f"sc_centered/c_capped_num_seg{k}"] = (c * seg_capped).sum().item()
+        out[f"sc_centered/cabs_capped_num_seg{k}"] = (c.abs() * seg_capped).sum().item()
+        out[f"sc_centered/logsct_num_seg{k}"] = (log_sc_t * seg).sum().item()
+        out[f"sc_centered/logscs_num_seg{k}"] = (log_sc_s * seg).sum().item()
+        lo = hi
 
     # --- terminal window: last 256 valid tokens of terminated rows -------------
     terminated_col = (1.0 - capped_row).unsqueeze(-1)
