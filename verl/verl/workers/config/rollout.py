@@ -144,6 +144,10 @@ class RolloutConfig(BaseConfig):
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", or "none"
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
     prune_opd: dict = field(default_factory=dict)
+    # Observation-only G-OPD overlap diagnostics; these do not affect rollout or loss.
+    gopd_overlap_top_k: int = 0
+    gopd_overlap_log_freq: int = 10
+    gopd_overlap_chunk_size: int = 1024
 
     disable_log_stats: bool = True
 
