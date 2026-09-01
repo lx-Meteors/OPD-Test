@@ -202,6 +202,7 @@ def compute_gopd_overlap_metrics(
         "teacher_on_student_log_probs",
         "teacher_top_k_log_probs",
         "gopd_ref_on_candidate_log_probs",
+        "gopd_ref_top_k_ids",
         "response_mask",
     )
     if any(key not in data.batch for key in required_keys):
@@ -212,6 +213,7 @@ def compute_gopd_overlap_metrics(
     teacher_on_student = data.batch["teacher_on_student_log_probs"].float()
     teacher_on_teacher = data.batch["teacher_top_k_log_probs"].float()
     ref_on_candidates = data.batch["gopd_ref_on_candidate_log_probs"].float()
+    ref_ids = data.batch["gopd_ref_top_k_ids"].long()
     response_mask = data.batch["response_mask"].float()
 
     top_k = student_ids.shape[-1]
@@ -221,6 +223,11 @@ def compute_gopd_overlap_metrics(
         raise ValueError(
             "G-OPD overlap diagnostic shape mismatch: "
             f"candidate_ids={tuple(candidate_ids.shape)}, ref_log_probs={tuple(ref_on_candidates.shape)}"
+        )
+    if ref_ids.shape != student_ids.shape:
+        raise ValueError(
+            "G-OPD Reference Top-K diagnostic shape mismatch: "
+            f"student_ids={tuple(student_ids.shape)}, ref_ids={tuple(ref_ids.shape)}"
         )
 
     extrapolated_scores = lambda_value * teacher_on_candidates + (1.0 - lambda_value) * ref_on_candidates
@@ -237,12 +244,6 @@ def compute_gopd_overlap_metrics(
     extrapolated_scores = extrapolated_scores.masked_fill(duplicate, float("-inf"))
     extrapolated_indices = torch.topk(extrapolated_scores, k=top_k, dim=-1).indices
     extrapolated_ids = torch.gather(candidate_ids, dim=-1, index=extrapolated_indices)
-
-    # Construct the Reference Top-K over the same S/T candidate space. This
-    # reuses the existing Ref forward and keeps the diagnostic observation-only.
-    ref_candidate_scores = ref_on_candidates.masked_fill(duplicate, float("-inf"))
-    ref_indices = torch.topk(ref_candidate_scores, k=top_k, dim=-1).indices
-    ref_ids = torch.gather(candidate_ids, dim=-1, index=ref_indices)
 
     def overlap_ratio(left_ids: torch.Tensor, right_ids: torch.Tensor) -> torch.Tensor:
         return (left_ids.unsqueeze(-1) == right_ids.unsqueeze(-2)).any(dim=-1).float().mean(dim=-1)
@@ -1738,7 +1739,12 @@ class RayPPOTrainer:
                             metrics.update(overlap_metrics)
 
                             # Diagnostic tensors must never reach advantage/loss computation.
-                            for key in ("gopd_overlap_candidate_ids", "gopd_ref_on_candidate_log_probs"):
+                            for key in (
+                                "gopd_overlap_candidate_ids",
+                                "gopd_ref_on_candidate_log_probs",
+                                "gopd_ref_top_k_ids",
+                                "gopd_ref_top_k_log_probs",
+                            ):
                                 if key in batch.batch:
                                     batch.batch.pop(key)
                             if self.config.actor_rollout_ref.rollout.get("log_prob_top_k", 0) == 0:

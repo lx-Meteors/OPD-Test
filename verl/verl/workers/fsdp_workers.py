@@ -986,7 +986,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys, topk_ids, topk_log_probs = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, topk_ids, topk_log_probs, native_topk_ids, native_topk_log_probs = (
+                    self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                )
             
             tensors = {"old_log_probs": output, "entropys": entropys}
             if topk_ids is not None:
@@ -994,6 +996,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if topk_log_probs is not None:
                 tensors["student_top_k_log_probs"] = topk_log_probs
                 tensors["student_valid_counts"] = (topk_log_probs > -1e6).sum(dim=-1)
+            if native_topk_ids is not None:
+                tensors["gopd_native_top_k_ids"] = native_topk_ids
+            if native_topk_log_probs is not None:
+                tensors["gopd_native_top_k_log_probs"] = native_topk_log_probs
             
             output = DataProto.from_dict(
                 tensors=tensors,
@@ -1089,6 +1095,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             tensors = {"ref_log_prob": data.batch["old_log_probs"]}
             if has_overlap_candidates and "student_top_k_log_probs" in data.batch:
                 tensors["gopd_ref_on_candidate_log_probs"] = data.batch["student_top_k_log_probs"]
+            if has_overlap_candidates and "gopd_native_top_k_ids" in data.batch:
+                tensors["gopd_ref_top_k_ids"] = data.batch["gopd_native_top_k_ids"]
+                tensors["gopd_ref_top_k_log_probs"] = data.batch["gopd_native_top_k_log_probs"]
             data = DataProto.from_dict(tensors=tensors)
             return data
         assert self._is_ref
@@ -1103,10 +1112,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["top_k"] = 0
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _, _, candidate_log_probs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, _, _, candidate_log_probs, ref_top_k_ids, ref_top_k_log_probs = (
+                self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            )
             tensors = {"ref_log_prob": output}
             if has_overlap_candidates:
                 tensors["gopd_ref_on_candidate_log_probs"] = candidate_log_probs
+                tensors["gopd_ref_top_k_ids"] = ref_top_k_ids
+                tensors["gopd_ref_top_k_log_probs"] = ref_top_k_log_probs
             output = DataProto.from_dict(tensors=tensors)
 
         output = output.to("cpu")
