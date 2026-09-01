@@ -686,6 +686,9 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        diagnostic_target_key = "gopd_overlap_candidate_ids"
+        if diagnostic_target_key in data.batch:
+            select_keys.append(diagnostic_target_key)
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -706,9 +709,15 @@ class DataParallelPPOActor(BasePPOActor):
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            diagnostic_target_ids = model_inputs.get(diagnostic_target_key, None)
+            forward_top_k = diagnostic_target_ids.shape[-1] if diagnostic_target_ids is not None else top_k
             with torch.no_grad():
                 entropy, log_probs, topk_ids, topk_log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, top_k=top_k
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    top_k=forward_top_k,
+                    student_top_k_ids=diagnostic_target_ids,
                 )
             # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k
             # log_probs = log_probs.to("cpu")
@@ -716,7 +725,7 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_entropy:
                 # entropy = entropy.to("cpu")
                 entropy_lst.append(entropy)
-            if top_k > 0:
+            if forward_top_k > 0:
                 # topk_ids = topk_ids.to("cpu")
                 # topk_log_probs = topk_log_probs.to("cpu")
                 topk_ids_lst.append(topk_ids)
@@ -729,7 +738,8 @@ class DataParallelPPOActor(BasePPOActor):
         
         topk_ids_tensor = None
         topk_log_probs_tensor = None
-        if top_k > 0:
+        has_top_k_output = top_k > 0 or diagnostic_target_key in data.batch
+        if has_top_k_output:
             topk_ids_tensor = torch.concat(topk_ids_lst, dim=0)
             topk_log_probs_tensor = torch.concat(topk_log_probs_lst, dim=0)
 
@@ -737,7 +747,7 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
-            if top_k > 0:
+            if has_top_k_output:
                 topk_ids_tensor = restore_dynamic_batch(topk_ids_tensor, batch_idx_list)
                 topk_log_probs_tensor = restore_dynamic_batch(topk_log_probs_tensor, batch_idx_list)
 

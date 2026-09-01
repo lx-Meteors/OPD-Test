@@ -179,6 +179,97 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+@torch.no_grad()
+def compute_gopd_overlap_metrics(
+    data: DataProto,
+    lambda_value: float,
+    chunk_size: int = 1024,
+) -> dict[str, float]:
+    """Compute diagnostic Top-K overlap for Student, Teacher, and Extrapolated target.
+
+    The extrapolated target is evaluated on the union of Student and Teacher
+    candidates without changing the sampled-token G-OPD objective:
+
+        log E(a|s) = lambda * log T(a|s) + (1-lambda) * log R(a|s) - log Z.
+
+    Only candidate ordering is required for overlap, so the normalization term
+    cancels. Duplicate tokens in the S/T union are removed before selecting E Top-K.
+    """
+
+    required_keys = (
+        "student_top_k_ids",
+        "teacher_top_k_ids",
+        "teacher_on_student_log_probs",
+        "teacher_top_k_log_probs",
+        "gopd_ref_on_candidate_log_probs",
+        "response_mask",
+    )
+    if any(key not in data.batch for key in required_keys):
+        return {}
+
+    student_ids = data.batch["student_top_k_ids"].long()
+    teacher_ids = data.batch["teacher_top_k_ids"].long()
+    teacher_on_student = data.batch["teacher_on_student_log_probs"].float()
+    teacher_on_teacher = data.batch["teacher_top_k_log_probs"].float()
+    ref_on_candidates = data.batch["gopd_ref_on_candidate_log_probs"].float()
+    response_mask = data.batch["response_mask"].float()
+
+    top_k = student_ids.shape[-1]
+    candidate_ids = torch.cat((student_ids, teacher_ids), dim=-1)
+    teacher_on_candidates = torch.cat((teacher_on_student, teacher_on_teacher), dim=-1)
+    if ref_on_candidates.shape != candidate_ids.shape:
+        raise ValueError(
+            "G-OPD overlap diagnostic shape mismatch: "
+            f"candidate_ids={tuple(candidate_ids.shape)}, ref_log_probs={tuple(ref_on_candidates.shape)}"
+        )
+
+    extrapolated_scores = lambda_value * teacher_on_candidates + (1.0 - lambda_value) * ref_on_candidates
+
+    # S and T may share candidates. Keep only the first occurrence so duplicate
+    # entries cannot occupy multiple slots in the extrapolated Top-K.
+    candidate_count = candidate_ids.shape[-1]
+    same_token = candidate_ids.unsqueeze(-1) == candidate_ids.unsqueeze(-2)
+    earlier_entry = torch.triu(
+        torch.ones(candidate_count, candidate_count, dtype=torch.bool, device=candidate_ids.device),
+        diagonal=1,
+    )
+    duplicate = (same_token & earlier_entry).any(dim=-2)
+    extrapolated_scores = extrapolated_scores.masked_fill(duplicate, float("-inf"))
+    extrapolated_indices = torch.topk(extrapolated_scores, k=top_k, dim=-1).indices
+    extrapolated_ids = torch.gather(candidate_ids, dim=-1, index=extrapolated_indices)
+
+    def overlap_ratio(left_ids: torch.Tensor, right_ids: torch.Tensor) -> torch.Tensor:
+        return (left_ids.unsqueeze(-1) == right_ids.unsqueeze(-2)).any(dim=-1).float().mean(dim=-1)
+
+    pair_ratios = {
+        "st": overlap_ratio(student_ids, teacher_ids),
+        "se": overlap_ratio(student_ids, extrapolated_ids),
+        "te": overlap_ratio(teacher_ids, extrapolated_ids),
+    }
+
+    valid_tokens = response_mask.sum()
+    if valid_tokens <= 0:
+        return {}
+
+    metrics: dict[str, float] = {}
+    for pair_name, ratios in pair_ratios.items():
+        metrics[f"gopd-overlap/{pair_name}"] = ((ratios * response_mask).sum() / valid_tokens).item()
+
+    max_len = response_mask.shape[-1]
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, max_len, chunk_size):
+        end = min(start + chunk_size, max_len)
+        chunk_mask = response_mask[:, start:end]
+        chunk_valid_tokens = chunk_mask.sum()
+        if chunk_valid_tokens <= 0:
+            continue
+        for pair_name, ratios in pair_ratios.items():
+            chunk_ratio = (ratios[:, start:end] * chunk_mask).sum() / chunk_valid_tokens
+            metrics[f"gopd-overlap/{pair_name}_chunk_{start}_{end}"] = chunk_ratio.item()
+
+    return metrics
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -1265,6 +1356,24 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    overlap_top_k = int(
+                        self.config.actor_rollout_ref.rollout.get("gopd_overlap_top_k", 0) or 0
+                    )
+                    overlap_log_freq = max(
+                        1, int(self.config.actor_rollout_ref.rollout.get("gopd_overlap_log_freq", 10) or 10)
+                    )
+                    gopd_enabled = self.config.actor_rollout_ref.actor.policy_loss.get(
+                        "only_reverse_kl_advantages", False
+                    )
+                    collect_gopd_overlap = (
+                        gopd_enabled
+                        and overlap_top_k > 0
+                        and (self.global_steps == 1 or self.global_steps % overlap_log_freq == 0)
+                    )
+                    # Workers may return diagnostic Top-K tensors from the same forwards,
+                    # while the configured log_prob_top_k continues to control the loss.
+                    batch.meta_info["gopd_overlap_top_k"] = overlap_top_k if collect_gopd_overlap else 0
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1595,11 +1704,48 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            if collect_gopd_overlap:
+                                student_ids = batch.batch.get("student_top_k_ids", None)
+                                teacher_ids = batch.batch.get("teacher_top_k_ids", None)
+                                if student_ids is not None and teacher_ids is not None:
+                                    batch.batch["gopd_overlap_candidate_ids"] = torch.cat(
+                                        (student_ids, teacher_ids), dim=-1
+                                    )
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                        if collect_gopd_overlap:
+                            overlap_chunk_size = int(
+                                self.config.actor_rollout_ref.rollout.get("gopd_overlap_chunk_size", 1024) or 1024
+                            )
+                            overlap_metrics = compute_gopd_overlap_metrics(
+                                data=batch,
+                                lambda_value=float(self.config.actor_rollout_ref.actor.policy_loss.lambda_vals),
+                                chunk_size=overlap_chunk_size,
+                            )
+                            metrics.update(overlap_metrics)
+
+                            # Diagnostic tensors must never reach advantage/loss computation.
+                            for key in ("gopd_overlap_candidate_ids", "gopd_ref_on_candidate_log_probs"):
+                                if key in batch.batch:
+                                    batch.batch.pop(key)
+                            if self.config.actor_rollout_ref.rollout.get("log_prob_top_k", 0) == 0:
+                                for key in (
+                                    "student_top_k_ids",
+                                    "student_top_k_log_probs",
+                                    "student_valid_counts",
+                                    "teacher_top_k_ids",
+                                    "teacher_top_k_log_probs",
+                                    "teacher_on_student_log_probs",
+                                    "teacher_valid_counts",
+                                    "overlap_mask",
+                                    "teacher_in_student_mask",
+                                ):
+                                    if key in batch.batch:
+                                        batch.batch.pop(key)
 
                     # compute values
                     if self.use_critic:

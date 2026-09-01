@@ -976,7 +976,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["top_k"] = self.config.rollout.get("log_prob_top_k", 0)
+        training_top_k = self.config.rollout.get("log_prob_top_k", 0)
+        diagnostic_top_k = int(data.meta_info.get("gopd_overlap_top_k", 0) or 0)
+        # Diagnostic candidates are returned by the same forward but are not used
+        # by the sampled-token objective when training_top_k == 0.
+        data.meta_info["top_k"] = max(training_top_k, diagnostic_top_k)
         # data.meta_info["top_p"] = 1.0
         # print("log_prob_top_k", data.meta_info["top_k"])
         # perform recompute log_prob
@@ -1076,12 +1080,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        has_overlap_candidates = "gopd_overlap_candidate_ids" in data.batch
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            tensors = {"ref_log_prob": data.batch["old_log_probs"]}
+            if has_overlap_candidates and "student_top_k_log_probs" in data.batch:
+                tensors["gopd_ref_on_candidate_log_probs"] = data.batch["student_top_k_log_probs"]
+            data = DataProto.from_dict(tensors=tensors)
             return data
         assert self._is_ref
         # else:
@@ -1095,8 +1103,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["top_k"] = 0
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            output, _, _, candidate_log_probs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            tensors = {"ref_log_prob": output}
+            if has_overlap_candidates:
+                tensors["gopd_ref_on_candidate_log_probs"] = candidate_log_probs
+            output = DataProto.from_dict(tensors=tensors)
 
         output = output.to("cpu")
 
@@ -2608,7 +2619,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
             
             # Get Top-K and Top-P from config
-            top_k = data.meta_info.get("log_prob_top_k", self.config.get("log_prob_top_k", 0))
+            reward_top_k = data.meta_info.get("log_prob_top_k", self.config.get("log_prob_top_k", 0))
+            diagnostic_top_k = int(data.meta_info.get("gopd_overlap_top_k", 0) or 0)
+            top_k = max(reward_top_k, diagnostic_top_k)
             top_k_strategy = data.meta_info.get("top_k_strategy", self.config.get("top_k_strategy", "only_stu"))
             teacher_temperature = data.meta_info.get("teacher_temperature", self.config.get("teacher_temperature", 1.0))
             
@@ -2709,7 +2722,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 if teacher_in_student_mask is not None:
                     teacher_in_student_mask = teacher_in_student_mask[revert_indices]
 
-            if top_k > 0:
+            if reward_top_k > 0:
                 # Reward calculation is moved to ray_trainer for top_k > 0
                 # because it needs student_on_teacher_log_probs which requires another actor forward
                 rm_scores = None 
@@ -2719,9 +2732,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 
                 reverse_kl = student_logp - teacher_logp
                 rm_scores = -reverse_kl
-                
-                teacher_valid_counts = None
-                overlap_mask = None
+                # Keep diagnostic Top-K tensors when requested, while preserving
+                # the original sampled-token reward above.
+                if diagnostic_top_k > 0:
+                    overlap_mask = teacher_overlap_mask
+                else:
+                    teacher_valid_counts = None
+                    overlap_mask = None
             
             tensors = {}
             if rm_scores is not None:
