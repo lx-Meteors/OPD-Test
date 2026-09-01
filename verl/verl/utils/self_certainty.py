@@ -40,7 +40,14 @@ import math
 
 import torch
 
-__all__ = ["self_certainty_from_logits", "sc_ratio_weight", "centered_log_sc_ratio"]
+__all__ = ["SC_FLOOR", "self_certainty_from_logits", "sc_ratio_weight", "centered_log_sc_ratio"]
+
+# Numerical floor for SC before any division or log. SC >= 0 by Gibbs, but
+# padding positions are exactly 0 (pad_input zero-fills the rmpad path) and fp32
+# cancellation can return ~-1e-9 on a near-uniform distribution. Public because
+# sc_probe's log-SC readouts must use the same floor, or the g they report stops
+# being the g that produced the tilt.
+SC_FLOOR = 1e-6
 
 
 def self_certainty_from_logits(logits: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
@@ -71,7 +78,7 @@ def centered_log_sc_ratio(
     student_self_certainty: torch.Tensor,
     teacher_self_certainty: torch.Tensor,
     response_mask: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float = SC_FLOOR,
 ) -> torch.Tensor:
     """Within-trajectory centered log SC-ratio for the SC-centered advantage.
 
@@ -118,7 +125,7 @@ def centered_log_sc_ratio(
 def sc_ratio_weight(
     student_self_certainty: torch.Tensor,
     teacher_self_certainty: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float = SC_FLOOR,
 ) -> torch.Tensor:
     """State-level bonus weight w = clamp(1 - SC_S / SC_T, 0, 1).
 

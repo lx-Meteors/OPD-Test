@@ -38,8 +38,11 @@
 #                       negative force, against the normal-row complement
 #                       (read on seg4; seg5 is all-capped). Runaway row share
 #                       itself is the trainer's response_length/clip_ratio.
-#   logsct_num / logscs_num_seg   teacher/student attribution of the g profile
-#                       (their difference is exactly g).
+#   g_num_seg           uncentered depth profile (the speed the centering
+#                       removes). Logged directly: differencing the two log-SC
+#                       families below loses ~4 digits to cancellation.
+#   logsct_num / logscs_num_seg   teacher/student attribution of that profile
+#                       (read their own trends, do not subtract them).
 #   c_term_num/term_den terminal-window tilt (watch for early-truncation side
 #                       effects; offline ~-0.13 on correct endings).
 

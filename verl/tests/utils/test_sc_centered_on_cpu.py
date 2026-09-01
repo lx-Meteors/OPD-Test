@@ -20,7 +20,7 @@ import math
 import torch
 
 from verl.utils.sc_probe import compute_sc_centered_probe_metrics
-from verl.utils.self_certainty import centered_log_sc_ratio
+from verl.utils.self_certainty import SC_FLOOR, centered_log_sc_ratio
 
 
 def _make_case(bsz=5, resp_len=97, seed=0):
@@ -146,6 +146,7 @@ _FAMILIES = (
     "strong_cpos_num",
     "tok_capped_den",
     "c_capped_num",
+    "g_num",
     "logsct_num",
     "logscs_num",
 )
@@ -228,8 +229,11 @@ def _bruteforce_segments(a, c, sc_s, sc_t, mask):
                     d["strong_apos_num"] += 1.0
                 if cv > 0.0:
                     d["strong_cpos_num"] += 1.0
-            d["logsct_num"] += math.log(max(sct_row[j], 1e-6))
-            d["logscs_num"] += math.log(max(scs_row[j], 1e-6))
+            log_t = math.log(max(sct_row[j], SC_FLOOR))
+            log_s = math.log(max(scs_row[j], SC_FLOOR))
+            d["g_num"] += log_t - log_s
+            d["logsct_num"] += log_t
+            d["logscs_num"] += log_s
     return acc
 
 
@@ -388,17 +392,14 @@ def test_recoverable_readings_match_direct_computation():
     m = mask.bool()
     n_tok = mask.sum().item()
 
-    # uncentered g per segment = logsct - logscs
-    g = torch.log(sc_t.clamp_min(1e-6) / sc_s.clamp_min(1e-6))
-    g_from_logs = sum(
-        out[f"sc_centered/logsct_num_seg{k}"] - out[f"sc_centered/logscs_num_seg{k}"] for k in range(_N_SEG)
-    )
-    assert math.isclose(g_from_logs, g[m].sum().item(), rel_tol=1e-4)
+    g = torch.log(sc_t.clamp_min(SC_FLOOR) / sc_s.clamp_min(SC_FLOOR))
+    g_direct = sum(out[f"sc_centered/g_num_seg{k}"] for k in range(_N_SEG))
+    assert math.isclose(g_direct, g[m].sum().item(), rel_tol=1e-4)
 
     # the dropped global means come back out of the segment families
     absa = sum(out[f"sc_centered/absa_num_seg{k}"] for k in range(_N_SEG)) / n_tok
     assert math.isclose(absa, a[m].abs().mean().item(), rel_tol=1e-4)
-    g_mean = g_from_logs / n_tok
+    g_mean = g_direct / n_tok
     assert math.isclose(g_mean, g[m].mean().item(), rel_tol=1e-4)
     cabs = sum(out[f"sc_centered/cabs_num_seg{k}"] for k in range(_N_SEG)) / n_tok
     assert math.isclose(cabs, out["sc_centered/c_abs_mean"], rel_tol=1e-4)
@@ -414,14 +415,85 @@ def test_recoverable_readings_match_direct_computation():
         assert normal_den >= 0.0
 
 
+def test_derived_readings_on_a_known_ground_truth():
+    """The section-5 formulas on c = +/-0.25*a, i.e. exact (anti-)substitution.
+
+    Locks the arithmetic of the readings themselves, not just the counters: a
+    sign or factor slip here would silently decide the experiment.
+    """
+    torch.manual_seed(21)
+    bsz, resp_len = 3, 300
+    a = torch.randn(bsz, resp_len) * 0.8
+    mask = torch.ones(bsz, resp_len)
+    sc = torch.rand(bsz, resp_len) * 20.0 + 1.0
+
+    for factor, rate_expected, overlap_expected in ((0.25, 1.0, 1.0), (-0.25, -1.0, 0.0)):
+        out = _probe(a, factor * a, sc, sc, mask)
+        tok = out["sc_centered/tok_den_seg0"]
+        budget = 0.25 * out["sc_centered/absa_num_seg0"] / tok
+        effective = (out["sc_centered/csigna_num_seg0"] / tok) / budget
+        assert math.isclose(effective, rate_expected, rel_tol=1e-5), (factor, effective)
+        # the |c| version cannot tell substitution from anti-substitution: it
+        # reads 1.0 in both directions, which is why it only bounds
+        bound = (out["sc_centered/cabs_num_seg0"] / tok) / budget
+        assert math.isclose(bound, 1.0, rel_tol=1e-5), (factor, bound)
+
+        n_strong = out["sc_centered/strong_den_seg0"]
+        assert n_strong > 0
+        overlap = out["sc_centered/agree_num_seg0"] / n_strong
+        assert math.isclose(overlap, overlap_expected, abs_tol=1e-9), (factor, overlap)
+        p_a = out["sc_centered/strong_apos_num_seg0"] / n_strong
+        p_c = out["sc_centered/strong_cpos_num_seg0"] / n_strong
+        chance = p_a * p_c + (1.0 - p_a) * (1.0 - p_c)
+        assert 0.0 < chance < 1.0
+        # perfect alignment must beat chance, perfect anti-alignment must lose
+        assert (overlap - chance > 0.4) if factor > 0 else (overlap - chance < -0.4)
+
+
+def test_probe_g_matches_the_tilt_helper_at_the_sc_floor():
+    """g_num_seg must be the same g that produced c, SC floor included."""
+    sc_s = torch.tensor([[0.0, 5.0, 2.0, 3.0]])  # a zero SC exercises the floor
+    sc_t = torch.tensor([[4.0, 0.0, 2.0, 6.0]])
+    mask = torch.ones(1, 4)
+    c = centered_log_sc_ratio(sc_s, sc_t, mask)
+    out = _probe(torch.zeros(1, 4), c, sc_s, sc_t, mask)
+
+    g_direct = torch.log(sc_t.double().clamp_min(SC_FLOOR)) - torch.log(sc_s.double().clamp_min(SC_FLOOR))
+    assert math.isclose(out["sc_centered/g_num_seg0"], g_direct.sum().item(), rel_tol=1e-6)
+    # and that same g, with that same floor, is what the tilt was centered from
+    assert torch.allclose((g_direct - g_direct.mean()).float(), c, atol=1e-4)
+
+
+def test_g_is_not_recoverable_from_the_log_sc_split_in_fp32():
+    """Why g_num_seg is logged separately although it is exactly the difference.
+
+    At production scale the two log-SC sums are ~1e5 while g's sum is ~1e0, so
+    differencing them loses about four digits; the direct sum does not.
+    """
+    torch.manual_seed(23)
+    sc_s = torch.rand(4, 16384) * 6.0 + 12.0  # SC ~ 12-18 nats, as observed live
+    sc_t = sc_s * torch.exp(torch.randn(4, 16384) * 0.005)  # flat-profile regime
+    mask = torch.ones(4, 16384)
+    c = centered_log_sc_ratio(sc_s, sc_t, mask)
+    out = _probe(torch.zeros_like(sc_s), c, sc_s, sc_t, mask)
+
+    ref = (torch.log(sc_t.double()) - torch.log(sc_s.double())).sum().item()
+    logged = sum(out[f"sc_centered/g_num_seg{k}"] for k in range(_N_SEG))
+    differenced = sum(
+        out[f"sc_centered/logsct_num_seg{k}"] - out[f"sc_centered/logscs_num_seg{k}"] for k in range(_N_SEG)
+    )
+    err_direct = abs(logged - ref) / abs(ref)
+    err_diff = abs(differenced - ref) / abs(ref)
+    assert err_direct < 1e-4, err_direct
+    assert err_diff > 20 * err_direct, (err_direct, err_diff)
+
+
 def test_deleted_keys_are_absent():
     a, c, sc_s, sc_t, mask, _ = _make_deep_case(seed=16)
     out = _probe(a, c, sc_s, sc_t, mask)
     for key in _DELETED_KEYS:
         assert key not in out, key
     for k in range(_N_SEG):
-        # recoverable as logsct_num_seg{k} - logscs_num_seg{k}
-        assert f"sc_centered/g_num_seg{k}" not in out
         # the linear SC families were replaced by their log versions
         assert f"sc_centered/sct_num_seg{k}" not in out
         assert f"sc_centered/scs_num_seg{k}" not in out

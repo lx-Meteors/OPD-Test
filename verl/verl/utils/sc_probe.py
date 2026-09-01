@@ -11,9 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Online probes for the SC-ratio OPD advantage adv = a * (1 + w).
+"""Online probes for the two reference-free OPD arms.
 
-One readout per pre-registered claim:
+compute_sc_probe_metrics covers the SC-ratio advantage adv = a * (1 + w) and
+compute_sc_centered_probe_metrics the SC-centered one adv = a + c; the two suites
+share the conventions listed at the end of this docstring but nothing else, and
+their segment bounds are deliberately independent (_SEG_BOUNDS is frozen by the
+finished scratio run, _CENTERED_SEG_BOUNDS is not).
+
+SC-ratio readouts, one per pre-registered claim:
 
   * align_mean            E[a] = -KL(S||T): the debt-repayment progress bar
                           (starts ~ -0.2, rises to 0; rent is impossible, so it
@@ -55,12 +61,13 @@ from __future__ import annotations
 
 import torch
 
+from verl.utils.self_certainty import SC_FLOOR
+
 _SEG_BOUNDS = (2048, 4096, 8192)
 _CENTERED_SEG_BOUNDS = (1024, 2048, 4096, 8192, 12288)
 _TERMINAL_WINDOW = 256
 _ACTIVE_EPS = 0.05
 _STRONG_A = 0.5
-_SC_FLOOR = 1e-6
 
 __all__ = ["compute_sc_probe_metrics", "compute_sc_centered_probe_metrics"]
 
@@ -178,6 +185,14 @@ def compute_sc_centered_probe_metrics(
     the first4k analysis both put the extrapolation force's value in the early
     accumulation phase, which is the window the anchor covers.
 
+    Vintage assumption. a is built from old_log_probs (the rollout policy) while
+    c is built from the student SC of the *current* forward. They coincide only
+    while there is one optimizer step per rollout batch, i.e. ppo_mini_batch_size
+    == train_batch_size (both 1024 in this arm's script). Shrink the mini-batch
+    and every mini-batch after the first measures c at an already-updated policy
+    against a debt frozen at the rollout policy, which silently biases every
+    reading below.
+
     Segments (_CENTERED_SEG_BOUNDS, response-token index, prompt excluded):
       0 [0, 1k)    the "front 1k" of the offline +0.082 baseline
       1 [1k, 2k)   continuity with the existing readouts
@@ -238,16 +253,27 @@ def compute_sc_centered_probe_metrics(
             relation between c and a) but at the lower |.| > 0.05 threshold and
             global only; kept solely for comparability with the gopd terminal
             60% reading (offline SC-centered: ~30%, bounded real conflict).
+      * uncentered profile
+            g_num_seg{k} / tok_den_seg{k}: the speed component the centering
+            removes, by depth. Summed per token, NOT recovered by differencing
+            the two log-SC families below. That difference is exact in real
+            arithmetic and useless in float32: with SC ~ 15 nats and ~65k tokens
+            per micro-batch each log-SC sum is ~1.8e5 while g's sum is ~7, a
+            2e4-fold cancellation (5e5-fold once the profile flattens), and
+            fp32's ULP at 1.8e5 is 0.016, so the differenced g arrives quantised
+            at ~0.016 with 0.2-0.8% error against 2e-6 for the direct sum --
+            worst exactly in the flat-profile regime the attribution exists to
+            diagnose, and made worse by whatever the metric transport rounds to.
       * profile attribution
-            logsct_num_seg{k}, logscs_num_seg{k}. Their difference is exactly
-            g's segment sum (g = log SC_T - log SC_S), so the uncentered
-            profile needs no family of its own, and the split says whether a
-            flattening depth profile came from the teacher getting clearer in
-            the deep tail or from the student's tail suppression catching up --
-            two situations whose responses are opposite. Logged as means of
-            log SC rather than of SC because g is a difference of logs and only
-            the log means decompose it exactly (E[g] != log(E[SC_T]/E[SC_S]));
-            SC levels in nats remain available as sc_{student,teacher}_mean.
+            logsct_num_seg{k}, logscs_num_seg{k}: which side moved when the
+            depth profile changes -- the teacher getting clearer in the deep
+            tail, or the student's tail suppression catching up, two situations
+            whose responses are opposite. Read their own per-token means (~2.7
+            nats, well conditioned) and their trends; never subtract them for a
+            load-bearing number, that is what g_num_seg is for. Logged as means
+            of log SC rather than of SC because g is a difference of logs
+            (E[g] != log(E[SC_T]/E[SC_S])); SC levels in nats remain available
+            as sc_{student,teacher}_mean.
       * zero-sum self-check
             c_mean, ~0 by construction (centering + mask plumbing).
       * terminal window
@@ -262,7 +288,6 @@ def compute_sc_centered_probe_metrics(
         c_num_seg{k} - c_capped_num_seg{k}, denominator likewise.
       * the full 2x2 sign table on the strong-a set: its four cells follow from
         strong_den, agree_num, strong_apos and strong_cpos.
-      * uncentered g per segment: logsct_num_seg{k} - logscs_num_seg{k}.
       * global means of |a|, |c| and g: sum a segment family and divide by
         sum(tok_den_seg). c_abs_mean is kept anyway, as the kill line.
       * runaway row share: the trainer already logs response_length/clip_ratio
@@ -293,8 +318,12 @@ def compute_sc_centered_probe_metrics(
     sc_t = sc_teacher.float()
     mask = response_mask.to(torch.float32)
     n_tok = mask.sum().clamp_min(1.0)
-    log_sc_s = torch.log(sc_s.clamp_min(_SC_FLOOR))
-    log_sc_t = torch.log(sc_t.clamp_min(_SC_FLOOR))
+    # SC_FLOOR is shared with centered_log_sc_ratio: the g reported here has to
+    # be the g that produced the tilt.
+    log_sc_s = torch.log(sc_s.clamp_min(SC_FLOOR))
+    log_sc_t = torch.log(sc_t.clamp_min(SC_FLOOR))
+    g = log_sc_t - log_sc_s  # summed per token: differencing the two log sums
+    # loses ~4 digits to cancellation (see the docstring)
     sign_a = torch.sign(a)
     strong_a = (a.abs() > _STRONG_A).float()
     # torch.sign(0) = 0, so a zero tilt never counts as agreement (on the strong
@@ -339,6 +368,7 @@ def compute_sc_centered_probe_metrics(
         out[f"sc_centered/strong_cpos_num_seg{k}"] = (strong_a * (c > 0).float() * seg).sum().item()
         out[f"sc_centered/tok_capped_den_seg{k}"] = seg_capped.sum().item()
         out[f"sc_centered/c_capped_num_seg{k}"] = (c * seg_capped).sum().item()
+        out[f"sc_centered/g_num_seg{k}"] = (g * seg).sum().item()
         out[f"sc_centered/logsct_num_seg{k}"] = (log_sc_t * seg).sum().item()
         out[f"sc_centered/logscs_num_seg{k}"] = (log_sc_s * seg).sum().item()
         lo = hi
