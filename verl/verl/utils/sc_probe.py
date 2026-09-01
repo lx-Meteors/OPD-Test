@@ -163,7 +163,10 @@ def compute_sc_centered_probe_metrics(
     Two pre-registered propositions, both resolved per depth segment:
 
       P1 (selection) c lands on the tokens the frozen G-OPD extrapolation force
-                     lands on, and with the same sign.
+                     lands on, and with the same sign. Only the sign half is
+                     measured here (see the deferral note at the end): nothing
+                     reports whether |c|'s mass concentrates on the fingerprint
+                     tokens, so read P1 as the directional claim alone.
       P2 (payment)   c's per-token force is of the same order as the
                      extrapolation force's, segment by segment.
 
@@ -300,6 +303,18 @@ def compute_sc_centered_probe_metrics(
         and actor/gopd_lambda is that same factor while lambda_vals is 1.0.
         Recovering it means dividing two loss_scale_factor-contaminated series
         and relying on this arm's lambda; the probe suite keeps raw readings.
+
+    Deferred, on purpose:
+      * P1's concentration half, i.e. whether |c|'s mass sits on the strong-a
+        tokens rather than spreading. c is zero-sum per row, so its total mass
+        is fixed and the whole question is where it lands; a uniform spread and
+        a fingerprint-targeted tilt are indistinguishable in every readout here
+        except the sign rate. One family closes it,
+        cabs_strong_num_seg{k} = sum(|c| * 1[|a| > 0.5] * seg), read as
+        (cabs_strong/strong_den) / (cabs_num/tok_den) with 1.0 meaning no
+        selectivity. Held back until this arm's force budget is shown to clear
+        the kill line: a targeting readout is meaningless on a tilt too weak to
+        matter.
 
     Deliberately no longer measured:
       * negative-force share on capped rows. The pre-registered "66-71%
