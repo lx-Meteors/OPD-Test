@@ -185,7 +185,7 @@ def compute_gopd_overlap_metrics(
     lambda_value: float,
     chunk_size: int = 1024,
 ) -> dict[str, float]:
-    """Compute diagnostic Top-K overlap for Student, Teacher, and Extrapolated target.
+    """Compute diagnostic Top-K overlap among Student, Teacher, Reference, and Extrapolated target.
 
     The extrapolated target is evaluated on the union of Student and Teacher
     candidates without changing the sampled-token G-OPD objective:
@@ -238,13 +238,22 @@ def compute_gopd_overlap_metrics(
     extrapolated_indices = torch.topk(extrapolated_scores, k=top_k, dim=-1).indices
     extrapolated_ids = torch.gather(candidate_ids, dim=-1, index=extrapolated_indices)
 
+    # Construct the Reference Top-K over the same S/T candidate space. This
+    # reuses the existing Ref forward and keeps the diagnostic observation-only.
+    ref_candidate_scores = ref_on_candidates.masked_fill(duplicate, float("-inf"))
+    ref_indices = torch.topk(ref_candidate_scores, k=top_k, dim=-1).indices
+    ref_ids = torch.gather(candidate_ids, dim=-1, index=ref_indices)
+
     def overlap_ratio(left_ids: torch.Tensor, right_ids: torch.Tensor) -> torch.Tensor:
         return (left_ids.unsqueeze(-1) == right_ids.unsqueeze(-2)).any(dim=-1).float().mean(dim=-1)
 
     pair_ratios = {
         "st": overlap_ratio(student_ids, teacher_ids),
+        "sr": overlap_ratio(student_ids, ref_ids),
+        "tr": overlap_ratio(teacher_ids, ref_ids),
         "se": overlap_ratio(student_ids, extrapolated_ids),
         "te": overlap_ratio(teacher_ids, extrapolated_ids),
+        "re": overlap_ratio(ref_ids, extrapolated_ids),
     }
 
     valid_tokens = response_mask.sum()

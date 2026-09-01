@@ -228,7 +228,7 @@ run_opd() {
         echo "Reference: ${REFERENCE_MODEL_PATH}"
         echo "G-OPD lambda: ${GOPD_LAMBDA}"
         if (( GOPD_OVERLAP_TOP_K > 0 )); then
-            echo "G-OPD overlap diagnostics: ST/SE/TE top-${GOPD_OVERLAP_TOP_K}, every ${GOPD_OVERLAP_LOG_FREQ} steps, chunk ${GOPD_OVERLAP_CHUNK_SIZE}"
+            echo "G-OPD overlap diagnostics: all S/T/R/E pairs top-${GOPD_OVERLAP_TOP_K}, every ${GOPD_OVERLAP_LOG_FREQ} steps, chunk ${GOPD_OVERLAP_CHUNK_SIZE}"
         fi
     fi
     echo "Train dataset: ${TRAIN_DATASET}"
