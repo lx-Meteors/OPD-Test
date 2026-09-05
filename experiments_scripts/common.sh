@@ -144,6 +144,8 @@ run_opd() {
     export GOPD_OVERLAP_TOP_K="${GOPD_OVERLAP_TOP_K:-0}"
     export GOPD_OVERLAP_LOG_FREQ="${GOPD_OVERLAP_LOG_FREQ:-10}"
     export GOPD_OVERLAP_CHUNK_SIZE="${GOPD_OVERLAP_CHUNK_SIZE:-1024}"
+    export GOPD_ALIGNMENT_GATE_ENABLE="${GOPD_ALIGNMENT_GATE_ENABLE:-False}"
+    export GOPD_ALIGNMENT_GATE_CHUNK_SIZE="${GOPD_ALIGNMENT_GATE_CHUNK_SIZE:-1024}"
     export ROLLOUT_IS="${ROLLOUT_IS:-null}"
     export ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
     export ROLLOUT_RS="${ROLLOUT_RS:-null}"
@@ -227,6 +229,9 @@ run_opd() {
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         echo "Reference: ${REFERENCE_MODEL_PATH}"
         echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        if [[ "${GOPD_ALIGNMENT_GATE_ENABLE}" == "True" ]]; then
+            echo "G-OPD alignment gate: enabled, chunk ${GOPD_ALIGNMENT_GATE_CHUNK_SIZE}"
+        fi
         if (( GOPD_OVERLAP_TOP_K > 0 )); then
             echo "G-OPD overlap diagnostics: all S/T/R/E pairs top-${GOPD_OVERLAP_TOP_K}, every ${GOPD_OVERLAP_LOG_FREQ} steps, chunk ${GOPD_OVERLAP_CHUNK_SIZE}"
         fi
@@ -339,6 +344,8 @@ run_opd() {
             "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
             "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
+            "++actor_rollout_ref.actor.policy_loss.gopd_alignment_gate_enable=${GOPD_ALIGNMENT_GATE_ENABLE}"
+            "++actor_rollout_ref.actor.policy_loss.gopd_alignment_gate_chunk_size=${GOPD_ALIGNMENT_GATE_CHUNK_SIZE}"
             "+actor_rollout_ref.rollout.gopd_overlap_top_k=${GOPD_OVERLAP_TOP_K}"
             "+actor_rollout_ref.rollout.gopd_overlap_log_freq=${GOPD_OVERLAP_LOG_FREQ}"
             "+actor_rollout_ref.rollout.gopd_overlap_chunk_size=${GOPD_OVERLAP_CHUNK_SIZE}"

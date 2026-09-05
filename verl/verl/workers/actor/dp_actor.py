@@ -852,6 +852,10 @@ class DataParallelPPOActor(BasePPOActor):
                     raise ValueError(f"G-OPD requires '{key}' in the actor batch")
                 if key not in select_keys:
                     select_keys.append(key)
+            if self.config.policy_loss.gopd_alignment_gate_enable:
+                if "gopd_alignment_gate" not in data.batch:
+                    raise ValueError("Alignment-gated G-OPD requires 'gopd_alignment_gate' in the actor batch")
+                select_keys.append("gopd_alignment_gate")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -985,16 +989,29 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_log_prob = model_inputs["ref_log_prob"]
                         teacher_log_prob = model_inputs["teacher_log_probs"]
                         with torch.no_grad():
-                            # G-OPD cost: (log S - log R) - lambda * (log T - log R).
-                            # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
-                            reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
-                                teacher_log_prob - ref_log_prob
+                            # Decompose G-OPD into standard OPD plus reward extrapolation:
+                            #   A = (log T - log S) + (lambda - 1) * (log T - log R).
+                            # The optional alignment gate scales only the second term.
+                            opd_advantage = teacher_log_prob - old_log_prob
+                            extrapolation_advantage = teacher_log_prob - ref_log_prob
+                            if self.config.policy_loss.gopd_alignment_gate_enable:
+                                alignment_gate = model_inputs["gopd_alignment_gate"].to(
+                                    dtype=opd_advantage.dtype
+                                )
+                            else:
+                                alignment_gate = 1.0
+                            advantages = opd_advantage + (lambda_value - 1.0) * alignment_gate * (
+                                extrapolation_advantage
                             )
-                            advantages = -reverse_kl
                         micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
+                        if self.config.policy_loss.gopd_alignment_gate_enable:
+                            micro_batch_metrics["actor/gopd_extrapolation_enabled_ratio"] = (
+                                verl_F.masked_mean(alignment_gate, response_mask).detach().item()
+                                * loss_scale_factor
+                            )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

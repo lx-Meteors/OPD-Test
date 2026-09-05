@@ -180,6 +180,101 @@ def compute_response_mask(data: DataProto):
 
 
 @torch.no_grad()
+def compute_gopd_alignment_gate(
+    data: DataProto,
+    chunk_size: int = 1024,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Build a block-wise gate for the G-OPD extrapolation term.
+
+    Standard OPD and reward extrapolation provide the sampled-token signals
+
+        a = log T - log S,
+        e = log T - log R.
+
+    For each response-position block, this function computes their cosine
+    similarity over every valid token in the rollout batch and uses the
+    binary direction test
+
+        g = 1[cos(a, e) > 0]
+
+    as the shared block switch.  Cosine magnitude never scales the signal:
+    an aligned block receives the complete extrapolation term, while an
+    orthogonal or conflicting block falls back to standard OPD.
+    """
+
+    required_keys = ("old_log_probs", "teacher_log_probs", "ref_log_prob", "response_mask")
+    missing_keys = [key for key in required_keys if key not in data.batch]
+    if missing_keys:
+        raise ValueError(f"G-OPD alignment gate requires tensors: {missing_keys}")
+
+    student_log_probs = data.batch["old_log_probs"].float()
+    teacher_log_probs = data.batch["teacher_log_probs"].float()
+    ref_log_probs = data.batch["ref_log_prob"].float()
+    response_mask = data.batch["response_mask"].float()
+
+    expected_shape = response_mask.shape
+    for name, tensor in (
+        ("old_log_probs", student_log_probs),
+        ("teacher_log_probs", teacher_log_probs),
+        ("ref_log_prob", ref_log_probs),
+    ):
+        if tensor.dim() != 2 or tensor.shape != expected_shape:
+            raise ValueError(
+                "G-OPD alignment gate currently supports sampled-token log probabilities only: "
+                f"{name} has shape {tuple(tensor.shape)}, expected {tuple(expected_shape)}"
+            )
+
+    opd_signal = teacher_log_probs - student_log_probs
+    extrapolation_signal = teacher_log_probs - ref_log_probs
+    gate = torch.zeros_like(response_mask)
+    metrics: dict[str, float] = {}
+
+    chunk_size = max(1, int(chunk_size))
+    weighted_cosine_sum = torch.zeros((), device=response_mask.device, dtype=torch.float32)
+    enabled_token_sum = torch.zeros_like(weighted_cosine_sum)
+    total_valid_tokens = torch.zeros_like(weighted_cosine_sum)
+
+    max_len = response_mask.shape[-1]
+    for start in range(0, max_len, chunk_size):
+        end = min(start + chunk_size, max_len)
+        chunk_mask = response_mask[:, start:end]
+        valid_tokens = chunk_mask.sum()
+        if valid_tokens <= 0:
+            continue
+
+        chunk_opd = opd_signal[:, start:end]
+        chunk_extrapolation = extrapolation_signal[:, start:end]
+        dot = (chunk_opd * chunk_extrapolation * chunk_mask).sum()
+        opd_norm = torch.sqrt((chunk_opd.square() * chunk_mask).sum())
+        extrapolation_norm = torch.sqrt((chunk_extrapolation.square() * chunk_mask).sum())
+        cosine = dot / (opd_norm * extrapolation_norm + eps)
+        cosine = cosine.clamp(min=-1.0, max=1.0)
+        direction_agrees = (cosine > 0.0).to(dtype=response_mask.dtype)
+
+        gate[:, start:end] = direction_agrees * chunk_mask
+        label = f"{start}_{end}"
+        metrics[f"gopd-alignment/cosine_chunk_{label}"] = cosine.item()
+        metrics[f"gopd-alignment/direction_agree_chunk_{label}"] = direction_agrees.item()
+        metrics[f"gopd-alignment/opd_rms_chunk_{label}"] = torch.sqrt(
+            (chunk_opd.square() * chunk_mask).sum() / valid_tokens
+        ).item()
+        metrics[f"gopd-alignment/extrapolation_rms_chunk_{label}"] = torch.sqrt(
+            (chunk_extrapolation.square() * chunk_mask).sum() / valid_tokens
+        ).item()
+
+        weighted_cosine_sum += cosine * valid_tokens
+        enabled_token_sum += direction_agrees * valid_tokens
+        total_valid_tokens += valid_tokens
+
+    if total_valid_tokens > 0:
+        metrics["gopd-alignment/cosine"] = (weighted_cosine_sum / total_valid_tokens).item()
+        metrics["gopd-alignment/enabled_token_ratio"] = (enabled_token_sum / total_valid_tokens).item()
+
+    return gate.to(dtype=data.batch["old_log_probs"].dtype), metrics
+
+
+@torch.no_grad()
 def compute_gopd_overlap_metrics(
     data: DataProto,
     lambda_value: float,
@@ -1726,6 +1821,25 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                        alignment_gate_enabled = bool(
+                            self.config.actor_rollout_ref.actor.policy_loss.get(
+                                "gopd_alignment_gate_enable", False
+                            )
+                        )
+                        if gopd_enabled and alignment_gate_enabled:
+                            alignment_chunk_size = int(
+                                self.config.actor_rollout_ref.actor.policy_loss.get(
+                                    "gopd_alignment_gate_chunk_size", 1024
+                                )
+                                or 1024
+                            )
+                            alignment_gate, alignment_metrics = compute_gopd_alignment_gate(
+                                data=batch,
+                                chunk_size=alignment_chunk_size,
+                            )
+                            batch.batch["gopd_alignment_gate"] = alignment_gate
+                            metrics.update(alignment_metrics)
 
                         if collect_gopd_overlap:
                             overlap_chunk_size = int(

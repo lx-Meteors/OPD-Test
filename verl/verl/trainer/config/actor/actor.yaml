@@ -71,6 +71,12 @@ policy_loss:
   # G-OPD reward scaling factor; 1.0 recovers standard OPD
   lambda_vals: 1.0
 
+  # Enable full reward extrapolation only in blocks where its direction agrees with OPD
+  gopd_alignment_gate_enable: false
+
+  # Number of response tokens in each alignment block
+  gopd_alignment_gate_chunk_size: 1024
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
