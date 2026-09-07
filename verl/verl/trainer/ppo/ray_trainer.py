@@ -283,7 +283,9 @@ def compute_gopd_mean_horizon_gate(
 
     The standard OPD component remains active at every valid response token.
     ``cutoff_tokens`` is the rounded mean effective response length of the
-    current Student rollout batch, so this function is stateless.
+    successful trajectories in the current Student rollout batch, so this
+    function is stateless. A zero cutoff disables reward extrapolation while
+    leaving the standard OPD component active on the full response.
     """
 
     if "response_mask" not in data.batch:
@@ -297,7 +299,7 @@ def compute_gopd_mean_horizon_gate(
         )
 
     max_response_tokens = response_mask.shape[-1]
-    cutoff_tokens = max(1, min(int(cutoff_tokens), max_response_tokens))
+    cutoff_tokens = max(0, min(int(cutoff_tokens), max_response_tokens))
     positions = torch.arange(max_response_tokens, device=response_mask.device).unsqueeze(0)
     gate = (positions < cutoff_tokens).to(dtype=response_mask.dtype).expand_as(response_mask)
 
@@ -596,15 +598,53 @@ class RayPPOTrainer:
 
     @torch.no_grad()
     def _build_gopd_mean_horizon_gate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, float]]:
+        if "true_reward_score" not in batch.batch:
+            raise ValueError(
+                "Success-mean-horizon G-OPD requires 'true_reward_score' after verifier evaluation"
+            )
+
         response_mask = batch.batch["response_mask"].float()
         response_lengths = response_mask.sum(dim=-1)
-        observed_mean = response_lengths.mean().item()
-        cutoff_tokens = int(round(observed_mean))
+
+        true_reward = batch.batch["true_reward_score"].to(device=response_mask.device).float()
+        if true_reward.shape[0] != response_lengths.shape[0]:
+            raise ValueError(
+                "Success-mean-horizon G-OPD requires one verifier reward per response: "
+                f"got reward shape {tuple(true_reward.shape)} for batch size {response_lengths.shape[0]}"
+            )
+        sequence_true_reward = true_reward.reshape(true_reward.shape[0], -1).sum(dim=-1)
+        success_mask = sequence_true_reward > 0.5
+        success_count = int(success_mask.sum().item())
+
+        # No successful trajectory means there is no outcome-supported horizon
+        # for reward extrapolation in this batch. A zero cutoff therefore falls
+        # back to full-horizon standard OPD without inventing an extrapolation
+        # boundary from failed trajectories.
+        if success_count > 0:
+            successful_lengths = response_lengths[success_mask]
+            successful_length_mean = successful_lengths.mean().item()
+            cutoff_tokens = int(round(successful_length_mean))
+            successful_length_std = successful_lengths.std(unbiased=False).item()
+            successful_length_min = successful_lengths.min().item()
+            successful_length_max = successful_lengths.max().item()
+        else:
+            successful_length_mean = 0.0
+            cutoff_tokens = 0
+            successful_length_std = 0.0
+            successful_length_min = 0.0
+            successful_length_max = 0.0
 
         gate, metrics = compute_gopd_mean_horizon_gate(batch, cutoff_tokens=cutoff_tokens)
         metrics.update(
             {
-                "gopd-mean-horizon/observed_response_length_mean": observed_mean,
+                "gopd-mean-horizon/successful_response_count": float(success_count),
+                "gopd-mean-horizon/successful_response_ratio": success_mask.float().mean().item(),
+                "gopd-mean-horizon/successful_response_length_mean": successful_length_mean,
+                "gopd-mean-horizon/successful_response_length_std": successful_length_std,
+                "gopd-mean-horizon/successful_response_length_min": successful_length_min,
+                "gopd-mean-horizon/successful_response_length_max": successful_length_max,
+                "gopd-mean-horizon/no_success_fallback": float(success_count == 0),
+                "gopd-mean-horizon/observed_response_length_mean": response_lengths.mean().item(),
                 "gopd-mean-horizon/observed_response_length_std": response_lengths.std(unbiased=False).item(),
                 "gopd-mean-horizon/observed_response_length_min": response_lengths.min().item(),
                 "gopd-mean-horizon/observed_response_length_max": response_lengths.max().item(),
@@ -1901,16 +1941,6 @@ class RayPPOTrainer:
                             batch.batch["gopd_alignment_gate"] = alignment_gate
                             metrics.update(alignment_metrics)
 
-                        mean_horizon_enabled = bool(
-                            self.config.actor_rollout_ref.actor.policy_loss.get(
-                                "gopd_mean_horizon_enable", False
-                            )
-                        )
-                        if gopd_enabled and mean_horizon_enabled:
-                            mean_horizon_gate, mean_horizon_metrics = self._build_gopd_mean_horizon_gate(batch)
-                            batch.batch["gopd_mean_horizon_gate"] = mean_horizon_gate
-                            metrics.update(mean_horizon_metrics)
-
                         if collect_gopd_overlap:
                             overlap_chunk_size = int(
                                 self.config.actor_rollout_ref.rollout.get("gopd_overlap_chunk_size", 1024) or 1024
@@ -1971,6 +2001,16 @@ class RayPPOTrainer:
                                 )
                         else:
                             batch.batch["true_reward_score"] = reward_tensor
+
+                        mean_horizon_enabled = bool(
+                            self.config.actor_rollout_ref.actor.policy_loss.get(
+                                "gopd_mean_horizon_enable", False
+                            )
+                        )
+                        if gopd_enabled and mean_horizon_enabled:
+                            mean_horizon_gate, mean_horizon_metrics = self._build_gopd_mean_horizon_gate(batch)
+                            batch.batch["gopd_mean_horizon_gate"] = mean_horizon_gate
+                            metrics.update(mean_horizon_metrics)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

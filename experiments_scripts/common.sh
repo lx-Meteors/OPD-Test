@@ -234,7 +234,7 @@ run_opd() {
             echo "G-OPD alignment gate: enabled, chunk ${GOPD_ALIGNMENT_GATE_CHUNK_SIZE}"
         fi
         if [[ "${GOPD_MEAN_HORIZON_ENABLE}" == "True" ]]; then
-            echo "G-OPD mean horizon: enabled, using the current rollout batch mean length"
+            echo "G-OPD mean horizon: enabled, using the current rollout batch's successful-response mean length"
         fi
         if (( GOPD_OVERLAP_TOP_K > 0 )); then
             echo "G-OPD overlap diagnostics: all S/T/R/E pairs top-${GOPD_OVERLAP_TOP_K}, every ${GOPD_OVERLAP_LOG_FREQ} steps, chunk ${GOPD_OVERLAP_CHUNK_SIZE}"
