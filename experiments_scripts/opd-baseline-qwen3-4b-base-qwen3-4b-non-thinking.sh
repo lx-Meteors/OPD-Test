@@ -131,8 +131,9 @@ export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parque
 export ADV_ESTIMATOR="${ADV_ESTIMATOR:-grpo}"
 export GOPD_ENABLE="${GOPD_ENABLE:-True}"
 export GOPD_LAMBDA="${GOPD_LAMBDA:-1.25}"
-export GOPD_ALIGNMENT_GATE_ENABLE="${GOPD_ALIGNMENT_GATE_ENABLE:-True}"
+export GOPD_ALIGNMENT_GATE_ENABLE="${GOPD_ALIGNMENT_GATE_ENABLE:-False}"
 export GOPD_ALIGNMENT_GATE_CHUNK_SIZE="${GOPD_ALIGNMENT_GATE_CHUNK_SIZE:-1024}"
+export GOPD_MEAN_HORIZON_ENABLE="${GOPD_MEAN_HORIZON_ENABLE:-True}"
 # Observation only: sampled-token training remains LOG_PROB_TOP_K=0.
 export GOPD_OVERLAP_TOP_K="${GOPD_OVERLAP_TOP_K:-16}"
 export GOPD_OVERLAP_LOG_FREQ="${GOPD_OVERLAP_LOG_FREQ:-1}"
@@ -192,4 +193,4 @@ export PROJECT_NAME="${PROJECT_NAME:-on-policy-distillation}"
 export TRACKING_BACKENDS="${TRACKING_BACKENDS:-[\"console\",\"wandb\"]}"
 export APPLY_CHAT_TEMPLATE_ENABLE_THINKING="${APPLY_CHAT_TEMPLATE_ENABLE_THINKING:-False}"
 
-run_opd "${OPD_RUN_NAME:-gopd-binary-alignment-gated-qwen3-4b-nonthinking-step500-lambda-1.25-chunk1024}" "$@"
+run_opd "${OPD_RUN_NAME:-gopd-mean-horizon-qwen3-4b-nonthinking-step500-lambda-1.25}" "$@"

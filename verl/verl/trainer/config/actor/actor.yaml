@@ -77,6 +77,9 @@ policy_loss:
   # Number of response tokens in each alignment block
   gopd_alignment_gate_chunk_size: 1024
 
+  # Limit only the G-OPD extrapolation term to the current Student rollout mean length
+  gopd_mean_horizon_enable: false
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

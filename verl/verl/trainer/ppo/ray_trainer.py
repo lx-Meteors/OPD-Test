@@ -275,6 +275,48 @@ def compute_gopd_alignment_gate(
 
 
 @torch.no_grad()
+def compute_gopd_mean_horizon_gate(
+    data: DataProto,
+    cutoff_tokens: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Mask only G-OPD reward extrapolation after a response-token horizon.
+
+    The standard OPD component remains active at every valid response token.
+    ``cutoff_tokens`` is the rounded mean effective response length of the
+    current Student rollout batch, so this function is stateless.
+    """
+
+    if "response_mask" not in data.batch:
+        raise ValueError("Mean-horizon G-OPD requires 'response_mask' in the actor batch")
+
+    response_mask = data.batch["response_mask"].float()
+    if response_mask.dim() != 2:
+        raise ValueError(
+            "Mean-horizon G-OPD requires a 2D response mask, "
+            f"got shape {tuple(response_mask.shape)}"
+        )
+
+    max_response_tokens = response_mask.shape[-1]
+    cutoff_tokens = max(1, min(int(cutoff_tokens), max_response_tokens))
+    positions = torch.arange(max_response_tokens, device=response_mask.device).unsqueeze(0)
+    gate = (positions < cutoff_tokens).to(dtype=response_mask.dtype).expand_as(response_mask)
+
+    response_lengths = response_mask.sum(dim=-1)
+    enabled_mask = gate * response_mask
+    valid_tokens = response_mask.sum().clamp_min(1.0)
+    enabled_lengths = enabled_mask.sum(dim=-1)
+    truncated = response_lengths > float(cutoff_tokens)
+
+    metrics = {
+        "gopd-mean-horizon/cutoff_tokens": float(cutoff_tokens),
+        "gopd-mean-horizon/extrapolation_enabled_token_ratio": (enabled_mask.sum() / valid_tokens).item(),
+        "gopd-mean-horizon/enabled_tokens_per_response_mean": enabled_lengths.mean().item(),
+        "gopd-mean-horizon/truncated_response_ratio": truncated.float().mean().item(),
+    }
+    return gate.to(dtype=data.batch["old_log_probs"].dtype), metrics
+
+
+@torch.no_grad()
 def compute_gopd_overlap_metrics(
     data: DataProto,
     lambda_value: float,
@@ -551,6 +593,24 @@ class RayPPOTrainer:
 
         self._init_prune_opd_dynamic_response_length()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    @torch.no_grad()
+    def _build_gopd_mean_horizon_gate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, float]]:
+        response_mask = batch.batch["response_mask"].float()
+        response_lengths = response_mask.sum(dim=-1)
+        observed_mean = response_lengths.mean().item()
+        cutoff_tokens = int(round(observed_mean))
+
+        gate, metrics = compute_gopd_mean_horizon_gate(batch, cutoff_tokens=cutoff_tokens)
+        metrics.update(
+            {
+                "gopd-mean-horizon/observed_response_length_mean": observed_mean,
+                "gopd-mean-horizon/observed_response_length_std": response_lengths.std(unbiased=False).item(),
+                "gopd-mean-horizon/observed_response_length_min": response_lengths.min().item(),
+                "gopd-mean-horizon/observed_response_length_max": response_lengths.max().item(),
+            }
+        )
+        return gate, metrics
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -1840,6 +1900,16 @@ class RayPPOTrainer:
                             )
                             batch.batch["gopd_alignment_gate"] = alignment_gate
                             metrics.update(alignment_metrics)
+
+                        mean_horizon_enabled = bool(
+                            self.config.actor_rollout_ref.actor.policy_loss.get(
+                                "gopd_mean_horizon_enable", False
+                            )
+                        )
+                        if gopd_enabled and mean_horizon_enabled:
+                            mean_horizon_gate, mean_horizon_metrics = self._build_gopd_mean_horizon_gate(batch)
+                            batch.batch["gopd_mean_horizon_gate"] = mean_horizon_gate
+                            metrics.update(mean_horizon_metrics)
 
                         if collect_gopd_overlap:
                             overlap_chunk_size = int(

@@ -45,6 +45,7 @@ class PolicyLossConfig(BaseConfig):
         lambda_vals (float): G-OPD reward scaling factor. A value of 1.0 recovers standard OPD.
         gopd_alignment_gate_enable (bool): Enable full extrapolation only when its direction agrees with OPD.
         gopd_alignment_gate_chunk_size (int): Response-token block length used to estimate alignment.
+        gopd_mean_horizon_enable (bool): Limit only reward extrapolation to the current rollout mean length.
     """
 
     loss_mode: str = "vanilla"
@@ -57,6 +58,7 @@ class PolicyLossConfig(BaseConfig):
     lambda_vals: float = 1.0
     gopd_alignment_gate_enable: bool = False
     gopd_alignment_gate_chunk_size: int = 1024
+    gopd_mean_horizon_enable: bool = False
 
 
 @dataclass

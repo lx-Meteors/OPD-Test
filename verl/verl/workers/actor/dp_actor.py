@@ -856,6 +856,10 @@ class DataParallelPPOActor(BasePPOActor):
                 if "gopd_alignment_gate" not in data.batch:
                     raise ValueError("Alignment-gated G-OPD requires 'gopd_alignment_gate' in the actor batch")
                 select_keys.append("gopd_alignment_gate")
+            if self.config.policy_loss.gopd_mean_horizon_enable:
+                if "gopd_mean_horizon_gate" not in data.batch:
+                    raise ValueError("Mean-horizon G-OPD requires 'gopd_mean_horizon_gate' in the actor batch")
+                select_keys.append("gopd_mean_horizon_gate")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -991,25 +995,33 @@ class DataParallelPPOActor(BasePPOActor):
                         with torch.no_grad():
                             # Decompose G-OPD into standard OPD plus reward extrapolation:
                             #   A = (log T - log S) + (lambda - 1) * (log T - log R).
-                            # The optional alignment gate scales only the second term.
+                            # Optional gates scale only the second term; standard OPD stays full-horizon.
                             opd_advantage = teacher_log_prob - old_log_prob
                             extrapolation_advantage = teacher_log_prob - ref_log_prob
+                            extrapolation_gate = 1.0
                             if self.config.policy_loss.gopd_alignment_gate_enable:
                                 alignment_gate = model_inputs["gopd_alignment_gate"].to(
                                     dtype=opd_advantage.dtype
                                 )
-                            else:
-                                alignment_gate = 1.0
-                            advantages = opd_advantage + (lambda_value - 1.0) * alignment_gate * (
+                                extrapolation_gate = extrapolation_gate * alignment_gate
+                            if self.config.policy_loss.gopd_mean_horizon_enable:
+                                mean_horizon_gate = model_inputs["gopd_mean_horizon_gate"].to(
+                                    dtype=opd_advantage.dtype
+                                )
+                                extrapolation_gate = extrapolation_gate * mean_horizon_gate
+                            advantages = opd_advantage + (lambda_value - 1.0) * extrapolation_gate * (
                                 extrapolation_advantage
                             )
                         micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
-                        if self.config.policy_loss.gopd_alignment_gate_enable:
+                        if (
+                            self.config.policy_loss.gopd_alignment_gate_enable
+                            or self.config.policy_loss.gopd_mean_horizon_enable
+                        ):
                             micro_batch_metrics["actor/gopd_extrapolation_enabled_ratio"] = (
-                                verl_F.masked_mean(alignment_gate, response_mask).detach().item()
+                                verl_F.masked_mean(extrapolation_gate, response_mask).detach().item()
                                 * loss_scale_factor
                             )
 
