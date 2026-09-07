@@ -48,6 +48,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_validation_completion_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -890,6 +891,16 @@ class RayPPOTrainer:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
 
+            # Termination channel of validation: per-sample response length and whether the
+            # response hit the validation budget. Summarised below by
+            # compute_validation_completion_metrics into val-aux/<ds>/completion/* (completion
+            # rate, acc|completed, clipped rate, finished-without-answer rate, lengths).
+            val_response_mask = compute_response_mask(test_output_gen_batch)
+            val_response_length = val_response_mask.sum(dim=-1).float()
+            val_budget = val_response_mask.shape[-1]
+            reward_extra_infos_dict["response_length"].extend(val_response_length.cpu().tolist())
+            reward_extra_infos_dict["clipped"].extend((val_response_length >= val_budget).float().cpu().tolist())
+
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
@@ -915,7 +926,12 @@ class RayPPOTrainer:
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        # response_length / clipped are summarised by compute_validation_completion_metrics below;
+        # keep them out of the bootstrap (best@k / maj@k are meaningless for them).
+        bootstrap_infos = {
+            k: v for k, v in reward_extra_infos_dict.items() if k not in ("response_length", "clipped")
+        }
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, bootstrap_infos)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -932,6 +948,10 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        metric_dict.update(
+            compute_validation_completion_metrics(data_sources=data_sources, infos_dict=reward_extra_infos_dict)
+        )
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)

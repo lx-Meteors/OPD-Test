@@ -64,6 +64,9 @@ normalises c_T by its maximum and is not a tunable.
 Probe metrics (``etopd/*``) follow the num/den convention: raw values, NOT
 multiplied by ``loss_scale_factor``; ``*_num`` / ``*_den`` are per-micro-batch
 sums, so the mean reduction over micro-batches preserves their ratio exactly.
+See ``compute_etopd_probe_metrics`` for the readout map (force decomposition,
+teacher-probability bins, same-token counterfactual residuals, termination
+channel, beyond-teacher realisation, comparison temperature, depth profile).
 """
 
 from __future__ import annotations
@@ -154,59 +157,134 @@ def compute_etopd_probe_metrics(
     residual: torch.Tensor,
     alpha: torch.Tensor,
     teacher_log_prob: torch.Tensor,
+    ref_log_prob: torch.Tensor,
     response_mask: torch.Tensor,
 ) -> dict[str, float]:
-    """Probe suite for ET-OPD (raw values, num/den convention).
+    """Probe suite for ET-OPD (raw values, num/den convention, one GPU sync).
 
-    Readouts (divide the logged series in W&B):
-      * etopd/align_mean, residual_mean, residual_abs_mean: force decomposition
-        of the advantage (residual_mean is the net "rent" of the residual).
-      * etopd/log_alpha_mean, alpha_ge2_frac: how cold the comparison is and
-        the share of tokens the residual has effectively switched off.
-      * resabs_num_t{low,mid,high} / resabs_den: share of |residual| landing on
-        tokens with T < 0.1, 0.1 <= T <= 0.9, T > 0.9 (expected: ~1%, most,
-        ~10%). tok_num_t* / tok_den give the corresponding token shares.
-      * eos_res_num / eos_den, eos_align_num / eos_den: residual and alignment
-        on the last valid token of terminated rows (the sampled EOS). The
-        pre-registered prediction is eos_res_num / eos_den ~= 0.
-      * capped_res_num / capped_tok_den vs its complement
-        (residual_num - capped_res_num) / (tok_den - capped_tok_den): residual
-        on full-buffer (runaway) rows vs terminated rows.
-      * res_num_seg{k} / tok_den_seg{k}, resabs_num_seg{k} / tok_den_seg{k}:
-        depth profile over [0,1k), [1k,2k), [2k,4k), [4k,8k), [8k,+).
+    Every ``*_num`` / ``*_den`` pair is a per-micro-batch sum, so the mean
+    reduction over micro-batches preserves the ratio exactly; divide the logged
+    series in W&B. Names without num/den are already per-token means of the
+    micro-batch (fine for reading, slightly biased under dynamic batch sizes).
+
+    Force decomposition
+      align_mean, residual_mean, residual_abs_mean, adv_abs_mean
+        residual_mean is the net rent of the residual (G-OPD's plateau was
+        ~0.025); adv_abs_mean is the distance from the per-token fixed point.
+      rent_num / rent_den
+        residual on agreement corridors (T > 0.5 and R > 0.5), the part of the
+        rent no entropy gate can remove.
+
+    Where the residual lands (teacher-probability bins)
+      resabs_num_<bin> / resabs_den, res_num_<bin> / tok_num_<bin>, tok_num_<bin> / tok_den
+        bins: tlow T<0.1 | t1 0.1-0.3 | t2 0.3-0.7 (decision) | t3 0.7-0.9 |
+        thigh T>0.9, plus tmid = t1+t2+t3 for the pre-registered 3-bin split.
+        Pre-registered: resabs share on tlow < 1%, thigh ~10%.
+
+    Counterfactual residuals on the SAME tokens (design claims without extra arms)
+      cf_log_*   G-OPD log-space residual d = log T - log R (per unit lambda-1)
+      cf_l2_*    alpha == 1 residual T - R
+      cf_noe_*   alpha' = e * alpha (the "drop e" variant)
+      cf_noinv_* T^alpha - R^alpha (the "drop 1/alpha" variant)
+      each with abs_den, num (signed sum), abs_num_tlow / abs_num_thigh /
+      abs_num_t2 and eos_num. Offline expectation: cf_log puts ~24% of |d| on
+      tlow and -1.5..-4.4 on the sampled EOS; cf_noinv puts >80% on thigh.
+
+    Termination channel
+      eos_den, eos_res_num, eos_align_num, eos_logT_num, eos_logR_num, eos_logS_num
+        the last valid token of terminated rows is the sampled EOS. Predicted
+        eos_res_num / eos_den ~= 0. eos_logT vs eos_logR tracks the EOS cliff
+        (teacher continues where the student stopped) and whether stops become
+        agreed (eos_logT -> 0) as training proceeds.
+      capped_tok_den, capped_res_num, capped_align_num
+        full-buffer (runaway) rows; complement = terminated rows.
+
+    Beyond-teacher realisation
+      beyond_num_<bin> / tok_num_<bin>, beyond_num / tok_den
+        sum of sign(T - R) * (log S - log T): > 0 means the student already sits
+        past the teacher in the RL-edit direction. Prediction: grows on t2/t3,
+        stays ~0 on tlow/thigh (G-OPD would grow it everywhere incl. tlow).
+      opposed_num / opposed_den
+        tokens where alignment and residual pull in opposite directions (the
+        student has overshot the teacher and the residual holds it there),
+        among tokens with |residual| > 1e-4.
+
+    Comparison temperature
+      log_alpha_mean, log_alpha_p10/p50/p90, alpha_ge2_frac
+        alpha >= 2 means the residual is at most half of the mass difference.
+
+    Depth profile
+      res_num_seg{k}, resabs_num_seg{k}, tok_den_seg{k}
+        [0,1k), [1k,2k), [2k,4k), [4k,8k), [8k,+).
     """
     if align.dim() != 2:
         return {}
     a = align.float()
     r = residual.float()
     al = alpha.float()
+    log_t = teacher_log_prob.to(torch.float32)
+    log_r = ref_log_prob.to(torch.float32)
+    log_s = log_t - a
     mask = response_mask.to(torch.float32)
     n_tok = mask.sum().clamp_min(1.0)
-    t_prob = torch.exp(teacher_log_prob.to(torch.float32))
+    t_prob = torch.exp(log_t)
+    r_prob = torch.exp(log_r)
+    adv = a + r
 
-    out: dict[str, float] = {}
+    names: list[str] = []
+    vals: list[torch.Tensor] = []
 
-    def full_mean(x: torch.Tensor) -> float:
-        return ((x * mask).sum() / n_tok).item()
+    def put(name: str, value: torch.Tensor) -> None:
+        names.append(f"etopd/{name}")
+        vals.append(value.reshape(()))
 
-    out["etopd/align_mean"] = full_mean(a)
-    out["etopd/residual_mean"] = full_mean(r)
-    out["etopd/residual_abs_mean"] = full_mean(r.abs())
-    out["etopd/log_alpha_mean"] = full_mean(torch.log(al))
-    out["etopd/alpha_ge2_frac"] = full_mean((al >= 2.0).float())
+    def msum(x: torch.Tensor, sel: torch.Tensor) -> torch.Tensor:
+        return (x * sel).sum()
 
-    # --- where does the residual land, by teacher probability -----------------
-    low = (t_prob < _T_LOW).float() * mask
-    high = (t_prob > _T_HIGH).float() * mask
-    mid = mask - low - high
-    out["etopd/resabs_den"] = (r.abs() * mask).sum().item()
-    out["etopd/residual_num"] = (r * mask).sum().item()
-    out["etopd/tok_den"] = mask.sum().item()
-    for name, sel in (("tlow", low), ("tmid", mid), ("thigh", high)):
-        out[f"etopd/resabs_num_{name}"] = (r.abs() * sel).sum().item()
-        out[f"etopd/tok_num_{name}"] = sel.sum().item()
+    # --- force decomposition ------------------------------------------------------
+    put("align_mean", msum(a, mask) / n_tok)
+    put("residual_mean", msum(r, mask) / n_tok)
+    put("residual_abs_mean", msum(r.abs(), mask) / n_tok)
+    put("adv_abs_mean", msum(adv.abs(), mask) / n_tok)
+    put("residual_num", msum(r, mask))
+    put("resabs_den", msum(r.abs(), mask))
+    put("tok_den", mask.sum())
+    agree = ((t_prob > 0.5) & (r_prob > 0.5)).float() * mask
+    put("rent_num", msum(r, agree))
+    put("rent_den", agree.sum())
 
-    # --- terminal token of terminated rows (the sampled EOS) -------------------
+    # --- comparison temperature ---------------------------------------------------
+    log_al = torch.log(al)
+    put("log_alpha_mean", msum(log_al, mask) / n_tok)
+    put("alpha_ge2_frac", msum((al >= 2.0).float(), mask) / n_tok)
+    valid_log_al = log_al[mask > 0]
+    if valid_log_al.numel() > 0:
+        qs = torch.quantile(valid_log_al, torch.tensor([0.1, 0.5, 0.9], device=valid_log_al.device))
+        put("log_alpha_p10", qs[0])
+        put("log_alpha_p50", qs[1])
+        put("log_alpha_p90", qs[2])
+
+    # --- teacher-probability bins ---------------------------------------------------
+    beyond = torch.sign(t_prob - r_prob) * (log_s - log_t)
+    bins = {
+        "tlow": (t_prob < _T_LOW).float() * mask,
+        "t1": ((t_prob >= _T_LOW) & (t_prob < 0.3)).float() * mask,
+        "t2": ((t_prob >= 0.3) & (t_prob <= 0.7)).float() * mask,
+        "t3": ((t_prob > 0.7) & (t_prob <= _T_HIGH)).float() * mask,
+        "thigh": (t_prob > _T_HIGH).float() * mask,
+    }
+    bins["tmid"] = bins["t1"] + bins["t2"] + bins["t3"]
+    for name, sel in bins.items():
+        put(f"tok_num_{name}", sel.sum())
+        put(f"resabs_num_{name}", msum(r.abs(), sel))
+        put(f"res_num_{name}", msum(r, sel))
+        put(f"beyond_num_{name}", msum(beyond, sel))
+    put("beyond_num", msum(beyond, mask))
+    active = (r.abs() > 1e-4).float() * mask
+    put("opposed_den", active.sum())
+    put("opposed_num", msum((a * r < 0).float(), active))
+
+    # --- terminal token of terminated rows (the sampled EOS) ------------------------
     lengths = mask.sum(dim=-1)
     resp_len = mask.shape[-1]
     capped_row = (lengths >= resp_len).float()
@@ -215,22 +293,43 @@ def compute_etopd_probe_metrics(
     positions = torch.arange(resp_len, device=mask.device)
     last_pos = (positions.unsqueeze(0) == last_idx.unsqueeze(-1)).float() * mask
     eos_sel = last_pos * terminated_row.unsqueeze(-1)
-    out["etopd/eos_den"] = eos_sel.sum().item()
-    out["etopd/eos_res_num"] = (r * eos_sel).sum().item()
-    out["etopd/eos_align_num"] = (a * eos_sel).sum().item()
+    put("eos_den", eos_sel.sum())
+    put("eos_res_num", msum(r, eos_sel))
+    put("eos_align_num", msum(a, eos_sel))
+    put("eos_logT_num", msum(log_t, eos_sel))
+    put("eos_logR_num", msum(log_r, eos_sel))
+    put("eos_logS_num", msum(log_s, eos_sel))
 
-    # --- runaway (full-buffer) rows --------------------------------------------
+    # --- runaway (full-buffer) rows -----------------------------------------------
     capped_sel = mask * capped_row.unsqueeze(-1)
-    out["etopd/capped_tok_den"] = capped_sel.sum().item()
-    out["etopd/capped_res_num"] = (r * capped_sel).sum().item()
+    put("capped_tok_den", capped_sel.sum())
+    put("capped_res_num", msum(r, capped_sel))
+    put("capped_align_num", msum(a, capped_sel))
 
-    # --- depth segments --------------------------------------------------------
+    # --- counterfactual residuals on the same tokens ------------------------------
+    adaptive_alpha = entropy_tempered_alpha(log_t)
+    cf = {
+        "cf_log": log_t - log_r,
+        "cf_l2": t_prob - r_prob,
+        "cf_noe": entropy_tempered_residual(log_t, log_r, adaptive_alpha * math.e),
+        "cf_noinv": torch.exp(adaptive_alpha * log_t) - torch.exp(adaptive_alpha * log_r),
+    }
+    for name, x in cf.items():
+        put(f"{name}_abs_den", msum(x.abs(), mask))
+        put(f"{name}_num", msum(x, mask))
+        put(f"{name}_abs_num_tlow", msum(x.abs(), bins["tlow"]))
+        put(f"{name}_abs_num_t2", msum(x.abs(), bins["t2"]))
+        put(f"{name}_abs_num_thigh", msum(x.abs(), bins["thigh"]))
+        put(f"{name}_eos_num", msum(x, eos_sel))
+
+    # --- depth segments -----------------------------------------------------------
     lo = 0
     for k, hi in enumerate((*_SEG_BOUNDS, resp_len + 1)):
         seg = ((positions >= lo) & (positions < hi)).float().unsqueeze(0) * mask
-        out[f"etopd/tok_den_seg{k}"] = seg.sum().item()
-        out[f"etopd/res_num_seg{k}"] = (r * seg).sum().item()
-        out[f"etopd/resabs_num_seg{k}"] = (r.abs() * seg).sum().item()
+        put(f"tok_den_seg{k}", seg.sum())
+        put(f"res_num_seg{k}", msum(r, seg))
+        put(f"resabs_num_seg{k}", msum(r.abs(), seg))
         lo = hi
 
-    return out
+    values = torch.stack(vals).tolist()  # single device sync
+    return dict(zip(names, values, strict=True))

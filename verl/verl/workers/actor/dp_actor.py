@@ -1025,6 +1025,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     residual=etopd_residual,
                                     alpha=etopd_alpha,
                                     teacher_log_prob=teacher_log_prob,
+                                    ref_log_prob=ref_log_prob,
                                     response_mask=response_mask,
                                 )
                             )

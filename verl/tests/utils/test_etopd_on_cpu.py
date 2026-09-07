@@ -15,9 +15,11 @@
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
+from verl.trainer.ppo.metric_utils import compute_validation_completion_metrics
 from verl.utils.etopd import (
     compute_etopd_advantages,
     compute_etopd_probe_metrics,
@@ -125,12 +127,32 @@ def test_probe_metrics_eos_capped_and_bins():
         [[0.7, 0.3, 0.1, 0.05, 0.5, 0.5], [0.9, 0.2, 0.3, 0.3, 0.6, 0.4]], dtype=torch.float32
     ).log()
     adv, align, residual, alpha = compute_etopd_advantages(log_t, log_s, log_r)
-    m = compute_etopd_probe_metrics(align, residual, alpha, log_t, mask)
+    m = compute_etopd_probe_metrics(align, residual, alpha, log_t, log_r, mask)
 
     # one terminated row -> one EOS position (index 3 of row 0), whose residual is ~0
     assert m["etopd/eos_den"] == 1.0
     assert abs(m["etopd/eos_res_num"]) < 1e-6
     assert abs(m["etopd/eos_align_num"] - (math.log(1e-4) - math.log(0.05))) < 1e-4
+    # the same EOS under the counterfactual log-space residual is the cliff: log(1e-4/0.08) = -6.7
+    assert abs(m["etopd/cf_log_eos_num"] - math.log(1e-4 / 0.08)) < 1e-4
+    assert abs(m["etopd/cf_l2_eos_num"] - (1e-4 - 0.08)) < 1e-6
+    assert abs(m["etopd/eos_logT_num"] - math.log(1e-4)) < 1e-4
+    assert abs(m["etopd/eos_logR_num"] - math.log(0.08)) < 1e-4
+    assert abs(m["etopd/eos_logS_num"] - math.log(0.05)) < 1e-4
+    # capped row bookkeeping for the alignment term
+    assert abs(m["etopd/capped_align_num"] - (align[1] * mask[1]).sum().item()) < 1e-5
+    # counterfactual and actual |residual| totals partition over the 3 coarse bins
+    for cf in ("cf_log", "cf_l2", "cf_noe", "cf_noinv"):
+        assert m[f"etopd/{cf}_abs_den"] >= m[f"etopd/{cf}_abs_num_tlow"] + m[f"etopd/{cf}_abs_num_thigh"]
+    # fine bins partition the coarse middle bin
+    assert abs(m["etopd/tok_num_t1"] + m["etopd/tok_num_t2"] + m["etopd/tok_num_t3"] - m["etopd/tok_num_tmid"]) < 1e-6
+    # alpha quantiles are ordered and >= 0 (alpha >= 1)
+    assert 0.0 <= m["etopd/log_alpha_p10"] <= m["etopd/log_alpha_p50"] <= m["etopd/log_alpha_p90"]
+    # beyond-teacher realisation: row 1 token 1 has T=0.4 > R=0.1 and S=0.2 < T -> negative contribution
+    expected_beyond = (torch.sign(log_t.exp() - log_r.exp()) * (log_s - log_t) * mask).sum().item()
+    assert abs(m["etopd/beyond_num"] - expected_beyond) < 1e-4
+    assert m["etopd/opposed_den"] <= m["etopd/tok_den"]
+    assert 0.0 <= m["etopd/opposed_num"] <= m["etopd/opposed_den"]
     # capped row contributes all 6 tokens
     assert m["etopd/capped_tok_den"] == 6.0
     assert m["etopd/tok_den"] == 10.0
@@ -154,7 +176,60 @@ def test_zero_length_row_is_ignored(fixed_alpha):
     log_r = torch.full((2, 3), math.log(0.4))
     log_s = torch.full((2, 3), math.log(0.45))
     adv, align, residual, alpha = compute_etopd_advantages(log_t, log_s, log_r, fixed_alpha=fixed_alpha)
-    m = compute_etopd_probe_metrics(align, residual, alpha, log_t, mask)
+    m = compute_etopd_probe_metrics(align, residual, alpha, log_t, log_r, mask)
     assert m["etopd/eos_den"] == 1.0  # only the second row terminates
     assert m["etopd/tok_den"] == 2.0
     assert torch.isfinite(adv).all()
+
+
+def test_probe_metrics_all_finite_and_no_nan_on_extreme_inputs():
+    torch.manual_seed(4)
+    mask = torch.ones(3, 40)
+    mask[0, 25:] = 0
+    log_t = torch.rand(3, 40).clamp(1e-6, 1 - 1e-6).log()
+    log_t[1, 5] = 0.0  # T == 1 exactly
+    log_t[2, 7] = -60.0  # T ~ 0
+    log_r = torch.rand(3, 40).clamp(1e-6, 1 - 1e-6).log()
+    log_s = torch.rand(3, 40).clamp(1e-6, 1 - 1e-6).log()
+    adv, align, residual, alpha = compute_etopd_advantages(log_t, log_s, log_r)
+    m = compute_etopd_probe_metrics(align, residual, alpha, log_t, log_r, mask)
+    assert len(m) > 60
+    assert all(math.isfinite(v) for v in m.values()), [k for k, v in m.items() if not math.isfinite(v)]
+    assert torch.isfinite(adv).all()
+
+
+def test_rent_counts_only_agreement_corridors():
+    mask = torch.ones(1, 4)
+    log_t = torch.tensor([[0.9, 0.9, 0.2, 0.6]]).log()
+    log_r = torch.tensor([[0.8, 0.3, 0.1, 0.55]]).log()
+    log_s = torch.tensor([[0.85, 0.5, 0.15, 0.6]]).log()
+    adv, align, residual, alpha = compute_etopd_advantages(log_t, log_s, log_r)
+    m = compute_etopd_probe_metrics(align, residual, alpha, log_t, log_r, mask)
+    # tokens 0 and 3 have both T > 0.5 and R > 0.5
+    assert m["etopd/rent_den"] == 2.0
+    assert abs(m["etopd/rent_num"] - (residual[0, 0] + residual[0, 3]).item()) < 1e-6
+
+
+def test_validation_completion_decomposition():
+    ds = ["A", "A", "A", "A", "B", "B"]
+    infos = {
+        "acc": [1.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        "format_score": [1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+        "clipped": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        "response_length": [100.0, 200.0, 16384.0, 300.0, 50.0, 70.0],
+    }
+    m = compute_validation_completion_metrics(ds, infos)
+    assert m["val-aux/A/completion/completion_rate"] == 0.5
+    assert m["val-aux/A/completion/acc_given_completed"] == 0.5
+    assert m["val-aux/A/completion/clipped_rate"] == 0.25
+    assert m["val-aux/A/completion/finished_unboxed_rate"] == 0.25  # sample 3: no box, not clipped
+    assert abs(m["val-aux/A/completion/acc_given_unclipped"] - 1 / 3) < 1e-9
+    assert m["val-aux/A/completion/response_length_completed"] == 150.0
+    assert m["val-aux/B/completion/completion_rate"] == 1.0
+    assert m["val-aux/B/completion/acc_given_completed"] == 1.0
+    assert "val-aux/B/completion/finished_unboxed_rate" in m
+    # acc = completion_rate * acc_given_completed holds pooled as well
+    pooled = m["val-aux/all/completion/completion_rate"] * m["val-aux/all/completion/acc_given_completed"]
+    assert abs(pooled - np.mean(infos["acc"])) < 1e-9
+    # missing keys -> no metrics rather than a crash
+    assert compute_validation_completion_metrics(ds, {"acc": infos["acc"]}) == {}

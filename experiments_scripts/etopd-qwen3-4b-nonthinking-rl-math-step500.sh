@@ -94,11 +94,18 @@ resolve_reference_checkpoint() {
 # Ablations: ETOPD_FIXED_ALPHA=1 gives the L2 residual T - R; GOPD_ENTROPY_TEMPERED=False
 # with GOPD_LAMBDA=1.25 reproduces the G-OPD baseline arm.
 #
-# Readouts to compare against the std / gopd / first4k arms:
-#   val-aux/*/format_score/mean@32 (completion rate), val-core/*/acc/mean@32,
-#   etopd/eos_res_num / etopd/eos_den (residual on sampled EOS; predicted ~0),
-#   etopd/resabs_num_tlow / etopd/resabs_den (share of |residual| on T < 0.1; predicted < 1%),
-#   response_length/clip_ratio, actor/gopd_adv_mean.
+# Pre-registered readouts (compare against the std / gopd / first4k arms):
+#   outcome   val-core/*/acc/mean@32; val-aux/*/completion/{completion_rate, acc_given_completed,
+#             clipped_rate, finished_unboxed_rate} (acc = completion_rate x acc_given_completed;
+#             predicted: completion >= first4k's 86%, acc|completed >= gopd's 65-66%)
+#   mechanism etopd/eos_res_num / etopd/eos_den (residual on the sampled EOS; predicted ~0)
+#             vs etopd/cf_log_eos_num / etopd/eos_den (what G-OPD would have put there: -1.5..-4.4)
+#             etopd/resabs_num_tlow / etopd/resabs_den (|residual| share on T < 0.1; predicted < 1%)
+#             vs etopd/cf_log_abs_num_tlow / etopd/cf_log_abs_den (G-OPD: ~24%)
+#             etopd/beyond_num_t2 / etopd/tok_num_t2 (student past the teacher on decision tokens)
+#   safety    response_length/clip_ratio, response_length/mean <= first4k;
+#             etopd/residual_mean plateau <= gopd's 0.025; etopd/rent_num / etopd/rent_den.
+# All etopd/* values are raw (not scaled by loss_scale_factor); divide *_num by *_den in W&B.
 if [[ -z "${ACTOR_MODEL_PATH:-}" ]]; then
     if [[ -d "${MODEL_ROOT}/Qwen3-4B" ]]; then
         export ACTOR_MODEL_PATH="${MODEL_ROOT}/Qwen3-4B"

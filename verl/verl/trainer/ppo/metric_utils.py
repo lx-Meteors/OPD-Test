@@ -595,3 +595,63 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
 
     return data_src2var2metric2val
+
+
+def compute_validation_completion_metrics(
+    data_sources: np.ndarray | list[str], infos_dict: dict[str, list[Any]]
+) -> dict[str, float]:
+    """Completion decomposition of validation accuracy, per data source and pooled.
+
+    With the ttrl_math reward, ``format_score`` is 1 exactly when an answer was
+    extracted and ``acc`` can only be 1 when ``format_score`` is 1, so
+    ``acc = completion_rate * acc_given_completed`` holds sample-by-sample. The
+    termination channel splits the non-completed mass further into responses
+    that hit the validation budget (``clipped``) and responses that finished
+    without an extractable answer.
+
+    Logged keys (``val-aux/<ds>/completion/*`` and ``val-aux/all/completion/*``):
+      completion_rate           mean(format_score)
+      acc_given_completed       mean(acc | format_score == 1)
+      clipped_rate              mean(clipped)
+      finished_unboxed_rate     mean(format_score == 0 and not clipped)
+      acc_given_unclipped       mean(acc | not clipped)
+      response_length_mean      mean(response_length)
+      response_length_completed mean(response_length | format_score == 1)
+
+    Keys whose conditioning set is empty are omitted. Returns {} when the
+    required per-sample lists are missing or inconsistent.
+    """
+    required = ("acc", "format_score", "clipped", "response_length")
+    n = len(data_sources)
+    if n == 0 or any(len(infos_dict.get(k, [])) != n for k in required):
+        return {}
+
+    acc = np.asarray(infos_dict["acc"], dtype=np.float64)
+    completed = np.asarray(infos_dict["format_score"], dtype=np.float64) > 0.5
+    clipped = np.asarray(infos_dict["clipped"], dtype=np.float64) > 0.5
+    length = np.asarray(infos_dict["response_length"], dtype=np.float64)
+    data_sources = np.asarray(data_sources)
+
+    def summarize(sel: np.ndarray) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if sel.sum() == 0:
+            return out
+        c, k, a, l = completed[sel], clipped[sel], acc[sel], length[sel]
+        out["completion_rate"] = float(c.mean())
+        out["clipped_rate"] = float(k.mean())
+        out["finished_unboxed_rate"] = float((~c & ~k).mean())
+        out["response_length_mean"] = float(l.mean())
+        if c.any():
+            out["acc_given_completed"] = float(a[c].mean())
+            out["response_length_completed"] = float(l[c].mean())
+        if (~k).any():
+            out["acc_given_unclipped"] = float(a[~k].mean())
+        return out
+
+    metrics: dict[str, float] = {}
+    for ds in sorted(set(data_sources.tolist())):
+        for name, val in summarize(data_sources == ds).items():
+            metrics[f"val-aux/{ds}/completion/{name}"] = val
+    for name, val in summarize(np.ones(n, dtype=bool)).items():
+        metrics[f"val-aux/all/completion/{name}"] = val
+    return metrics
