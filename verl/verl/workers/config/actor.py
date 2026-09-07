@@ -43,6 +43,12 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         only_reverse_kl_advantages (bool): Whether to replace rollout advantages with the G-OPD token signal.
         lambda_vals (float): G-OPD reward scaling factor. A value of 1.0 recovers standard OPD.
+        entropy_tempered_extrapolation (bool): ET-OPD. Keep the OPD alignment term log T - log S and replace
+            the log-space G-OPD residual (lambda - 1) * (log T - log R) with the Box-Cox residual
+            (T^alpha - R^alpha) / alpha, alpha = 1 / (e * (-T log T)) evaluated on the sampled token.
+            Requires only_reverse_kl_advantages=True; lambda_vals is ignored in this mode.
+        etopd_fixed_alpha (float): Ablation only. When > 0, use this constant exponent instead of the
+            adaptive alpha (1.0 gives the L2 residual T - R). 0 selects the adaptive alpha.
     """
 
     loss_mode: str = "vanilla"
@@ -53,6 +59,8 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     only_reverse_kl_advantages: bool = False
     lambda_vals: float = 1.0
+    entropy_tempered_extrapolation: bool = False
+    etopd_fixed_alpha: float = 0.0
 
 
 @dataclass

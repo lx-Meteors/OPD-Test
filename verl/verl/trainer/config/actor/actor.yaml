@@ -71,6 +71,15 @@ policy_loss:
   # G-OPD reward scaling factor; 1.0 recovers standard OPD
   lambda_vals: 1.0
 
+  # ET-OPD: keep the OPD alignment term and replace the log-space G-OPD residual
+  # (lambda - 1) * (log T - log R) with the Box-Cox residual (T^alpha - R^alpha) / alpha,
+  # alpha = 1 / (e * (-T log T)) on the sampled token. Needs only_reverse_kl_advantages;
+  # lambda_vals is ignored in this mode.
+  entropy_tempered_extrapolation: false
+
+  # Ablation only: > 0 fixes the exponent (1.0 -> L2 residual T - R); 0 = adaptive alpha.
+  etopd_fixed_alpha: 0.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

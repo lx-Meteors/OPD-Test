@@ -30,6 +30,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.etopd import compute_etopd_advantages, compute_etopd_probe_metrics
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.prune_opd import apply_prune_opd_to_scores
 from verl.utils.profiler import GPUMemoryLogger
@@ -982,19 +983,51 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.policy_loss.only_reverse_kl_advantages:
                         lambda_value = self.config.policy_loss.lambda_vals
+                        etopd_mode = self.config.policy_loss.entropy_tempered_extrapolation
                         ref_log_prob = model_inputs["ref_log_prob"]
                         teacher_log_prob = model_inputs["teacher_log_probs"]
-                        with torch.no_grad():
-                            # G-OPD cost: (log S - log R) - lambda * (log T - log R).
-                            # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
-                            reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
-                                teacher_log_prob - ref_log_prob
+                        if etopd_mode and advantages.dim() == 3:
+                            raise ValueError(
+                                "entropy_tempered_extrapolation is a sampled-token-only advantage mode "
+                                "and does not support top-k (3D) advantages"
                             )
-                            advantages = -reverse_kl
+                        with torch.no_grad():
+                            if etopd_mode:
+                                # ET-OPD: A = (log T - log S) + (T^alpha - R^alpha) / alpha with
+                                # alpha = 1 / (e * (-T log T)) on the sampled token. The alignment
+                                # term is standard OPD; the residual is the G-OPD extrapolation moved
+                                # to Box-Cox space and compared at the temperature set by the
+                                # teacher's entropy contribution: no extrapolation on tokens the
+                                # teacher is certain about or ignores (EOS cliff included). lambda_vals
+                                # is not used. See verl/utils/etopd.py.
+                                advantages, etopd_align, etopd_residual, etopd_alpha = compute_etopd_advantages(
+                                    teacher_log_prob=teacher_log_prob,
+                                    old_log_prob=old_log_prob,
+                                    ref_log_prob=ref_log_prob,
+                                    fixed_alpha=self.config.policy_loss.etopd_fixed_alpha,
+                                )
+                            else:
+                                # G-OPD cost: (log S - log R) - lambda * (log T - log R).
+                                # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
+                                reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
+                                    teacher_log_prob - ref_log_prob
+                                )
+                                advantages = -reverse_kl
                         micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
+                        if etopd_mode:
+                            # etopd/* probes: raw values (NOT scaled by loss_scale_factor), num/den pairs.
+                            micro_batch_metrics.update(
+                                compute_etopd_probe_metrics(
+                                    align=etopd_align,
+                                    residual=etopd_residual,
+                                    alpha=etopd_alpha,
+                                    teacher_log_prob=teacher_log_prob,
+                                    response_mask=response_mask,
+                                )
+                            )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

@@ -141,6 +141,10 @@ run_opd() {
     export KL_TYPE="${KL_TYPE:-low_var_kl}"
     export GOPD_ENABLE="${GOPD_ENABLE:-False}"
     export GOPD_LAMBDA="${GOPD_LAMBDA:-1.0}"
+    # ET-OPD: entropy-tempered Box-Cox residual instead of the log-space G-OPD residual
+    # (lambda ignored). ETOPD_FIXED_ALPHA > 0 is an ablation (1.0 -> L2 residual T - R).
+    export GOPD_ENTROPY_TEMPERED="${GOPD_ENTROPY_TEMPERED:-False}"
+    export ETOPD_FIXED_ALPHA="${ETOPD_FIXED_ALPHA:-0}"
     export GOPD_OVERLAP_TOP_K="${GOPD_OVERLAP_TOP_K:-0}"
     export GOPD_OVERLAP_LOG_FREQ="${GOPD_OVERLAP_LOG_FREQ:-10}"
     export GOPD_OVERLAP_CHUNK_SIZE="${GOPD_OVERLAP_CHUNK_SIZE:-1024}"
@@ -226,7 +230,15 @@ run_opd() {
     fi
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         echo "Reference: ${REFERENCE_MODEL_PATH}"
-        echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        if [[ "${GOPD_ENTROPY_TEMPERED}" == "True" ]]; then
+            if [[ "${ETOPD_FIXED_ALPHA}" != "0" ]]; then
+                echo "ET-OPD residual: (T^a - R^a)/a with FIXED alpha=${ETOPD_FIXED_ALPHA} (ablation; lambda ignored)"
+            else
+                echo "ET-OPD residual: (T^a - R^a)/a, alpha = 1/(e * (-T log T)) per sampled token (lambda ignored)"
+            fi
+        else
+            echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        fi
         if (( GOPD_OVERLAP_TOP_K > 0 )); then
             echo "G-OPD overlap diagnostics: all S/T/R/E pairs top-${GOPD_OVERLAP_TOP_K}, every ${GOPD_OVERLAP_LOG_FREQ} steps, chunk ${GOPD_OVERLAP_CHUNK_SIZE}"
         fi
@@ -339,6 +351,8 @@ run_opd() {
             "+actor_rollout_ref.ref.model.path=${REFERENCE_MODEL_PATH}"
             "++actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True"
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
+            "++actor_rollout_ref.actor.policy_loss.entropy_tempered_extrapolation=${GOPD_ENTROPY_TEMPERED}"
+            "++actor_rollout_ref.actor.policy_loss.etopd_fixed_alpha=${ETOPD_FIXED_ALPHA}"
             "+actor_rollout_ref.rollout.gopd_overlap_top_k=${GOPD_OVERLAP_TOP_K}"
             "+actor_rollout_ref.rollout.gopd_overlap_log_freq=${GOPD_OVERLAP_LOG_FREQ}"
             "+actor_rollout_ref.rollout.gopd_overlap_chunk_size=${GOPD_OVERLAP_CHUNK_SIZE}"
