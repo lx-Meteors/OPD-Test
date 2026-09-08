@@ -83,29 +83,28 @@ resolve_reference_checkpoint() {
     RESOLVED_REFERENCE_MODEL_PATH="${merged_dir}"
 }
 
-# ET-OPD (entropy-tempered extrapolation), same setting as the G-OPD baseline script:
-# the original non-thinking model is both Student initialization and fixed Reference,
-# the teacher is its RL-Math step-500 variant. The only change versus
-# opd-baseline-qwen3-4b-base-qwen3-4b-non-thinking.sh is the advantage:
+# ET-OPD "ratio" arm: G-OPD with an adaptive Box-Cox exponent, same lambda.
 #
-#   A_t = (log T - log S) + (T^alpha - R^alpha) / alpha,   alpha = 1 / (e * (-T log T))
+#   A_t = (log T - log S) + (lambda - 1) * (T^alpha - R^alpha) / alpha,   alpha = c_T / c_R,
+#   c(p) = -p log p on the sampled token.
 #
-# evaluated on the sampled token (verl/utils/etopd.py). GOPD_LAMBDA is not used.
-# Ablations: ETOPD_FIXED_ALPHA=1 gives the L2 residual T - R; GOPD_ENTROPY_TEMPERED=False
-# with GOPD_LAMBDA=1.25 reproduces the G-OPD baseline arm.
+# alpha -> 0 (residual = G-OPD's (lambda-1) log(T/R)) where RL *resolved* the token's uncertainty
+# relative to the base (committed to it or abandoned it: tail thinning at confident states, top
+# boosts); alpha -> inf (residual -> 0) where RL *created* uncertainty the base did not have (new
+# hedges, invented continuations at optional stops, unsettled base-certain stops). No new constant
+# (e cancels); lambda is G-OPD's. Same setting as the G-OPD / ET-OPD arms otherwise.
 #
-# Pre-registered readouts (compare against the std / gopd / first4k arms):
-#   outcome   val-core/*/acc/mean@32; val-aux/*/completion/{completion_rate, acc_given_completed,
-#             clipped_rate, finished_unboxed_rate} (acc = completion_rate x acc_given_completed;
-#             predicted: completion >= first4k's 86%, acc|completed >= gopd's 65-66%)
-#   mechanism etopd/eos_res_num / etopd/eos_den (residual on the sampled EOS; predicted ~0)
-#             vs etopd/cf_log_eos_num / etopd/eos_den (what G-OPD would have put there: -1.5..-4.4)
-#             etopd/resabs_num_tlow / etopd/resabs_den (|residual| share on T < 0.1; predicted < 1%)
-#             vs etopd/cf_log_abs_num_tlow / etopd/cf_log_abs_den (G-OPD: ~24%)
-#             etopd/beyond_num_t2 / etopd/tok_num_t2 (student past the teacher on decision tokens)
-#   safety    response_length/clip_ratio, response_length/mean <= first4k;
-#             etopd/residual_mean plateau <= gopd's 0.025; etopd/rent_num / etopd/rent_den.
-# All etopd/* values are raw (not scaled by loss_scale_factor); divide *_num by *_den in W&B.
+# Pre-registered readouts (compare to std / gopd / first4k / etopd(alpha_T) arms):
+#   mechanism etopd/resabs_num_{resolution,creation,uncommit} / etopd/resabs_den ~ 0.82 / 0.08 / 0.10 (offline),
+#             vs etopd/cf_log_abs_num_* / cf_log_abs_den ~ 0.53 / 0.39 / 0.08 (what G-OPD spends);
+#             etopd/alpha_lt1_frac ~ 0.68 (hot, log-like share of tokens);
+#             etopd/eos_res_num / eos_den (contested stops -> 0; cliff kept at G-OPD level);
+#             etopd/residual_mean ~ 1/3 of the gopd arm's (lambda-1) log(T/R) mean (rent).
+#   outcome   step 10/20: val-core/*/acc/mean@32 >= first4k (53.05 / 54.39), worst@32 gain vs std >= +1.5
+#             at k = 8..32 (top sharpening restored), maj@32 not below std, completion >= std (84.5 @20);
+#             val-aux/*/completion/{clipped_rate, acc_given_completed}.
+#   ablation  ETOPD_ALPHA_SOURCE=teacher ETOPD_USE_LAMBDA=False reproduces the previous ET-OPD arm;
+#             GOPD_ENTROPY_TEMPERED=False reproduces G-OPD.
 if [[ -z "${ACTOR_MODEL_PATH:-}" ]]; then
     if [[ -d "${MODEL_ROOT}/Qwen3-4B" ]]; then
         export ACTOR_MODEL_PATH="${MODEL_ROOT}/Qwen3-4B"
@@ -154,9 +153,9 @@ export ADV_ESTIMATOR="${ADV_ESTIMATOR:-grpo}"
 export GOPD_ENABLE="${GOPD_ENABLE:-True}"
 export GOPD_ENTROPY_TEMPERED="${GOPD_ENTROPY_TEMPERED:-True}"
 export ETOPD_FIXED_ALPHA="${ETOPD_FIXED_ALPHA:-0}"
-export ETOPD_ALPHA_SOURCE="${ETOPD_ALPHA_SOURCE:-teacher}"
-export ETOPD_USE_LAMBDA="${ETOPD_USE_LAMBDA:-False}"
-# Unused in ET-OPD mode; kept so the G-OPD ablation arm can be launched from this script.
+export ETOPD_ALPHA_SOURCE="${ETOPD_ALPHA_SOURCE:-ratio}"
+export ETOPD_USE_LAMBDA="${ETOPD_USE_LAMBDA:-True}"
+# G-OPD's lambda; with ETOPD_USE_LAMBDA=True the residual coefficient is lambda - 1.
 export GOPD_LAMBDA="${GOPD_LAMBDA:-1.25}"
 # Observation only: sampled-token training remains LOG_PROB_TOP_K=0.
 export GOPD_OVERLAP_TOP_K="${GOPD_OVERLAP_TOP_K:-16}"
@@ -223,7 +222,10 @@ if [[ "${GOPD_ENTROPY_TEMPERED}" == "True" ]]; then
     if [[ "${ETOPD_FIXED_ALPHA}" != "0" ]]; then
         default_run_name="etopd-fixed-alpha-${ETOPD_FIXED_ALPHA}-qwen3-4b-nonthinking-rl-math-step500"
     else
-        default_run_name="etopd-qwen3-4b-nonthinking-rl-math-step500"
+        default_run_name="etopd-${ETOPD_ALPHA_SOURCE}-qwen3-4b-nonthinking-rl-math-step500"
+    fi
+    if [[ "${ETOPD_USE_LAMBDA}" == "True" ]]; then
+        default_run_name="${default_run_name}-lambda-${GOPD_LAMBDA}"
     fi
 else
     default_run_name="gopd-exopd-qwen3-4b-nonthinking-rl-math-step500-lambda-${GOPD_LAMBDA}"

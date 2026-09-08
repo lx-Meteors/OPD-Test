@@ -145,6 +145,10 @@ run_opd() {
     # (lambda ignored). ETOPD_FIXED_ALPHA > 0 is an ablation (1.0 -> L2 residual T - R).
     export GOPD_ENTROPY_TEMPERED="${GOPD_ENTROPY_TEMPERED:-False}"
     export ETOPD_FIXED_ALPHA="${ETOPD_FIXED_ALPHA:-0}"
+    # teacher (alpha = 1/(e c_T)) | reference (1/(e c_R)) | ratio (alpha = c_T/c_R)
+    export ETOPD_ALPHA_SOURCE="${ETOPD_ALPHA_SOURCE:-teacher}"
+    # True: residual scaled by (GOPD_LAMBDA - 1) -> G-OPD with an adaptive exponent
+    export ETOPD_USE_LAMBDA="${ETOPD_USE_LAMBDA:-False}"
     export GOPD_OVERLAP_TOP_K="${GOPD_OVERLAP_TOP_K:-0}"
     export GOPD_OVERLAP_LOG_FREQ="${GOPD_OVERLAP_LOG_FREQ:-10}"
     export GOPD_OVERLAP_CHUNK_SIZE="${GOPD_OVERLAP_CHUNK_SIZE:-1024}"
@@ -231,10 +235,21 @@ run_opd() {
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         echo "Reference: ${REFERENCE_MODEL_PATH}"
         if [[ "${GOPD_ENTROPY_TEMPERED}" == "True" ]]; then
-            if [[ "${ETOPD_FIXED_ALPHA}" != "0" ]]; then
-                echo "ET-OPD residual: (T^a - R^a)/a with FIXED alpha=${ETOPD_FIXED_ALPHA} (ablation; lambda ignored)"
+            if [[ "${ETOPD_USE_LAMBDA}" == "True" ]]; then
+                coef_desc="coefficient lambda-1 = $(python3 -c "print(${GOPD_LAMBDA}-1)")"
             else
-                echo "ET-OPD residual: (T^a - R^a)/a, alpha = 1/(e * (-T log T)) per sampled token (lambda ignored)"
+                coef_desc="coefficient 1 (lambda ignored)"
+            fi
+            if [[ "${ETOPD_FIXED_ALPHA}" != "0" ]]; then
+                echo "ET-OPD residual: (T^a - R^a)/a with FIXED alpha=${ETOPD_FIXED_ALPHA} (ablation), ${coef_desc}"
+            else
+                case "${ETOPD_ALPHA_SOURCE}" in
+                    teacher)   alpha_desc="alpha = 1/(e * c_T), c_T = -T log T" ;;
+                    reference) alpha_desc="alpha = 1/(e * c_R), c_R = -R log R" ;;
+                    ratio)     alpha_desc="alpha = c_T / c_R (log-space where RL resolved uncertainty, zero where it created it)" ;;
+                    *) echo "Unknown ETOPD_ALPHA_SOURCE=${ETOPD_ALPHA_SOURCE}" >&2; exit 1 ;;
+                esac
+                echo "ET-OPD residual: (T^a - R^a)/a, ${alpha_desc}, ${coef_desc}"
             fi
         else
             echo "G-OPD lambda: ${GOPD_LAMBDA}"
@@ -353,6 +368,8 @@ run_opd() {
             "++actor_rollout_ref.actor.policy_loss.lambda_vals=${GOPD_LAMBDA}"
             "++actor_rollout_ref.actor.policy_loss.entropy_tempered_extrapolation=${GOPD_ENTROPY_TEMPERED}"
             "++actor_rollout_ref.actor.policy_loss.etopd_fixed_alpha=${ETOPD_FIXED_ALPHA}"
+            "++actor_rollout_ref.actor.policy_loss.etopd_alpha_source=${ETOPD_ALPHA_SOURCE}"
+            "++actor_rollout_ref.actor.policy_loss.etopd_use_lambda=${ETOPD_USE_LAMBDA}"
             "+actor_rollout_ref.rollout.gopd_overlap_top_k=${GOPD_OVERLAP_TOP_K}"
             "+actor_rollout_ref.rollout.gopd_overlap_log_freq=${GOPD_OVERLAP_LOG_FREQ}"
             "+actor_rollout_ref.rollout.gopd_overlap_chunk_size=${GOPD_OVERLAP_CHUNK_SIZE}"

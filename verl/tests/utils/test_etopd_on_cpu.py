@@ -233,3 +233,121 @@ def test_validation_completion_decomposition():
     assert abs(pooled - np.mean(infos["acc"])) < 1e-9
     # missing keys -> no metrics rather than a crash
     assert compute_validation_completion_metrics(ds, {"acc": infos["acc"]}) == {}
+
+
+# ---------------------------------------------------------------------------------------
+# alpha_source = "ratio": alpha = c_T / c_R
+# ---------------------------------------------------------------------------------------
+def _ratio_res(t, r, coef=1.0):
+    lt, lr = _logp(t), _logp(r)
+    a = entropy_tempered_alpha(lt, ref_log_prob=lr, alpha_source="ratio")
+    return coef * entropy_tempered_residual(lt, lr, a).item(), a.item()
+
+
+def test_ratio_alpha_is_hot_on_resolutions_and_cold_on_creations():
+    # RL committed to a token the base was unsure about -> c_T < c_R -> alpha < 1 (log-like)
+    _, a = _ratio_res(0.98, 0.7)
+    assert a < 1.0
+    # RL abandoned a token the base used -> c_T < c_R -> hot
+    _, a = _ratio_res(0.005, 0.05)
+    assert a < 1.0
+    # RL raised a token the base essentially never produced (hedge / rare boost) -> cold
+    _, a = _ratio_res(0.5, 0.01)
+    assert a > 5.0
+    _, a = _ratio_res(0.008, 0.001)
+    assert a > 5.0
+    # contested stop: base certain to stop (R ~ 1) -> c_R -> 0 -> alpha huge -> residual ~ 0
+    res, a = _ratio_res(0.38, 0.9998)
+    assert a > 1e3 and abs(res) < 1e-3
+    # identical probabilities -> alpha = 1 exactly and residual 0
+    res, a = _ratio_res(0.3, 0.3)
+    assert abs(a - 1.0) < 1e-6 and abs(res) < 1e-7
+
+
+def test_ratio_residual_matches_gopd_log_in_the_hot_limit_and_vanishes_when_cold():
+    # cliff: T = 1e-4, R = 0.08 -> alpha ~ 0.005 -> residual ~ log(T/R) = -6.68
+    res, a = _ratio_res(1e-4, 0.08)
+    assert a < 0.01
+    assert abs(res - math.log(1e-4 / 0.08)) < 0.25
+    # scaled by G-OPD's lambda - 1 it reproduces G-OPD's cliff force
+    res_l, _ = _ratio_res(1e-4, 0.08, coef=0.25)
+    assert abs(res_l - 0.25 * math.log(1e-4 / 0.08)) < 0.07
+    # top boost at lambda-1: about G-OPD's +0.084
+    res_top, _ = _ratio_res(0.98, 0.7, coef=0.25)
+    assert 0.06 < res_top < 0.10
+    # hedge-like boost the base never produced: essentially zero (G-OPD would give +0.98)
+    res_h, _ = _ratio_res(0.5, 0.01, coef=0.25)
+    assert abs(res_h) < 1e-3
+    # rare boost: zero (G-OPD +0.52)
+    res_r, _ = _ratio_res(0.008, 0.001, coef=0.25)
+    assert abs(res_r) < 1e-4
+
+
+def test_ratio_residual_sign_consistent_bounded_by_log_and_finite_at_extremes():
+    torch.manual_seed(5)
+    lt = torch.rand(256, 64).clamp(1e-6, 1 - 1e-6).log()
+    lr = torch.rand(256, 64).clamp(1e-6, 1 - 1e-6).log()
+    lt[0, 0], lr[0, 1], lt[1, 2], lr[1, 3] = 0.0, 0.0, -80.0, -80.0  # T == 1, R == 1, T ~ 0, R ~ 0
+    a = entropy_tempered_alpha(lt, ref_log_prob=lr, alpha_source="ratio")
+    res = entropy_tempered_residual(lt, lr, a)
+    assert torch.isfinite(res).all() and torch.isfinite(a).all()
+    target = torch.sign(lt.exp() - lr.exp())
+    assert torch.all((res == 0) | (torch.sign(res) == target))
+    # |residual| never exceeds the log residual (alpha -> 0 limit) by more than float error
+    assert torch.all(res.abs() <= (lt - lr).abs() + 1e-4)
+
+
+def test_expm1_residual_equals_exp_form_for_alpha_ge_1():
+    torch.manual_seed(6)
+    lt = torch.rand(8, 16).clamp_min(1e-3).log()
+    lr = torch.rand(8, 16).clamp_min(1e-3).log()
+    a = entropy_tempered_alpha(lt)  # teacher source, alpha >= 1
+    got = entropy_tempered_residual(lt, lr, a)
+    want = (torch.exp(a * lt) - torch.exp(a * lr)) / a
+    assert torch.allclose(got, want, atol=1e-6)
+
+
+def test_compute_advantages_with_ratio_source_and_lambda_coef():
+    torch.manual_seed(7)
+    lt = torch.rand(3, 9).clamp_min(1e-3).log()
+    ls = torch.rand(3, 9).clamp_min(1e-3).log()
+    lr = torch.rand(3, 9).clamp_min(1e-3).log()
+    adv, align, res, alpha = compute_etopd_advantages(lt, ls, lr, alpha_source="ratio", residual_coef=0.25)
+    a_ref = entropy_tempered_alpha(lt, ref_log_prob=lr, alpha_source="ratio")
+    assert torch.allclose(alpha, a_ref)
+    assert torch.allclose(res, 0.25 * entropy_tempered_residual(lt, lr, a_ref))
+    assert torch.allclose(adv, align + res)
+    with pytest.raises(ValueError):
+        entropy_tempered_alpha(lt, alpha_source="nonsense")
+    with pytest.raises(ValueError):
+        entropy_tempered_alpha(lt, alpha_source="ratio")  # ref_log_prob missing
+
+
+def test_probe_edit_type_buckets_partition_and_ratio_claims():
+    mask = torch.ones(1, 6)
+    #        top boost   hedge-like   slip       contested-stop  rare boost  agree
+    T = torch.tensor([[0.98, 0.5, 0.005, 0.38, 0.008, 0.9]])
+    R = torch.tensor([[0.70, 0.01, 0.05, 0.9998, 0.001, 0.9]])
+    S = torch.tensor([[0.90, 0.30, 0.02, 0.60, 0.004, 0.9]])
+    lt, lr, ls = T.log(), R.log(), S.log()
+    adv, align, res, alpha = compute_etopd_advantages(lt, ls, lr, alpha_source="ratio", residual_coef=0.25)
+    m = compute_etopd_probe_metrics(align, res, alpha, lt, lr, mask)
+    n = m["etopd/tok_num_resolution"] + m["etopd/tok_num_creation"] + m["etopd/tok_num_uncommit"] + m["etopd/tok_num_tie"]
+    assert n == m["etopd/tok_den"] == 6.0
+    # top boost and slip are resolutions; hedge-like and rare boost are creations;
+    # contested stop is uncommit; the agree token (T == R) is a tie
+    assert m["etopd/tok_num_resolution"] == 2.0
+    assert m["etopd/tok_num_creation"] == 2.0
+    assert m["etopd/tok_num_uncommit"] == 1.0
+    assert m["etopd/tok_num_tie"] == 1.0
+    # the ratio residual puts (almost) nothing on creation/uncommit tokens
+    assert m["etopd/resabs_num_creation"] / m["etopd/resabs_den"] < 0.01
+    assert m["etopd/resabs_num_uncommit"] / m["etopd/resabs_den"] < 0.01
+    # while G-OPD's log residual would spend a large share there
+    assert m["etopd/cf_log_abs_num_creation"] / m["etopd/cf_log_abs_den"] > 0.4
+    # hot fraction: resolutions with c_T < c_R are the alpha < 1 tokens
+    assert m["etopd/alpha_lt1_frac"] == pytest.approx(2 / 6, abs=1e-6)
+    # counterfactual columns exist and the applied residual is 0.25 x the unscaled ratio residual
+    assert abs(m["etopd/residual_num"] - 0.25 * m["etopd/cf_ratio_num"]) < 1e-5
+    assert "etopd/cf_aT_abs_den" in m
+    assert all(math.isfinite(v) for v in m.values())

@@ -80,6 +80,15 @@ policy_loss:
   # Ablation only: > 0 fixes the exponent (1.0 -> L2 residual T - R); 0 = adaptive alpha.
   etopd_fixed_alpha: 0.0
 
+  # Exponent source: teacher (alpha = 1/(e c_T), ET-OPD) | reference (1/(e c_R)) |
+  # ratio (alpha = c_T / c_R: G-OPD's log residual where RL resolved the token's
+  # uncertainty relative to the base, zero where RL created uncertainty)
+  etopd_alpha_source: teacher
+
+  # Multiply the residual by (lambda_vals - 1); with alpha_source=ratio this is
+  # G-OPD with an adaptive exponent at the same lambda
+  etopd_use_lambda: false
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

@@ -993,18 +993,21 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         with torch.no_grad():
                             if etopd_mode:
-                                # ET-OPD: A = (log T - log S) + (T^alpha - R^alpha) / alpha with
-                                # alpha = 1 / (e * (-T log T)) on the sampled token. The alignment
-                                # term is standard OPD; the residual is the G-OPD extrapolation moved
-                                # to Box-Cox space and compared at the temperature set by the
-                                # teacher's entropy contribution: no extrapolation on tokens the
-                                # teacher is certain about or ignores (EOS cliff included). lambda_vals
-                                # is not used. See verl/utils/etopd.py.
+                                # ET-OPD family: A = (log T - log S) + coef * (T^alpha - R^alpha) / alpha
+                                # on the sampled token. alpha_source=teacher: alpha = 1/(e c_T) (no
+                                # extrapolation where the teacher is certain or ignores the token).
+                                # alpha_source=ratio: alpha = c_T / c_R (G-OPD's log residual where RL
+                                # resolved the token's uncertainty relative to the base, zero where RL
+                                # created it); with etopd_use_lambda the coefficient is lambda - 1, i.e.
+                                # G-OPD with an adaptive exponent. See verl/utils/etopd.py.
+                                etopd_coef = (lambda_value - 1.0) if self.config.policy_loss.etopd_use_lambda else 1.0
                                 advantages, etopd_align, etopd_residual, etopd_alpha = compute_etopd_advantages(
                                     teacher_log_prob=teacher_log_prob,
                                     old_log_prob=old_log_prob,
                                     ref_log_prob=ref_log_prob,
                                     fixed_alpha=self.config.policy_loss.etopd_fixed_alpha,
+                                    alpha_source=self.config.policy_loss.etopd_alpha_source,
+                                    residual_coef=etopd_coef,
                                 )
                             else:
                                 # G-OPD cost: (log S - log R) - lambda * (log T - log R).
@@ -1018,6 +1021,7 @@ class DataParallelPPOActor(BasePPOActor):
                             verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
                         )
                         if etopd_mode:
+                            micro_batch_metrics["actor/etopd_residual_coef"] = etopd_coef * loss_scale_factor
                             # etopd/* probes: raw values (NOT scaled by loss_scale_factor), num/den pairs.
                             micro_batch_metrics.update(
                                 compute_etopd_probe_metrics(

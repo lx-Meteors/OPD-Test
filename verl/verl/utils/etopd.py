@@ -61,6 +61,24 @@ alpha_t varies per token; it is the factor that keeps near-certain tokens
 (T^alpha stays O(1) for T -> 1) from dominating the residual. The constant e
 normalises c_T by its maximum and is not a tunable.
 
+Relative variant (alpha_source="ratio")
+--------------------------------------
+    alpha_t = c_T(y_t) / c_R(y_t)
+
+The comparison temperature is the RATIO of the token's entropy contribution
+under the teacher and under the base (e cancels; no constant). alpha -> 0
+(the residual becomes G-OPD's log T - log R) exactly where RL *resolved* the
+token's uncertainty relative to the base -- committed to it (T -> 1) or
+abandoned it (T -> 0) -- which is where the useful sharpening lives (tail
+thinning at confident states, top boosts). alpha -> infinity (residual -> 0)
+where RL *created* uncertainty the base did not have -- new hedges, invented
+continuations at optional stops, unsettling a base-certain stop -- which is
+where the completion damage lives. Equivalent to a token-level
+lambda_t = 1 + (lambda - 1) * h_t with h_t in (0, 1]; with
+``residual_coef = lambda - 1`` (G-OPD's lambda) the method is G-OPD with an
+adaptive exponent and nothing else changed. Numerically the Box-Cox form is
+evaluated with expm1 so the alpha -> 0 limit is exact.
+
 Probe metrics (``etopd/*``) follow the num/den convention: raw values, NOT
 multiplied by ``loss_scale_factor``; ``*_num`` / ``*_den`` are per-micro-batch
 sums, so the mean reduction over micro-batches preserves their ratio exactly.
@@ -77,11 +95,15 @@ import torch
 
 __all__ = [
     "ETOPD_C_FLOOR",
+    "ALPHA_SOURCES",
+    "entropy_contribution",
     "entropy_tempered_alpha",
     "entropy_tempered_residual",
     "compute_etopd_advantages",
     "compute_etopd_probe_metrics",
 ]
+
+ALPHA_SOURCES = ("teacher", "reference", "ratio")
 
 # Floor for the teacher's entropy contribution before inverting it. A sampled
 # token with T == 1 exactly has c_T == 0; the floor makes alpha finite (~4e7),
@@ -93,27 +115,51 @@ _T_LOW = 0.1
 _T_HIGH = 0.9
 
 
+def entropy_contribution(log_p: torch.Tensor, c_floor: float = ETOPD_C_FLOOR) -> torch.Tensor:
+    """c(p) = -p log p in float32, floored so it can be inverted (c -> 0 at p -> 0 and p -> 1)."""
+    lp = log_p.to(torch.float32)
+    return (-(torch.exp(lp) * lp)).clamp_min(c_floor)
+
+
 def entropy_tempered_alpha(
     teacher_log_prob: torch.Tensor,
     fixed_alpha: float = 0.0,
     c_floor: float = ETOPD_C_FLOOR,
+    ref_log_prob: torch.Tensor | None = None,
+    alpha_source: str = "teacher",
 ) -> torch.Tensor:
-    """Per-token Box-Cox exponent alpha = 1 / (e * c_T), c_T = -T log T.
+    """Per-token Box-Cox exponent.
+
+    alpha_source:
+        "teacher"    alpha = 1 / (e * c_T)      (ET-OPD; >= 1, == 1 at T = 1/e)
+        "reference"  alpha = 1 / (e * c_R)      (temperature set by the base model)
+        "ratio"      alpha = c_T / c_R          (relative entropy contribution; < 1 where RL
+                                                 resolved uncertainty, > 1 where RL created it)
 
     Args:
         teacher_log_prob: log T(y_t) on the sampled tokens, any float dtype.
         fixed_alpha: if > 0, return a constant exponent instead (ablation:
             1.0 gives the L2 residual T - R; the alpha -> 0 limit is G-OPD).
-        c_floor: numerical floor for c_T.
+        c_floor: numerical floor for the entropy contributions.
+        ref_log_prob: log R(y_t); required for "reference" and "ratio".
+        alpha_source: one of ALPHA_SOURCES.
 
     Returns:
-        float32 tensor of the same shape, >= 1 in the adaptive case.
+        float32 tensor of the same shape.
     """
     log_t = teacher_log_prob.to(torch.float32)
     if fixed_alpha > 0:
         return torch.full_like(log_t, float(fixed_alpha))
-    c_t = (-(torch.exp(log_t) * log_t)).clamp_min(c_floor)
-    return 1.0 / (math.e * c_t)
+    if alpha_source not in ALPHA_SOURCES:
+        raise ValueError(f"alpha_source must be one of {ALPHA_SOURCES}, got {alpha_source!r}")
+    if alpha_source == "teacher":
+        return 1.0 / (math.e * entropy_contribution(log_t, c_floor))
+    if ref_log_prob is None:
+        raise ValueError(f"alpha_source={alpha_source!r} needs ref_log_prob")
+    c_r = entropy_contribution(ref_log_prob, c_floor)
+    if alpha_source == "reference":
+        return 1.0 / (math.e * c_r)
+    return entropy_contribution(log_t, c_floor) / c_r
 
 
 def entropy_tempered_residual(
@@ -121,15 +167,21 @@ def entropy_tempered_residual(
     ref_log_prob: torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
-    """(T^alpha - R^alpha) / alpha computed in float32 as exp(alpha * log p).
+    """(T^alpha - R^alpha) / alpha in float32.
 
-    alpha * log p is <= 0 so exp never overflows; very negative arguments
-    underflow to exactly 0, which is the intended limit for T -> 0.
+    Two numerically equivalent forms are used depending on the regime:
+      * alpha >= 1: (exp(a log T) - exp(a log R)) / a. a * log p <= 0 so nothing overflows; very
+        negative arguments underflow to exactly 0, giving residual -> 0 for alpha -> infinity.
+      * alpha < 1 (only with alpha_source="ratio"): (expm1(a log T) - expm1(a log R)) / a, which
+        is exact in the alpha -> 0 limit where the residual tends to log T - log R and the exp
+        form would cancel two numbers near 1.
     """
     log_t = teacher_log_prob.to(torch.float32)
     log_r = ref_log_prob.to(torch.float32)
     alpha = alpha.to(torch.float32)
-    return (torch.exp(alpha * log_t) - torch.exp(alpha * log_r)) / alpha
+    exp_form = (torch.exp(alpha * log_t) - torch.exp(alpha * log_r)) / alpha
+    expm1_form = (torch.special.expm1(alpha * log_t) - torch.special.expm1(alpha * log_r)) / alpha
+    return torch.where(alpha < 1.0, expm1_form, exp_form)
 
 
 def compute_etopd_advantages(
@@ -137,17 +189,22 @@ def compute_etopd_advantages(
     old_log_prob: torch.Tensor,
     ref_log_prob: torch.Tensor,
     fixed_alpha: float = 0.0,
+    alpha_source: str = "teacher",
+    residual_coef: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (advantages, align, residual, alpha) for the ET-OPD advantage.
+    """Return (advantages, align, residual, alpha) for the ET-OPD family.
 
-    advantages = align + residual with align = log T - log S (the standard
-    OPD sampled-token advantage) and residual = (T^alpha - R^alpha) / alpha.
-    All tensors are (bsz, response_len); advantages is cast back to the dtype
-    of ``old_log_prob``.
+    advantages = align + residual with align = log T - log S (the standard OPD
+    sampled-token advantage) and residual = residual_coef * (T^alpha - R^alpha) / alpha.
+    With alpha_source="ratio" and residual_coef = lambda - 1 this is G-OPD whose exponent
+    adapts per token (G-OPD itself is the alpha -> 0 limit). All tensors are
+    (bsz, response_len); advantages is cast back to the dtype of ``old_log_prob``.
     """
     align = teacher_log_prob.to(torch.float32) - old_log_prob.to(torch.float32)
-    alpha = entropy_tempered_alpha(teacher_log_prob, fixed_alpha=fixed_alpha)
-    residual = entropy_tempered_residual(teacher_log_prob, ref_log_prob, alpha)
+    alpha = entropy_tempered_alpha(
+        teacher_log_prob, fixed_alpha=fixed_alpha, ref_log_prob=ref_log_prob, alpha_source=alpha_source
+    )
+    residual = float(residual_coef) * entropy_tempered_residual(teacher_log_prob, ref_log_prob, alpha)
     advantages = (align + residual).to(old_log_prob.dtype)
     return advantages, align, residual, alpha
 
@@ -210,8 +267,24 @@ def compute_etopd_probe_metrics(
         among tokens with |residual| > 1e-4.
 
     Comparison temperature
-      log_alpha_mean, log_alpha_p10/p50/p90, alpha_ge2_frac
-        alpha >= 2 means the residual is at most half of the mass difference.
+      log_alpha_mean, log_alpha_p10/p50/p90, alpha_ge2_frac, alpha_lt1_frac
+        alpha >= 2 means the residual is at most half of the mass difference;
+        alpha < 1 ("hot", log-like) only occurs with alpha_source="ratio".
+
+    Edit type (the claim behind alpha_source="ratio")
+      tok_num_<type>, res_num_<type>, resabs_num_<type>, beyond_num_<type>, cf_log_abs_num_<type>
+        types: resolution (c_T < c_R: RL committed to or abandoned the token),
+        creation (T > R and c_T > c_R: RL raised a token the base found less contested --
+        hedges, invented continuations, rare boosts), uncommit (T < R and c_T > c_R: RL
+        made a base-certain token uncertain, e.g. contested stops), tie (c_T == c_R, zero
+        residual). The four partition the valid tokens. Offline (74k val tokens) the
+        "ratio" residual puts 82% of |f| on resolution, 8% on creation, 10% on uncommit
+        (token shares 68 / 9 / 15 / 9%); G-OPD's |d| splits 53 / 39 / 8%. The
+        cf_log_abs_num_<type> / cf_log_abs_den columns reproduce that split in-run.
+      cf_aT_*  the ET-OPD (alpha = 1/(e c_T)) residual as a same-token counterfactual, so
+        the run also logs what the previous arm would have applied.
+      cf_ratio_*  the unscaled (coefficient 1) ratio residual; in a "ratio" run the applied
+        residual is residual_coef times this.
 
     Depth profile
       res_num_seg{k}, resabs_num_seg{k}, tok_den_seg{k}
@@ -257,6 +330,7 @@ def compute_etopd_probe_metrics(
     log_al = torch.log(al)
     put("log_alpha_mean", msum(log_al, mask) / n_tok)
     put("alpha_ge2_frac", msum((al >= 2.0).float(), mask) / n_tok)
+    put("alpha_lt1_frac", msum((al < 1.0).float(), mask) / n_tok)
     valid_log_al = log_al[mask > 0]
     if valid_log_al.numel() > 0:
         qs = torch.quantile(valid_log_al, torch.tensor([0.1, 0.5, 0.9], device=valid_log_al.device))
@@ -306,13 +380,32 @@ def compute_etopd_probe_metrics(
     put("capped_res_num", msum(r, capped_sel))
     put("capped_align_num", msum(a, capped_sel))
 
+    # --- edit type: did RL resolve or create uncertainty on this token? -------------
+    c_t = entropy_contribution(log_t)
+    c_r = entropy_contribution(log_r)
+    d_log = log_t - log_r
+    types = {
+        "resolution": (c_t < c_r).float() * mask,
+        "creation": ((t_prob > r_prob) & (c_t > c_r)).float() * mask,
+        "uncommit": ((t_prob < r_prob) & (c_t > c_r)).float() * mask,
+        "tie": (c_t == c_r).float() * mask,  # T == R (zero residual) and both-saturated tokens
+    }
+    for name, sel in types.items():
+        put(f"tok_num_{name}", sel.sum())
+        put(f"res_num_{name}", msum(r, sel))
+        put(f"resabs_num_{name}", msum(r.abs(), sel))
+        put(f"beyond_num_{name}", msum(beyond, sel))
+        put(f"cf_log_abs_num_{name}", msum(d_log.abs(), sel))
+
     # --- counterfactual residuals on the same tokens ------------------------------
     adaptive_alpha = entropy_tempered_alpha(log_t)
     cf = {
-        "cf_log": log_t - log_r,
+        "cf_log": d_log,
         "cf_l2": t_prob - r_prob,
         "cf_noe": entropy_tempered_residual(log_t, log_r, adaptive_alpha * math.e),
         "cf_noinv": torch.exp(adaptive_alpha * log_t) - torch.exp(adaptive_alpha * log_r),
+        "cf_aT": entropy_tempered_residual(log_t, log_r, adaptive_alpha),
+        "cf_ratio": entropy_tempered_residual(log_t, log_r, c_t / c_r),
     }
     for name, x in cf.items():
         put(f"{name}_abs_den", msum(x.abs(), mask))

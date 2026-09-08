@@ -49,6 +49,12 @@ class PolicyLossConfig(BaseConfig):
             Requires only_reverse_kl_advantages=True; lambda_vals is ignored in this mode.
         etopd_fixed_alpha (float): Ablation only. When > 0, use this constant exponent instead of the
             adaptive alpha (1.0 gives the L2 residual T - R). 0 selects the adaptive alpha.
+        etopd_alpha_source (str): Which entropy contribution sets the exponent. "teacher": alpha = 1/(e c_T)
+            (ET-OPD). "reference": alpha = 1/(e c_R). "ratio": alpha = c_T / c_R -- log-space (G-OPD) where RL
+            resolved the token's uncertainty relative to the base, zero where RL created uncertainty.
+        etopd_use_lambda (bool): Multiply the Box-Cox residual by (lambda_vals - 1). With alpha_source="ratio"
+            this makes the method G-OPD with an adaptive exponent at the same lambda (G-OPD = alpha -> 0 limit).
+            False keeps the coefficient-1 residual of ET-OPD.
     """
 
     loss_mode: str = "vanilla"
@@ -61,6 +67,8 @@ class PolicyLossConfig(BaseConfig):
     lambda_vals: float = 1.0
     entropy_tempered_extrapolation: bool = False
     etopd_fixed_alpha: float = 0.0
+    etopd_alpha_source: str = "teacher"
+    etopd_use_lambda: bool = False
 
 
 @dataclass
