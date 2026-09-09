@@ -1756,6 +1756,14 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.model.path, use_shm=use_shm)
 
+        # The tokenizer is also needed when the reward worker is used as the
+        # token-level OPD teacher (for example, to validate/score EOS).  It was
+        # previously initialized only when chat-template switching was enabled,
+        # leaving the normal same-tokenizer OPD path without ``self.tokenizer``.
+        self.tokenizer = hf_tokenizer(
+            local_path, trust_remote_code=config.model.get("trust_remote_code", False)
+        )
+
         if self.config.model.input_tokenizer is None:
             self._do_switch_chat_template = False
         else:
@@ -1764,7 +1772,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.input_tokenizer = hf_tokenizer(
                 input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False)
             )
-            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
