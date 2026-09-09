@@ -144,6 +144,11 @@ class RolloutConfig(BaseConfig):
     reward_weight_mode: str = "student_p"  # "student_p", "teacher_p", or "none"
     teacher_temperature: float = 1.0  # Temperature for teacher logits (default 1.0, no scaling)
     prune_opd: dict = field(default_factory=dict)
+    # Trainer-only configuration used to derive dynamic OPD/extrapolation loss
+    # horizons from successful response lengths.  It lives under rollout in the
+    # Hydra config for backward compatibility, so RolloutConfig must accept it
+    # even though the inference engine does not consume it directly.
+    gopd_success_length_horizon: dict = field(default_factory=dict)
 
     disable_log_stats: bool = True
 
