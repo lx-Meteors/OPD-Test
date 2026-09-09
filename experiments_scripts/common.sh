@@ -103,7 +103,7 @@ run_opd() {
     export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parquet\",\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/HMMT24/test.parquet\",\"${DATA_ROOT}/test_data/HMMT25/test.parquet\"]}"
     export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
     export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-8192}"
-    export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
+    export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-16384}"
     export MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-64}"
     export DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
     export DATA_SEED="${DATA_SEED:-42}"
