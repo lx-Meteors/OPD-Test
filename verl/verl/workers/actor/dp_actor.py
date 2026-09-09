@@ -46,6 +46,17 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _log1mexp(log_probability: torch.Tensor) -> torch.Tensor:
+    """Numerically stable log(1 - exp(x)) for log probabilities x <= 0."""
+    x = log_probability.float().clamp(max=-1e-6)
+    cutoff = -0.6931471805599453  # log(0.5)
+    return torch.where(
+        x < cutoff,
+        torch.log1p(-torch.exp(x)),
+        torch.log(-torch.expm1(x)),
+    )
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -92,7 +103,8 @@ class DataParallelPPOActor(BasePPOActor):
         top_k=0,
         student_top_k_ids=None,
         native_top_k=0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        eos_token_id=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -101,6 +113,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_log_probs: # (bs, response_len, k)
             native_topk_ids: model's own Top-K, independently of student_top_k_ids
             native_topk_log_probs: log probabilities for native_topk_ids
+            eos_log_probs: probability of EOS at each response state, when requested
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -119,6 +132,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_log_probs = None
             native_topk_ids = None
             native_topk_log_probs = None
+            eos_log_probs = None
             
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -192,7 +206,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
                 
-                need_logits = top_k > 0 or native_top_k > 0
+                need_logits = top_k > 0 or native_top_k > 0 or eos_token_id is not None
 
                 if self.use_fused_kernels and not need_logits:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -208,8 +222,10 @@ class DataParallelPPOActor(BasePPOActor):
                         inplace_backward = False
                     
                     # Compute log_softmax once when candidate scores or the model's
-                    # native Top-K are requested.
-                    if need_logits:
+                    # native Top-K are requested. For EOS-only diagnostics, use two
+                    # selective cross-entropies to avoid materializing full-vocab
+                    # log probabilities.
+                    if top_k > 0 or native_top_k > 0:
                         # Compute log_softmax once for both target and topk tokens
                         # Note: we don't use inplace_backward here to ensure correct gradients
                         # when both log_probs and topk_log_probs are needed
@@ -218,6 +234,25 @@ class DataParallelPPOActor(BasePPOActor):
                         log_probs = log_probs_all.gather(
                             dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)
                         ).squeeze(-1)
+                        if eos_token_id is not None:
+                            eos_ids = torch.full_like(input_ids_rmpad_rolled, int(eos_token_id))
+                            eos_log_probs = log_probs_all.gather(
+                                dim=-1, index=eos_ids.unsqueeze(-1)
+                            ).squeeze(-1)
+                    elif eos_token_id is not None:
+                        # inplace_backward=False is required because the same logits
+                        # participate in both target-token and EOS cross-entropies.
+                        log_probs = logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            inplace_backward=False,
+                        )
+                        eos_ids = torch.full_like(input_ids_rmpad_rolled, int(eos_token_id))
+                        eos_log_probs = logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=eos_ids,
+                            inplace_backward=False,
+                        )
                     else:
                         log_probs = logprobs_from_logits(
                             logits=logits_rmpad,
@@ -326,6 +361,13 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if eos_log_probs is not None:
+                        eos_log_probs = gather_outputs_and_unpad(
+                            eos_log_probs,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -340,6 +382,13 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if eos_log_probs is not None:
+                    full_eos_log_probs = pad_input(
+                        hidden_states=eos_log_probs.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
                 
                 if top_k > 0:
                     full_topk_ids = pad_input(
@@ -372,6 +421,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if eos_log_probs is not None:
+                    eos_log_probs = full_eos_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
                 
                 if top_k > 0:
                     topk_ids = full_topk_ids[:, -response_length - 1 : -1, :]
@@ -395,7 +446,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
                 
-                need_logits = top_k > 0 or native_top_k > 0
+                need_logits = top_k > 0 or native_top_k > 0 or eos_token_id is not None
                 if self.use_fused_kernels and not need_logits:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -406,15 +457,31 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     
-                    # Compute log_softmax once when candidate scores or the model's
-                    # native Top-K are requested.
-                    if need_logits:
+                    # Compute full log_softmax only when candidate scores are needed.
+                    if top_k > 0 or native_top_k > 0:
                         # Compute log_softmax once for both target and topk tokens
                         log_probs_all = torch.log_softmax(logits, dim=-1)
                         # Gather log_probs for target tokens (responses)
                         log_probs = log_probs_all.gather(
                             dim=-1, index=micro_batch["responses"].unsqueeze(-1)
                         ).squeeze(-1)
+                        if eos_token_id is not None:
+                            eos_ids = torch.full_like(micro_batch["responses"], int(eos_token_id))
+                            eos_log_probs = log_probs_all.gather(
+                                dim=-1, index=eos_ids.unsqueeze(-1)
+                            ).squeeze(-1)
+                    elif eos_token_id is not None:
+                        log_probs = logprobs_from_logits(
+                            logits,
+                            micro_batch["responses"],
+                            inplace_backward=False,
+                        )
+                        eos_ids = torch.full_like(micro_batch["responses"], int(eos_token_id))
+                        eos_log_probs = logprobs_from_logits(
+                            logits,
+                            eos_ids,
+                            inplace_backward=False,
+                        )
                     else:
                         log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     
@@ -439,7 +506,15 @@ class DataParallelPPOActor(BasePPOActor):
                             log_probs_all, k=native_top_k, dim=-1
                         )
 
-            return entropy, log_probs, topk_ids, topk_log_probs, native_topk_ids, native_topk_log_probs
+            return (
+                entropy,
+                log_probs,
+                topk_ids,
+                topk_log_probs,
+                native_topk_ids,
+                native_topk_log_probs,
+                eos_log_probs,
+            )
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_probs_for_ids(self, data: DataProto) -> torch.Tensor:
@@ -479,7 +554,7 @@ class DataParallelPPOActor(BasePPOActor):
             mb_target_ids = model_inputs["target_ids"]
             with torch.no_grad():
                 # Reuse the shared forward and ignore its optional native Top-K outputs.
-                _, _, _, topk_log_probs, _, _ = self._forward_micro_batch(
+                _, _, _, topk_log_probs, _, _, _ = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=False, 
                     top_k=top_k, student_top_k_ids=mb_target_ids
                 )
@@ -543,7 +618,7 @@ class DataParallelPPOActor(BasePPOActor):
                 model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                 mb_target_ids = model_inputs["teacher_top_k_ids"]
                 with torch.no_grad():
-                    _, _, _, topk_log_probs, _, _ = self._forward_micro_batch(
+                    _, _, _, topk_log_probs, _, _, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=False, 
                         top_k=top_k, student_top_k_ids=mb_target_ids
                     )
@@ -746,6 +821,7 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = data.split(micro_batch_size)
 
         top_k = data.meta_info.get("top_k", 0)
+        eos_token_id = data.meta_info.get("eos_token_id") if data.meta_info.get("compute_eos_log_probs", False) else None
         print(f"In compute_log_prob, top_k: {top_k}")
         log_probs_lst = []
         entropy_lst = []
@@ -753,6 +829,7 @@ class DataParallelPPOActor(BasePPOActor):
         topk_log_probs_lst = []
         native_topk_ids_lst = []
         native_topk_log_probs_lst = []
+        eos_log_probs_lst = []
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
@@ -765,7 +842,7 @@ class DataParallelPPOActor(BasePPOActor):
                 else 0
             )
             with torch.no_grad():
-                entropy, log_probs, topk_ids, topk_log_probs, native_topk_ids, native_topk_log_probs = (
+                entropy, log_probs, topk_ids, topk_log_probs, native_topk_ids, native_topk_log_probs, eos_log_probs = (
                     self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -773,6 +850,7 @@ class DataParallelPPOActor(BasePPOActor):
                         top_k=forward_top_k,
                         student_top_k_ids=diagnostic_target_ids,
                         native_top_k=native_top_k,
+                        eos_token_id=eos_token_id,
                     )
                 )
             # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k
@@ -789,6 +867,8 @@ class DataParallelPPOActor(BasePPOActor):
             if native_top_k > 0:
                 native_topk_ids_lst.append(native_topk_ids)
                 native_topk_log_probs_lst.append(native_topk_log_probs)
+            if eos_log_probs is not None:
+                eos_log_probs_lst.append(eos_log_probs)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
@@ -799,6 +879,7 @@ class DataParallelPPOActor(BasePPOActor):
         topk_log_probs_tensor = None
         native_topk_ids_tensor = None
         native_topk_log_probs_tensor = None
+        eos_log_probs_tensor = None
         has_top_k_output = top_k > 0 or diagnostic_target_key in data.batch
         if has_top_k_output:
             topk_ids_tensor = torch.concat(topk_ids_lst, dim=0)
@@ -807,6 +888,8 @@ class DataParallelPPOActor(BasePPOActor):
         if has_native_top_k_output:
             native_topk_ids_tensor = torch.concat(native_topk_ids_lst, dim=0)
             native_topk_log_probs_tensor = torch.concat(native_topk_log_probs_lst, dim=0)
+        if eos_log_probs_lst:
+            eos_log_probs_tensor = torch.concat(eos_log_probs_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
@@ -818,6 +901,8 @@ class DataParallelPPOActor(BasePPOActor):
             if has_native_top_k_output:
                 native_topk_ids_tensor = restore_dynamic_batch(native_topk_ids_tensor, batch_idx_list)
                 native_topk_log_probs_tensor = restore_dynamic_batch(native_topk_log_probs_tensor, batch_idx_list)
+            if eos_log_probs_tensor is not None:
+                eos_log_probs_tensor = restore_dynamic_batch(eos_log_probs_tensor, batch_idx_list)
 
         return (
             log_probs,
@@ -826,6 +911,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_log_probs_tensor,
             native_topk_ids_tensor,
             native_topk_log_probs_tensor,
+            eos_log_probs_tensor,
         )
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -834,6 +920,19 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        stop_preserving_extrapolation = bool(
+            self.config.policy_loss.get("stop_preserving_extrapolation", False)
+        )
+        eos_token_id = data.meta_info.get("eos_token_id") if stop_preserving_extrapolation else None
+        if isinstance(eos_token_id, (list, tuple)):
+            if len(eos_token_id) != 1:
+                raise ValueError(
+                    "Stop-preserving G-OPD currently requires exactly one EOS token id, "
+                    f"got {eos_token_id}."
+                )
+            eos_token_id = eos_token_id[0]
+        if stop_preserving_extrapolation and eos_token_id is None:
+            raise ValueError("Stop-preserving G-OPD requires eos_token_id in actor batch meta_info.")
 
         select_keys = [
             "responses",
@@ -851,6 +950,15 @@ class DataParallelPPOActor(BasePPOActor):
                 if key not in data.batch:
                     raise ValueError(f"G-OPD requires '{key}' in the actor batch")
                 if key not in select_keys:
+                    select_keys.append(key)
+            if stop_preserving_extrapolation:
+                for key in (
+                    "student_eos_log_probs",
+                    "teacher_eos_log_probs",
+                    "ref_eos_log_probs",
+                ):
+                    if key not in data.batch:
+                        raise ValueError(f"Stop-preserving G-OPD requires '{key}' in the actor batch")
                     select_keys.append(key)
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -932,6 +1040,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # Check if we have 3D advantages (top-k sampling case)
                     # If so, we need to recompute top-k log probs for correct gradient
                     if advantages.dim() == 3:
+                        if stop_preserving_extrapolation:
+                            raise ValueError(
+                                "Stop-preserving G-OPD currently supports sampled-token training only."
+                            )
                         top_k = advantages.shape[-1]
                         # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
                         student_top_k_ids = None
@@ -940,15 +1052,18 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs, _, _ = self._forward_micro_batch(
+                        entropy, _, _, topk_log_probs, _, _, _ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
                         log_prob_for_loss = topk_log_probs
                         
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        entropy, log_prob, _, _, _, _, current_eos_log_probs = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            eos_token_id=eos_token_id,
                         )
                         log_prob_for_loss = log_prob
 
@@ -985,16 +1100,94 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_log_prob = model_inputs["ref_log_prob"]
                         teacher_log_prob = model_inputs["teacher_log_probs"]
                         with torch.no_grad():
-                            # G-OPD cost: (log S - log R) - lambda * (log T - log R).
-                            # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
-                            reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
-                                teacher_log_prob - ref_log_prob
-                            )
-                            advantages = -reverse_kl
+                            if stop_preserving_extrapolation:
+                                # Standard OPD still supervises the full categorical
+                                # distribution, including the stop/continue decision.
+                                base_opd_advantages = teacher_log_prob - old_log_prob
+
+                                student_eos_log_probs = (
+                                    current_eos_log_probs.detach()
+                                    if on_policy
+                                    else model_inputs["student_eos_log_probs"]
+                                )
+                                teacher_eos_log_probs = model_inputs["teacher_eos_log_probs"]
+                                ref_eos_log_probs = model_inputs["ref_eos_log_probs"]
+                                student_log_continue = _log1mexp(student_eos_log_probs)
+                                teacher_log_continue = _log1mexp(teacher_eos_log_probs)
+                                ref_log_continue = _log1mexp(ref_eos_log_probs)
+
+                                teacher_conditional_log_prob = teacher_log_prob.float() - teacher_log_continue
+                                ref_conditional_log_prob = ref_log_prob.float() - ref_log_continue
+                                content_extrapolation_advantages = (lambda_value - 1.0) * (
+                                    teacher_conditional_log_prob - ref_conditional_log_prob
+                                )
+
+                                non_eos_mask = model_inputs["responses"].ne(int(eos_token_id))
+                                content_extrapolation_advantages = torch.where(
+                                    non_eos_mask,
+                                    content_extrapolation_advantages,
+                                    torch.zeros_like(content_extrapolation_advantages),
+                                )
+                                advantages = base_opd_advantages
+                                gopd_advantages_for_metrics = (
+                                    base_opd_advantages + content_extrapolation_advantages
+                                )
+                            else:
+                                # G-OPD cost: (log S - log R) - lambda * (log T - log R).
+                                # Its negative is the sampled-token policy advantage; lambda=1 recovers OPD.
+                                reverse_kl = (old_log_prob - ref_log_prob) - lambda_value * (
+                                    teacher_log_prob - ref_log_prob
+                                )
+                                advantages = -reverse_kl
+                                gopd_advantages_for_metrics = advantages
                         micro_batch_metrics["actor/gopd_lambda"] = lambda_value * loss_scale_factor
                         micro_batch_metrics["actor/gopd_adv_mean"] = (
-                            verl_F.masked_mean(advantages, response_mask).detach().item() * loss_scale_factor
+                            verl_F.masked_mean(gopd_advantages_for_metrics, response_mask).detach().item()
+                            * loss_scale_factor
                         )
+                        if stop_preserving_extrapolation:
+                            metric_non_eos_mask = response_mask * non_eos_mask.to(response_mask.dtype)
+                            micro_batch_metrics["actor/gopd_base_opd_adv_mean"] = (
+                                verl_F.masked_mean(base_opd_advantages, response_mask).detach().item()
+                                * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/gopd_content_extrap_adv_mean"] = (
+                                verl_F.masked_mean(content_extrapolation_advantages, metric_non_eos_mask)
+                                .detach()
+                                .item()
+                                * loss_scale_factor
+                            )
+                            continue_shift = teacher_log_continue - ref_log_continue
+                            micro_batch_metrics["actor/gopd_continue_shift_mean"] = (
+                                verl_F.masked_mean(continue_shift, response_mask).detach().item()
+                                * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/gopd_continue_shift_positive_frac"] = (
+                                verl_F.masked_mean(
+                                    (continue_shift > 0).to(response_mask.dtype), response_mask
+                                )
+                                .detach()
+                                .item()
+                                * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/gopd_student_eos_prob_mean"] = (
+                                verl_F.masked_mean(student_eos_log_probs.float().exp(), response_mask)
+                                .detach()
+                                .item()
+                                * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/gopd_teacher_eos_prob_mean"] = (
+                                verl_F.masked_mean(teacher_eos_log_probs.float().exp(), response_mask)
+                                .detach()
+                                .item()
+                                * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/gopd_ref_eos_prob_mean"] = (
+                                verl_F.masked_mean(ref_eos_log_probs.float().exp(), response_mask)
+                                .detach()
+                                .item()
+                                * loss_scale_factor
+                            )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
@@ -1024,6 +1217,45 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    if stop_preserving_extrapolation:
+                        current_student_log_continue = _log1mexp(current_eos_log_probs)
+                        current_conditional_log_prob = log_prob_for_loss.float() - current_student_log_continue
+                        old_conditional_log_prob = old_log_prob.float() - student_log_continue
+                        # EOS positions carry no content-extrapolation objective. Setting
+                        # both log probabilities to zero avoids undefined conditional
+                        # values without changing the token-mean denominator.
+                        current_conditional_log_prob = torch.where(
+                            non_eos_mask,
+                            current_conditional_log_prob,
+                            torch.zeros_like(current_conditional_log_prob),
+                        )
+                        old_conditional_log_prob = torch.where(
+                            non_eos_mask,
+                            old_conditional_log_prob,
+                            torch.zeros_like(old_conditional_log_prob),
+                        )
+                        content_extrapolation_loss, content_pg_metrics = policy_loss_fn(
+                            old_log_prob=old_conditional_log_prob,
+                            log_prob=current_conditional_log_prob,
+                            advantages=content_extrapolation_advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
+                        )
+                        base_opd_loss = pg_loss
+                        pg_loss = base_opd_loss + content_extrapolation_loss
+                        micro_batch_metrics["actor/gopd_base_opd_loss"] = (
+                            base_opd_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/gopd_content_extrapolation_loss"] = (
+                            content_extrapolation_loss.detach().item() * loss_scale_factor
+                        )
+                        for metric_name, metric_value in content_pg_metrics.items():
+                            suffix = metric_name.removeprefix("actor/")
+                            micro_batch_metrics[f"actor/gopd_content_{suffix}"] = metric_value
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

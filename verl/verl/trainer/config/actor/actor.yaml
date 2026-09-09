@@ -71,6 +71,11 @@ policy_loss:
   # G-OPD reward scaling factor; 1.0 recovers standard OPD
   lambda_vals: 1.0
 
+  # Keep standard OPD on the full distribution, but apply the extra
+  # Teacher-Reference extrapolation only within the conditional non-EOS
+  # distribution so it has no direct pressure on the EOS logit.
+  stop_preserving_extrapolation: false
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

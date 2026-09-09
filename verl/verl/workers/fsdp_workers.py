@@ -986,7 +986,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys, topk_ids, topk_log_probs, native_topk_ids, native_topk_log_probs = (
+                output, entropys, topk_ids, topk_log_probs, native_topk_ids, native_topk_log_probs, eos_log_probs = (
                     self.actor.compute_log_prob(data=data, calculate_entropy=True)
                 )
             
@@ -1000,6 +1000,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors["gopd_native_top_k_ids"] = native_topk_ids
             if native_topk_log_probs is not None:
                 tensors["gopd_native_top_k_log_probs"] = native_topk_log_probs
+            if eos_log_probs is not None:
+                tensors["student_eos_log_probs"] = eos_log_probs
             
             output = DataProto.from_dict(
                 tensors=tensors,
@@ -1093,6 +1095,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
             tensors = {"ref_log_prob": data.batch["old_log_probs"]}
+            if "student_eos_log_probs" in data.batch:
+                tensors["ref_eos_log_probs"] = data.batch["student_eos_log_probs"]
             if has_overlap_candidates and "student_top_k_log_probs" in data.batch:
                 tensors["gopd_ref_on_candidate_log_probs"] = data.batch["student_top_k_log_probs"]
             if has_overlap_candidates and "gopd_native_top_k_ids" in data.batch:
@@ -1112,10 +1116,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["top_k"] = 0
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _, _, candidate_log_probs, ref_top_k_ids, ref_top_k_log_probs = (
+            output, _, _, candidate_log_probs, ref_top_k_ids, ref_top_k_log_probs, eos_log_probs = (
                 self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             )
             tensors = {"ref_log_prob": output}
+            if eos_log_probs is not None:
+                tensors["ref_eos_log_probs"] = eos_log_probs
             if has_overlap_candidates:
                 tensors["gopd_ref_on_candidate_log_probs"] = candidate_log_probs
                 tensors["gopd_ref_top_k_ids"] = ref_top_k_ids
@@ -1946,7 +1952,16 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
 
-    def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        student_top_k_ids=None,
+        compute_entropy=False,
+        top_k=0,
+        strategy="only_stu",
+        teacher_temperature=1.0,
+        eos_token_id=None,
+    ):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
         import verl.utils.torch_functional as verl_F
@@ -1966,7 +1981,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             teacher_valid_counts = None
             teacher_overlap_mask = None
             teacher_in_student_mask = None  # For union strategy: T_in_S computed in chunks
-            need_logits = student_top_k_ids is not None or compute_entropy
+            teacher_eos_log_probs = None
+            need_logits = student_top_k_ids is not None or compute_entropy or eos_token_id is not None
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(
@@ -2029,6 +2045,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 local_teacher_top_k_ids = None
                 local_teacher_top_k_log_probs = None
                 local_teacher_in_student_mask = None
+                local_eos_log_probs = None
 
                 if self.use_fused_kernels and not need_logits:
                     rm_log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -2046,13 +2063,20 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                         local_entropy_rmpad = self._compute_entropy_safe(logits_rmpad) # (total_nnz,)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
+                    inplace_backward = eos_token_id is None
 
                     rm_log_probs = verl_F.logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
+                    if eos_token_id is not None:
+                        eos_ids = torch.full_like(input_ids_rmpad_rolled, int(eos_token_id))
+                        local_eos_log_probs = verl_F.logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=eos_ids,
+                            inplace_backward=False,
+                        )
                     
                     if student_top_k_ids is not None:
                          k_s = student_top_k_ids.shape[-1]
@@ -2168,6 +2192,15 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             sp_size=self.ulysses_sequence_parallel_size,
                             group=self.ulysses_sequence_parallel_group
                         )
+                    if local_eos_log_probs is not None:
+                        full_eos_log_probs = gather_outputs_and_unpad(
+                            local_hidden_states=local_eos_log_probs.unsqueeze(-1),
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                            group=self.ulysses_sequence_parallel_group,
+                        )
                 else:
                     full_log_probs = pad_input(
                         hidden_states=rm_log_probs.unsqueeze(-1),
@@ -2232,6 +2265,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             batch=batch_size,
                             seqlen=seqlen,
                         )
+                    if local_eos_log_probs is not None:
+                        full_eos_log_probs = pad_input(
+                            hidden_states=local_eos_log_probs.unsqueeze(-1),
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
 
                 rm_log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 if local_top_k_log_probs_on_student_ids is not None:
@@ -2248,6 +2288,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     teacher_in_student_mask = full_teacher_in_student_mask[:, -response_length - 1 : -1, :] # Keep K dimension
                 if local_entropy_rmpad is not None:
                     teacher_entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+                if local_eos_log_probs is not None:
+                    teacher_eos_log_probs = full_eos_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
 
             else:
                 output = self.reward_module(
@@ -2276,7 +2318,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     if compute_entropy:
                         teacher_entropy = self._compute_entropy_safe(rm_logits_resp) # (bsz, response_length)
 
-                    rm_log_probs = verl_F.logprobs_from_logits(rm_logits_resp, micro_batch["responses"])
+                    rm_log_probs = verl_F.logprobs_from_logits(
+                        rm_logits_resp,
+                        micro_batch["responses"],
+                        inplace_backward=eos_token_id is None,
+                    )
+                    if eos_token_id is not None:
+                        eos_ids = torch.full_like(micro_batch["responses"], int(eos_token_id))
+                        teacher_eos_log_probs = verl_F.logprobs_from_logits(
+                            rm_logits_resp,
+                            eos_ids,
+                            inplace_backward=False,
+                        )
                     
                     if student_top_k_ids is not None:
                         if top_k > 0:
@@ -2311,7 +2364,17 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             teacher_on_student_log_probs = teacher_on_student_log_probs - teacher_logsumexp
                             teacher_overlap_mask = None
 
-            return rm_log_probs, teacher_on_student_log_probs, teacher_top_k_ids, teacher_top_k_log_probs, teacher_entropy, teacher_valid_counts, teacher_overlap_mask, teacher_in_student_mask
+            return (
+                rm_log_probs,
+                teacher_on_student_log_probs,
+                teacher_top_k_ids,
+                teacher_top_k_log_probs,
+                teacher_entropy,
+                teacher_valid_counts,
+                teacher_overlap_mask,
+                teacher_in_student_mask,
+                teacher_eos_log_probs,
+            )
 
     def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor):
         batch_size = data.batch.batch_size[0]
@@ -2646,6 +2709,26 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             output_valid_counts = []
             output_overlap_counts = []
             output_teacher_in_student = []  # For union strategy: T_in_S computed in chunks
+            output_teacher_eos_log_probs = []
+
+            compute_eos_log_probs = bool(data.meta_info.get("compute_eos_log_probs", False))
+            eos_token_id = data.meta_info.get("eos_token_id") if compute_eos_log_probs else None
+            if isinstance(eos_token_id, (list, tuple)):
+                if len(eos_token_id) != 1:
+                    raise ValueError(
+                        "Stop-preserving G-OPD currently requires exactly one EOS token id, "
+                        f"got {eos_token_id}."
+                    )
+                eos_token_id = eos_token_id[0]
+            if eos_token_id is not None:
+                teacher_eos_token_id = self.tokenizer.eos_token_id
+                if isinstance(teacher_eos_token_id, (list, tuple)):
+                    teacher_eos_token_id = teacher_eos_token_id[0]
+                if int(teacher_eos_token_id) != int(eos_token_id):
+                    raise ValueError(
+                        "Stop-preserving G-OPD requires Student and Teacher to share the EOS token id: "
+                        f"student={eos_token_id}, teacher={teacher_eos_token_id}."
+                    )
             
             for micro_batch in micro_batches:
                 # micro_batch is a DataProto or DataProtoItem.
@@ -2662,13 +2745,14 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     # Fallback for other types (e.g. dict) if split behaves differently
                     mb_top_k_ids = micro_batch.get("student_top_k_ids", None) if hasattr(micro_batch, "get") else None
 
-                teacher_logp_batch, teacher_on_student_logp_batch, teacher_top_k_ids_batch, teacher_top_k_logp_teacher_batch, teacher_entropy_batch, teacher_valid_counts_batch, teacher_overlap_mask_batch, teacher_in_student_mask_batch = self._forward_micro_batch(
+                teacher_logp_batch, teacher_on_student_logp_batch, teacher_top_k_ids_batch, teacher_top_k_logp_teacher_batch, teacher_entropy_batch, teacher_valid_counts_batch, teacher_overlap_mask_batch, teacher_in_student_mask_batch, teacher_eos_log_probs_batch = self._forward_micro_batch(
                     micro_batch, 
                     student_top_k_ids=mb_top_k_ids,
                     compute_entropy=compute_entropy,
                     top_k=top_k,
                     strategy=top_k_strategy,
-                    teacher_temperature=teacher_temperature
+                    teacher_temperature=teacher_temperature,
+                    eos_token_id=eos_token_id,
                 )
                 output_logp.append(teacher_logp_batch)
                 if teacher_on_student_logp_batch is not None:
@@ -2685,6 +2769,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     output_overlap_counts.append(teacher_overlap_mask_batch)
                 if teacher_in_student_mask_batch is not None:
                     output_teacher_in_student.append(teacher_in_student_mask_batch)
+                if teacher_eos_log_probs_batch is not None:
+                    output_teacher_eos_log_probs.append(teacher_eos_log_probs_batch)
                     
             teacher_logp = torch.cat(output_logp, dim=0)
             teacher_on_student_logp = None
@@ -2715,6 +2801,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             if len(output_teacher_in_student) > 0:
                 teacher_in_student_mask = torch.cat(output_teacher_in_student, dim=0)
 
+            teacher_eos_log_probs = None
+            if output_teacher_eos_log_probs:
+                teacher_eos_log_probs = torch.cat(output_teacher_eos_log_probs, dim=0)
+
             if use_dynamic_bsz:
                 indices = list(itertools.chain.from_iterable(indices))
                 assert len(indices) == teacher_logp.size(0), f"{len(indices)} vs. {teacher_logp.size(0)}"
@@ -2734,6 +2824,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     teacher_overlap_mask = teacher_overlap_mask[revert_indices]
                 if teacher_in_student_mask is not None:
                     teacher_in_student_mask = teacher_in_student_mask[revert_indices]
+                if teacher_eos_log_probs is not None:
+                    teacher_eos_log_probs = teacher_eos_log_probs[revert_indices]
 
             if reward_top_k > 0:
                 # Reward calculation is moved to ray_trainer for top_k > 0
@@ -2777,6 +2869,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 tensors["overlap_mask"] = overlap_mask
             if teacher_in_student_mask is not None:
                 tensors["teacher_in_student_mask"] = teacher_in_student_mask
+            if teacher_eos_log_probs is not None:
+                tensors["teacher_eos_log_probs"] = teacher_eos_log_probs
 
             output = DataProto.from_dict(tensors=tensors)
 

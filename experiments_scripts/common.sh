@@ -227,6 +227,7 @@ run_opd() {
     if [[ "${GOPD_ENABLE}" == "True" ]]; then
         echo "Reference: ${REFERENCE_MODEL_PATH}"
         echo "G-OPD lambda: ${GOPD_LAMBDA}"
+        echo "G-OPD stop-preserving extrapolation: ${GOPD_STOP_PRESERVING_EXTRAPOLATION:-False}"
         if (( GOPD_OVERLAP_TOP_K > 0 )); then
             echo "G-OPD overlap diagnostics: all S/T/R/E pairs top-${GOPD_OVERLAP_TOP_K}, every ${GOPD_OVERLAP_LOG_FREQ} steps, chunk ${GOPD_OVERLAP_CHUNK_SIZE}"
         fi
@@ -343,6 +344,11 @@ run_opd() {
             "+actor_rollout_ref.rollout.gopd_overlap_log_freq=${GOPD_OVERLAP_LOG_FREQ}"
             "+actor_rollout_ref.rollout.gopd_overlap_chunk_size=${GOPD_OVERLAP_CHUNK_SIZE}"
         )
+        if [[ "${GOPD_STOP_PRESERVING_EXTRAPOLATION:-False}" == "True" ]]; then
+            cmd+=(
+                "++actor_rollout_ref.actor.policy_loss.stop_preserving_extrapolation=True"
+            )
+        fi
     fi
 
     if [[ "${USE_KL}" == "True" ]]; then

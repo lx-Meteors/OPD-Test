@@ -280,6 +280,105 @@ def compute_gopd_overlap_metrics(
     return metrics
 
 
+@torch.no_grad()
+def compute_gopd_stop_metrics(data: DataProto, chunk_size: int = 1024) -> dict[str, float]:
+    """Measure EOS hazard and the Teacher-Reference continuation/content decomposition."""
+
+    required_keys = (
+        "responses",
+        "response_mask",
+        "teacher_log_probs",
+        "ref_log_prob",
+        "student_eos_log_probs",
+        "teacher_eos_log_probs",
+        "ref_eos_log_probs",
+    )
+    if any(key not in data.batch for key in required_keys):
+        return {}
+
+    eos_token_id = data.meta_info.get("eos_token_id")
+    if isinstance(eos_token_id, (list, tuple)):
+        eos_token_id = eos_token_id[0] if len(eos_token_id) == 1 else None
+    if eos_token_id is None:
+        return {}
+
+    response_mask = data.batch["response_mask"].float()
+    non_eos_mask = data.batch["responses"].ne(int(eos_token_id)).float()
+    content_mask = response_mask * non_eos_mask
+    student_eos_logp = data.batch["student_eos_log_probs"].float()
+    teacher_eos_logp = data.batch["teacher_eos_log_probs"].float()
+    ref_eos_logp = data.batch["ref_eos_log_probs"].float()
+
+    def log1mexp(logp: torch.Tensor) -> torch.Tensor:
+        x = logp.clamp(max=-1e-6)
+        cutoff = -0.6931471805599453
+        return torch.where(
+            x < cutoff,
+            torch.log1p(-torch.exp(x)),
+            torch.log(-torch.expm1(x)),
+        )
+
+    teacher_log_continue = log1mexp(teacher_eos_logp)
+    ref_log_continue = log1mexp(ref_eos_logp)
+    continue_shift = teacher_log_continue - ref_log_continue
+    sampled_content_shift = (
+        data.batch["teacher_log_probs"].float()
+        - teacher_log_continue
+        - data.batch["ref_log_prob"].float()
+        + ref_log_continue
+    )
+
+    def add_region_metrics(
+        output: dict[str, float],
+        suffix: str,
+        region_mask: torch.Tensor,
+        region_content_mask: torch.Tensor,
+        region_slice: slice,
+    ) -> None:
+        valid = region_mask.sum()
+        if valid <= 0:
+            return
+        output[f"gopd-stop/student_eos_prob{suffix}"] = (
+            (student_eos_logp[:, region_slice].exp() * region_mask).sum() / valid
+        ).item()
+        output[f"gopd-stop/teacher_eos_prob{suffix}"] = (
+            (teacher_eos_logp[:, region_slice].exp() * region_mask).sum() / valid
+        ).item()
+        output[f"gopd-stop/ref_eos_prob{suffix}"] = (
+            (ref_eos_logp[:, region_slice].exp() * region_mask).sum() / valid
+        ).item()
+        region_continue_shift = continue_shift[:, region_slice]
+        output[f"gopd-stop/teacher_ref_continue_shift{suffix}"] = (
+            (region_continue_shift * region_mask).sum() / valid
+        ).item()
+        output[f"gopd-stop/continue_shift_positive_frac{suffix}"] = (
+            ((region_continue_shift > 0).float() * region_mask).sum() / valid
+        ).item()
+
+        content_valid = region_content_mask.sum()
+        if content_valid > 0:
+            output[f"gopd-stop/teacher_ref_sampled_content_shift{suffix}"] = (
+                (sampled_content_shift[:, region_slice] * region_content_mask).sum() / content_valid
+            ).item()
+
+    metrics: dict[str, float] = {}
+    full_slice = slice(0, response_mask.shape[-1])
+    add_region_metrics(metrics, "", response_mask, content_mask, full_slice)
+
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, response_mask.shape[-1], chunk_size):
+        end = min(start + chunk_size, response_mask.shape[-1])
+        region_slice = slice(start, end)
+        add_region_metrics(
+            metrics,
+            f"_chunk_{start}_{end}",
+            response_mask[:, region_slice],
+            content_mask[:, region_slice],
+            region_slice,
+        )
+    return metrics
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -1356,6 +1455,27 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    stop_preserving_extrapolation = bool(
+                        self.config.actor_rollout_ref.actor.policy_loss.get(
+                            "stop_preserving_extrapolation", False
+                        )
+                    )
+                    if stop_preserving_extrapolation:
+                        if not self.config.actor_rollout_ref.actor.policy_loss.get(
+                            "only_reverse_kl_advantages", False
+                        ):
+                            raise ValueError(
+                                "stop_preserving_extrapolation requires G-OPD "
+                                "(only_reverse_kl_advantages=True)."
+                            )
+                        if int(self.config.actor_rollout_ref.rollout.get("log_prob_top_k", 0) or 0) != 0:
+                            raise ValueError(
+                                "stop_preserving_extrapolation currently supports the sampled-token "
+                                "G-OPD objective only (log_prob_top_k=0)."
+                            )
+                        batch.meta_info["compute_eos_log_probs"] = True
+                        batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1726,6 +1846,20 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                        if stop_preserving_extrapolation:
+                            stop_metric_chunk_size = int(
+                                self.config.actor_rollout_ref.rollout.get(
+                                    "gopd_overlap_chunk_size", 1024
+                                )
+                                or 1024
+                            )
+                            metrics.update(
+                                compute_gopd_stop_metrics(
+                                    data=batch,
+                                    chunk_size=stop_metric_chunk_size,
+                                )
+                            )
 
                         if collect_gopd_overlap:
                             overlap_chunk_size = int(
