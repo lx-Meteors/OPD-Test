@@ -354,7 +354,93 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_prune_opd_dynamic_response_length()
+        self._init_gopd_success_length_horizon()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _init_gopd_success_length_horizon(self):
+        """Initialize success-conditioned OPD and extrapolation horizons."""
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        horizon_cfg = rollout_cfg.get("gopd_success_length_horizon", {})
+        self.gopd_success_length_horizon_enabled = bool(horizon_cfg.get("enable", False))
+
+        static_max_len = int(rollout_cfg.response_length)
+        min_len = max(1, int(horizon_cfg.get("min_len", 1)))
+        max_len = min(int(horizon_cfg.get("max_len", static_max_len)), static_max_len)
+        if self.gopd_success_length_horizon_enabled and min_len > max_len:
+            raise ValueError(
+                f"gopd_success_length_horizon min_len={min_len} exceeds max_len={max_len}."
+            )
+
+        default_init_len = int(self.config.actor_rollout_ref.actor.policy_loss.get("opd_max_tokens", 0))
+        if default_init_len <= 0:
+            default_init_len = max_len
+        init_len = int(horizon_cfg.get("init_len", default_init_len))
+        extrapolation_ratio = float(horizon_cfg.get("extrapolation_ratio", 0.5))
+        if not 0.0 <= extrapolation_ratio <= 1.0:
+            raise ValueError(
+                "gopd_success_length_horizon.extrapolation_ratio must be in [0, 1], "
+                f"got {extrapolation_ratio}."
+            )
+
+        self.gopd_success_length_min_len = min_len
+        self.gopd_success_length_max_len = max_len
+        self.gopd_success_length_extrapolation_ratio = extrapolation_ratio
+        self.gopd_success_length_reward_threshold = float(horizon_cfg.get("reward_threshold", 0.5))
+        self.gopd_success_length_last_opd_horizon = max(min_len, min(init_len, max_len))
+
+    def _update_gopd_success_length_horizon(self, batch: DataProto) -> dict[str, float]:
+        """Use successful responses in this batch to set its loss horizons and the next rollout limit."""
+        if not self.gopd_success_length_horizon_enabled:
+            return {}
+
+        response_mask = batch.batch["response_mask"]
+        response_lengths = response_mask.sum(dim=-1).to(torch.float32)
+        reward = batch.batch.get("true_reward_score", batch.batch["token_level_scores"])
+
+        # Reward can be one scalar per sequence or a sparse token-level tensor.
+        if reward.ndim == 0:
+            sequence_reward = reward.expand(response_lengths.shape[0])
+        elif reward.ndim == 1:
+            sequence_reward = reward
+        else:
+            sequence_reward = reward.reshape(reward.shape[0], -1).sum(dim=-1)
+        sequence_reward = sequence_reward.to(device=response_lengths.device, dtype=torch.float32)
+
+        success_mask = sequence_reward >= self.gopd_success_length_reward_threshold
+        success_count = int(success_mask.sum().item())
+        previous_opd_horizon = int(self.gopd_success_length_last_opd_horizon)
+
+        if success_count > 0:
+            successful_mean_length = response_lengths[success_mask].mean()
+            opd_horizon = int(torch.round(successful_mean_length).item())
+            opd_horizon = max(
+                self.gopd_success_length_min_len,
+                min(opd_horizon, self.gopd_success_length_max_len),
+            )
+            successful_mean_metric = successful_mean_length.item()
+        else:
+            # With no successful rollout there is no new length estimate. Keep
+            # the previous horizon instead of collapsing to zero.
+            opd_horizon = previous_opd_horizon
+            successful_mean_metric = float("nan")
+
+        extrapolation_horizon = max(
+            1, int(opd_horizon * self.gopd_success_length_extrapolation_ratio)
+        )
+
+        # These scalars only control the current actor loss masks. Rollout keeps
+        # using the normal configured response length.
+        batch.meta_info["gopd_dynamic_opd_max_tokens"] = opd_horizon
+        batch.meta_info["gopd_dynamic_extrapolation_max_tokens"] = extrapolation_horizon
+        self.gopd_success_length_last_opd_horizon = opd_horizon
+
+        return {
+            "gopd_success_horizon/successful_response_length_mean": successful_mean_metric,
+            "gopd_success_horizon/success_count": float(success_count),
+            "gopd_success_horizon/success_fraction": success_mask.float().mean().item(),
+            "gopd_success_horizon/opd_max_tokens": float(opd_horizon),
+            "gopd_success_horizon/extrapolation_max_tokens": float(extrapolation_horizon),
+        }
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -1638,6 +1724,8 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        metrics.update(self._update_gopd_success_length_horizon(batch))
 
                         # Compute rollout correction weights centrally (once per batch)
                         # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
