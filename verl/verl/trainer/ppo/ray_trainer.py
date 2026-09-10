@@ -375,6 +375,12 @@ class RayPPOTrainer:
         if default_init_len <= 0:
             default_init_len = max_len
         init_len = int(horizon_cfg.get("init_len", default_init_len))
+        opd_horizon_ratio = float(horizon_cfg.get("opd_ratio", 1.0))
+        if not 0.0 < opd_horizon_ratio <= 1.0:
+            raise ValueError(
+                "gopd_success_length_horizon.opd_ratio must be in (0, 1], "
+                f"got {opd_horizon_ratio}."
+            )
         extrapolation_ratio = float(horizon_cfg.get("extrapolation_ratio", 0.5))
         if not 0.0 <= extrapolation_ratio <= 1.0:
             raise ValueError(
@@ -384,12 +390,13 @@ class RayPPOTrainer:
 
         self.gopd_success_length_min_len = min_len
         self.gopd_success_length_max_len = max_len
+        self.gopd_success_length_opd_ratio = opd_horizon_ratio
         self.gopd_success_length_extrapolation_ratio = extrapolation_ratio
         self.gopd_success_length_reward_threshold = float(horizon_cfg.get("reward_threshold", 0.5))
         self.gopd_success_length_last_opd_horizon = max(min_len, min(init_len, max_len))
 
     def _update_gopd_success_length_horizon(self, batch: DataProto) -> dict[str, float]:
-        """Use successful responses in this batch to set its loss horizons and the next rollout limit."""
+        """Use successful responses in this batch to set its two current-batch loss horizons."""
         if not self.gopd_success_length_horizon_enabled:
             return {}
 
@@ -412,7 +419,9 @@ class RayPPOTrainer:
 
         if success_count > 0:
             successful_mean_length = response_lengths[success_mask].mean()
-            opd_horizon = int(torch.round(successful_mean_length).item())
+            opd_horizon = int(
+                torch.round(successful_mean_length * self.gopd_success_length_opd_ratio).item()
+            )
             opd_horizon = max(
                 self.gopd_success_length_min_len,
                 min(opd_horizon, self.gopd_success_length_max_len),
@@ -438,9 +447,82 @@ class RayPPOTrainer:
             "gopd_success_horizon/successful_response_length_mean": successful_mean_metric,
             "gopd_success_horizon/success_count": float(success_count),
             "gopd_success_horizon/success_fraction": success_mask.float().mean().item(),
+            "gopd_success_horizon/opd_horizon_ratio": self.gopd_success_length_opd_ratio,
             "gopd_success_horizon/opd_max_tokens": float(opd_horizon),
             "gopd_success_horizon/extrapolation_max_tokens": float(extrapolation_horizon),
         }
+
+    @staticmethod
+    def _response_prefix_batch(data: DataProto, max_response_tokens: int) -> DataProto:
+        """Return a zero-copy response-prefix view suitable for causal-LM forwards.
+
+        Student generation remains full length. Only the model input passed to a
+        subsequent teacher/reference forward is shortened. For a causal model,
+        logits in this prefix are identical to logits from the same positions in
+        the full sequence.
+        """
+        response_length = int(data.batch["responses"].shape[-1])
+        prefix_length = max(1, min(int(max_response_tokens), response_length))
+        if prefix_length >= response_length:
+            return data
+
+        input_length = int(data.batch["input_ids"].shape[-1])
+        prompt_block_length = input_length - response_length
+        model_sequence_length = prompt_block_length + prefix_length
+        sequence_keys = {"input_ids", "attention_mask", "position_ids"}
+        prompt_keys = {"prompts"}
+        tensors = {}
+
+        for key, tensor in data.batch.items():
+            if key in sequence_keys:
+                tensors[key] = tensor[..., :model_sequence_length]
+            elif (
+                key not in prompt_keys
+                and tensor.ndim >= 2
+                and int(tensor.shape[1]) == response_length
+            ):
+                tensors[key] = tensor[:, :prefix_length, ...]
+            else:
+                tensors[key] = tensor
+
+        meta_info = dict(data.meta_info)
+        meta_info["forward_response_prefix_tokens"] = prefix_length
+        return DataProto.from_dict(
+            tensors=tensors,
+            non_tensors=dict(data.non_tensor_batch),
+            meta_info=meta_info,
+        )
+
+    @staticmethod
+    def _pad_prefix_forward_output(
+        output: DataProto,
+        full_response_length: int,
+        neutral_tensors: Optional[dict[str, torch.Tensor]] = None,
+    ) -> DataProto:
+        """Pad response-prefix outputs back to the rollout shape for batch union."""
+        neutral_tensors = neutral_tensors or {}
+        tensors = {}
+        for key, tensor in output.batch.items():
+            if tensor.ndim < 2 or int(tensor.shape[1]) >= full_response_length:
+                tensors[key] = tensor
+                continue
+
+            prefix_length = int(tensor.shape[1])
+            neutral = neutral_tensors.get(key)
+            if neutral is not None:
+                padded = neutral.to(device=tensor.device, dtype=tensor.dtype).clone()
+            else:
+                padded_shape = list(tensor.shape)
+                padded_shape[1] = full_response_length
+                padded = torch.zeros(padded_shape, dtype=tensor.dtype, device=tensor.device)
+            padded[:, :prefix_length, ...] = tensor
+            tensors[key] = padded
+
+        return DataProto.from_dict(
+            tensors=tensors,
+            non_tensors=dict(output.non_tensor_batch),
+            meta_info=dict(output.meta_info),
+        )
 
     def _init_prune_opd_dynamic_response_length(self):
         prune_opd_cfg = self.config.actor_rollout_ref.rollout.get("prune_opd", {})
@@ -1351,6 +1433,23 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # The dynamic horizons depend on terminal correctness, so score
+                    # the complete Student rollouts before shortening any forward.
+                    # Cache this rule-based result to avoid running the verifier a
+                    # second time after the distillation reward is available.
+                    precomputed_outcome_reward = None
+                    precomputed_reward_extra_infos = None
+                    if self.gopd_success_length_horizon_enabled:
+                        with marked_timer("success_horizon_reward", timing_raw, color="yellow"):
+                            precomputed_outcome_reward, precomputed_reward_extra_infos = compute_reward(
+                                batch, self.reward_fn
+                            )
+                        batch.batch["token_level_scores"] = precomputed_outcome_reward
+                        batch.batch["true_reward_score"] = precomputed_outcome_reward
+                        metrics.update(self._update_gopd_success_length_horizon(batch))
+                        batch.batch.pop("token_level_scores")
+                        batch.batch.pop("true_reward_score")
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1384,7 +1483,19 @@ class RayPPOTrainer:
                                 batch.meta_info["prune_opd"] = OmegaConf.to_container(prune_opd_cfg, resolve=True)
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
-                                teacher_data = self.rm_wg.compute_rm_score(batch)
+                                teacher_forward_batch = batch
+                                if self.gopd_success_length_horizon_enabled:
+                                    teacher_forward_batch = self._response_prefix_batch(
+                                        batch,
+                                        batch.meta_info["gopd_dynamic_opd_max_tokens"],
+                                    )
+                                teacher_data = self.rm_wg.compute_rm_score(teacher_forward_batch)
+                                if teacher_forward_batch is not batch:
+                                    teacher_data = self._pad_prefix_forward_output(
+                                        teacher_data,
+                                        full_response_length=batch.batch["responses"].shape[-1],
+                                        neutral_tensors={"teacher_log_probs": batch.batch["old_log_probs"]},
+                                    )
                                 batch = batch.union(teacher_data)
 
                             if top_k > 0:
@@ -1604,7 +1715,13 @@ class RayPPOTrainer:
                              batch.batch.pop("overlap_counts")
 
 
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.gopd_success_length_horizon_enabled:
+                            reward_tensor = batch.batch.get("rm_scores", precomputed_outcome_reward)
+                            reward_extra_infos_dict = dict(precomputed_reward_extra_infos or {})
+                            reward_extra_infos_dict["true_reward_score"] = precomputed_outcome_reward
+                            if "format_mask" in reward_extra_infos_dict:
+                                batch.batch["format_mask"] = reward_extra_infos_dict["format_mask"]
+                        elif self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
@@ -1660,8 +1777,21 @@ class RayPPOTrainer:
                             # Compute teacher entropy metric if available
                             if "teacher_entropy" in batch.batch.keys():
                                 teacher_entropy = batch.batch["teacher_entropy"]
+                                teacher_response_masks = response_masks
+                                if self.gopd_success_length_horizon_enabled:
+                                    teacher_positions = torch.arange(
+                                        response_masks.shape[-1], device=response_masks.device
+                                    )
+                                    teacher_prefix_mask = teacher_positions < batch.meta_info[
+                                        "gopd_dynamic_opd_max_tokens"
+                                    ]
+                                    teacher_response_masks = response_masks * teacher_prefix_mask.unsqueeze(0).to(
+                                        response_masks.dtype
+                                    )
                                 teacher_entropy_agg = agg_loss(
-                                    loss_mat=teacher_entropy, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                    loss_mat=teacher_entropy,
+                                    loss_mask=teacher_response_masks,
+                                    loss_agg_mode=loss_agg_mode,
                                 )
                                 metrics.update({"teacher/entropy": teacher_entropy_agg.detach().item()})
 
@@ -1681,10 +1811,26 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            ref_forward_batch = batch
+                            if self.gopd_success_length_horizon_enabled:
+                                ref_forward_batch = self._response_prefix_batch(
+                                    batch,
+                                    batch.meta_info["gopd_dynamic_extrapolation_max_tokens"],
+                                )
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(ref_forward_batch)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(ref_forward_batch)
+                            if ref_forward_batch is not batch:
+                                ref_log_prob = self._pad_prefix_forward_output(
+                                    ref_log_prob,
+                                    full_response_length=batch.batch["responses"].shape[-1],
+                                    # Outside the extrapolation horizon, Ref is not
+                                    # used by G-OPD. Student log-prob is a neutral
+                                    # fill and also keeps the zero-coefficient KL
+                                    # diagnostic finite and interpretable.
+                                    neutral_tensors={"ref_log_prob": batch.batch["old_log_probs"]},
+                                )
                             batch = batch.union(ref_log_prob)
 
                     # compute values
@@ -1696,7 +1842,10 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if (
+                            self.config.reward_model.launch_reward_fn_async
+                            and not self.gopd_success_length_horizon_enabled
+                        ):
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
@@ -1725,7 +1874,8 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        metrics.update(self._update_gopd_success_length_horizon(batch))
+                        if not self.gopd_success_length_horizon_enabled:
+                            metrics.update(self._update_gopd_success_length_horizon(batch))
 
                         # Compute rollout correction weights centrally (once per batch)
                         # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
@@ -2662,7 +2812,16 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_update_batch = batch
+                            if self.gopd_success_length_horizon_enabled:
+                                actor_update_batch = self._response_prefix_batch(
+                                    batch,
+                                    batch.meta_info["gopd_dynamic_opd_max_tokens"],
+                                )
+                                actor_update_batch.meta_info["global_token_num"] = torch.sum(
+                                    actor_update_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                            actor_output = self.actor_rollout_wg.update_actor(actor_update_batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
