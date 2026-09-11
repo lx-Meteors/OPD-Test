@@ -3,5 +3,6 @@ outputs
 checkpoint
 logs
 validation_log
+/datasets/
 **.pdf
 idea.md
