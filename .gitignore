@@ -4,5 +4,6 @@ checkpoint
 logs
 validation_log
 /datasets/
+/code_eval_results/
 **.pdf
 idea.md
