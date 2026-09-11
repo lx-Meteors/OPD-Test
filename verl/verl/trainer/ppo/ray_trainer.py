@@ -1812,11 +1812,19 @@ class RayPPOTrainer:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_forward_batch = batch
+                            ref_forward_tokens = None
                             if self.gopd_success_length_horizon_enabled:
-                                ref_forward_batch = self._response_prefix_batch(
-                                    batch,
-                                    batch.meta_info["gopd_dynamic_extrapolation_max_tokens"],
+                                ref_forward_tokens = batch.meta_info[
+                                    "gopd_dynamic_extrapolation_max_tokens"
+                                ]
+                            elif self.config.actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages:
+                                static_extrapolation_tokens = int(
+                                    self.config.actor_rollout_ref.actor.policy_loss.extrapolation_max_tokens
                                 )
+                                if static_extrapolation_tokens > 0:
+                                    ref_forward_tokens = static_extrapolation_tokens
+                            if ref_forward_tokens is not None:
+                                ref_forward_batch = self._response_prefix_batch(batch, ref_forward_tokens)
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(ref_forward_batch)
                             else:

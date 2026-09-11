@@ -101,6 +101,9 @@ run_opd() {
     export TRAIN_DATASET="${TRAIN_DATASET:-${DATA_ROOT}/dapo-math-17k.parquet}"
     export TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-DAPO-Math-17k}"
     export TEST_DATASET="${TEST_DATASET:-[\"${DATA_ROOT}/test_data/AMC23/test.parquet\",\"${DATA_ROOT}/test_data/AIME24/test.parquet\",\"${DATA_ROOT}/test_data/AIME25/test.parquet\",\"${DATA_ROOT}/test_data/HMMT24/test.parquet\",\"${DATA_ROOT}/test_data/HMMT25/test.parquet\"]}"
+    export REQUIRE_DEFAULT_MATH_TEST_DATASETS="${REQUIRE_DEFAULT_MATH_TEST_DATASETS:-True}"
+    export CUSTOM_REWARD_FUNCTION_PATH="${CUSTOM_REWARD_FUNCTION_PATH:-${REPO_ROOT}/verl/verl/utils/reward_score/ttrl_math/__init__.py}"
+    export CUSTOM_REWARD_FUNCTION_NAME="${CUSTOM_REWARD_FUNCTION_NAME:-reward_func}"
     export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
     export MAX_RESP_LENGTH="${MAX_RESP_LENGTH:-8192}"
     export MAX_VAL_RESP_LENGTH="${MAX_VAL_RESP_LENGTH:-31744}"
@@ -166,11 +169,13 @@ run_opd() {
     fi
 
     require_path "$(resolve_path "${TRAIN_DATASET}")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME24/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME25/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/HMMT24/test.parquet")"
-    require_path "$(resolve_path "${DATA_ROOT}/test_data/HMMT25/test.parquet")"
+    if [[ "${REQUIRE_DEFAULT_MATH_TEST_DATASETS}" == "True" ]]; then
+        require_path "$(resolve_path "${DATA_ROOT}/test_data/AMC23/test.parquet")"
+        require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME24/test.parquet")"
+        require_path "$(resolve_path "${DATA_ROOT}/test_data/AIME25/test.parquet")"
+        require_path "$(resolve_path "${DATA_ROOT}/test_data/HMMT24/test.parquet")"
+        require_path "$(resolve_path "${DATA_ROOT}/test_data/HMMT25/test.parquet")"
+    fi
 
     export PYTHONUNBUFFERED=1
     export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.99}"
@@ -307,8 +312,8 @@ run_opd() {
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
         "reward_model.enable=${REWARD_MODEL_ENABLE}"
         "+reward_model.reward_kwargs.enable_format_reward=${ENABLE_FORMAT_REWARD}"
-        "custom_reward_function.path=${REPO_ROOT}/verl/verl/utils/reward_score/ttrl_math/__init__.py"
-        "custom_reward_function.name=reward_func"
+        "custom_reward_function.path=${CUSTOM_REWARD_FUNCTION_PATH}"
+        "custom_reward_function.name=${CUSTOM_REWARD_FUNCTION_NAME}"
         "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
         "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
         "trainer.logger=${TRACKING_BACKENDS}"
